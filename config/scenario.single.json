@@ -1,0 +1,18 @@
+{
+  "name": "single-node-demo",
+  "participants": ["node"],
+  "threshold": 1,
+  "clique_size": 1,
+  "inter_clique_edges": "ring",
+  "topology_iterations": 1,
+  "small_world_c": 1,
+  "service_hostnames": {
+    "node": "node"
+  },
+  "node_labels": {
+    "node": {"0": 1.0}
+  },
+  "reliability": {
+    "node": {"uptime": 1.0, "bandwidth": 1.0, "latency": 0.01}
+  }
+}

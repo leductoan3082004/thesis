@@ -1,0 +1,162 @@
+import math
+import random
+from collections import Counter, defaultdict
+from typing import Dict, Iterable, List, Mapping, MutableSequence, Sequence, Set, Tuple
+
+LabelDist = Dict[str, float]
+
+
+def _normalize(counts: Mapping[str, float]) -> LabelDist:
+    total = float(sum(counts.values()))
+    if total <= 0:
+        raise ValueError("Label counts must sum to a positive value")
+    return {label: value / total for label, value in counts.items()}
+
+
+def compute_label_distribution(node_labels: Mapping[str, Mapping[str, float] | str]) -> Dict[str, LabelDist]:
+    """
+    Normalizes label distributions per node and returns a mapping node_id -> distribution.
+    Accepts either a mapping of label->count or a single label string.
+    """
+    normalized: Dict[str, LabelDist] = {}
+    for node_id, labels in node_labels.items():
+        if isinstance(labels, str):
+            counts = Counter({labels: 1.0})
+        else:
+            counts = Counter({k: float(v) for k, v in labels.items()})
+        normalized[node_id] = _normalize(counts)
+    return normalized
+
+
+def _aggregate_clique_distribution(clique: Iterable[str], node_distributions: Mapping[str, LabelDist]) -> LabelDist:
+    agg: Dict[str, float] = defaultdict(float)
+    for node in clique:
+        if node not in node_distributions:
+            raise ValueError(f"Node '{node}' missing label distribution")
+        for label, prob in node_distributions[node].items():
+            agg[label] += prob
+    return _normalize(agg)
+
+
+def compute_skew(clique: Iterable[str], node_distributions: Mapping[str, LabelDist], global_distribution: LabelDist) -> float:
+    clique_dist = _aggregate_clique_distribution(clique, node_distributions)
+    labels = set(clique_dist) | set(global_distribution)
+    return sum(abs(clique_dist.get(label, 0.0) - global_distribution.get(label, 0.0)) for label in labels)
+
+
+def build_d_cliques(
+    node_labels: Mapping[str, Mapping[str, float] | str],
+    clique_size: int,
+    iterations: int = 1000,
+    seed: int | None = None,
+) -> List[Set[str]]:
+    """
+    Build D-cliques using greedy swaps to reduce label skew.
+    """
+    if clique_size <= 0:
+        raise ValueError("clique_size must be positive")
+    nodes = list(node_labels.keys())
+    if not nodes:
+        raise ValueError("node_labels cannot be empty")
+    rng = random.Random(seed)
+    rng.shuffle(nodes)
+    node_distributions = compute_label_distribution(node_labels)
+    global_counts: Counter[str] = Counter()
+    for dist in node_distributions.values():
+        for label, prob in dist.items():
+            global_counts[label] += prob
+    global_distribution = _normalize(global_counts)
+    cliques: List[Set[str]] = []
+    for i in range(0, len(nodes), clique_size):
+        cliques.append(set(nodes[i : i + clique_size]))
+    if len(cliques) == 1:
+        return cliques
+    for _ in range(iterations):
+        idx_a, idx_b = rng.sample(range(len(cliques)), 2)
+        clique_a = cliques[idx_a]
+        clique_b = cliques[idx_b]
+        base_skew = compute_skew(clique_a, node_distributions, global_distribution) + compute_skew(
+            clique_b, node_distributions, global_distribution
+        )
+        improvements: List[Tuple[str, str]] = []
+        for a in clique_a:
+            for b in clique_b:
+                new_a = clique_a.copy()
+                new_b = clique_b.copy()
+                new_a.remove(a)
+                new_a.add(b)
+                new_b.remove(b)
+                new_b.add(a)
+                new_skew = compute_skew(new_a, node_distributions, global_distribution) + compute_skew(
+                    new_b, node_distributions, global_distribution
+                )
+                if new_skew < base_skew:
+                    improvements.append((a, b))
+        if improvements:
+            swap_a, swap_b = rng.choice(improvements)
+            cliques[idx_a].remove(swap_a)
+            cliques[idx_a].add(swap_b)
+            cliques[idx_b].remove(swap_b)
+            cliques[idx_b].add(swap_a)
+    return cliques
+
+
+def _add_edge(edges: Set[Tuple[int, int]], a: int, b: int) -> None:
+    if a == b:
+        return
+    edge = (min(a, b), max(a, b))
+    edges.add(edge)
+
+
+def build_interclique_edges(
+    cliques: Sequence[Set[str]], mode: str = "small_world", small_world_c: int = 2
+) -> List[Tuple[int, int]]:
+    """
+    Construct inter-clique edges between clique indices.
+    """
+    num = len(cliques)
+    edges: Set[Tuple[int, int]] = set()
+    if num <= 1:
+        return []
+    if mode not in {"ring", "fractal", "small_world", "fully_connected"}:
+        raise ValueError(f"Unknown edge mode '{mode}'")
+    # Base connectivity keeps the graph connected.
+    for i in range(num):
+        _add_edge(edges, i, (i + 1) % num)
+    if mode == "ring":
+        return sorted(edges)
+    if mode == "fully_connected":
+        for i in range(num):
+            for j in range(i + 1, num):
+                _add_edge(edges, i, j)
+        return sorted(edges)
+    if mode == "fractal":
+        stride = max(2, num // 2)
+        for i in range(num):
+            _add_edge(edges, i, (i + stride) % num)
+        return sorted(edges)
+    # small_world
+    if small_world_c <= 0:
+        raise ValueError("small_world_c must be positive")
+    for k in range(small_world_c):
+        offset = 2**k
+        for i in range(num):
+            _add_edge(edges, i, (i + offset) % num)
+    return sorted(edges)
+
+
+def metropolis_hastings_weights(num_nodes: int, edges: Iterable[Tuple[int, int]]) -> List[List[float]]:
+    """
+    Compute row-stochastic Metropolis-Hastings weights for an undirected graph.
+    """
+    neighbors: Dict[int, Set[int]] = {i: set() for i in range(num_nodes)}
+    for u, v in edges:
+        neighbors[u].add(v)
+        neighbors[v].add(u)
+    weights: List[List[float]] = [[0.0 for _ in range(num_nodes)] for _ in range(num_nodes)]
+    for i in range(num_nodes):
+        for j in neighbors[i]:
+            weights[i][j] = 1.0 / (1.0 + max(len(neighbors[i]), len(neighbors[j])))
+        row_sum = sum(weights[i])
+        weights[i][i] = max(0.0, 1.0 - row_sum)
+    return weights

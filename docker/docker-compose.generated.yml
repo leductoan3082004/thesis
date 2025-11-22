@@ -1,0 +1,68 @@
+version: '3.9'
+services:
+  ttp:
+    build:
+      context: ..
+      dockerfile: docker/ttp.Dockerfile
+    command:
+    - python
+    - -c
+    - print('TTP placeholder')
+    container_name: ttp
+    networks:
+    - secureagg
+    volumes: &id001
+    - ../config:/app/config
+    - ../data:/app/data
+    - ../logs:/app/logs
+    - ../checkpoints:/app/checkpoints
+  node_a:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    command:
+    - python
+    - -m
+    - secure_aggregation.node.service
+    container_name: node_a
+    environment:
+    - NODE_ID=node_a
+    - SCENARIO_PATH=/app/config/scenario.sample.json
+    - PORT=8000
+    networks:
+    - secureagg
+    volumes: *id001
+  node_b:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    command:
+    - python
+    - -m
+    - secure_aggregation.node.service
+    container_name: node_b
+    environment:
+    - NODE_ID=node_b
+    - SCENARIO_PATH=/app/config/scenario.sample.json
+    - PORT=8000
+    networks:
+    - secureagg
+    volumes: *id001
+  node_c:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    command:
+    - python
+    - -m
+    - secure_aggregation.node.service
+    container_name: node_c
+    environment:
+    - NODE_ID=node_c
+    - SCENARIO_PATH=/app/config/scenario.sample.json
+    - PORT=8000
+    networks:
+    - secureagg
+    volumes: *id001
+networks:
+  secureagg: {}

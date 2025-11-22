@@ -1,0 +1,94 @@
+version: "3.9"
+
+services:
+  ttp:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: ttp
+    command: ["python", "-m", "secure_aggregation.communication.ttp_service"]
+    networks:
+      - secureagg
+    ports:
+      - "50051:50051"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_0:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_0
+    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_0.json"]
+    networks:
+      - secureagg
+    depends_on:
+      - ttp
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_1:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_1
+    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_1.json"]
+    networks:
+      - secureagg
+    depends_on:
+      - ttp
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_2:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_2
+    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_2.json"]
+    networks:
+      - secureagg
+    depends_on:
+      - ttp
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_3:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_3
+    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_3.json"]
+    networks:
+      - secureagg
+    depends_on:
+      - ttp
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+networks:
+  secureagg:
+    driver: bridge

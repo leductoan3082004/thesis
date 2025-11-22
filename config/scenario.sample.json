@@ -1,0 +1,24 @@
+{
+  "name": "local-demo",
+  "participants": ["node_a", "node_b", "node_c"],
+  "threshold": 2,
+  "clique_size": 2,
+  "inter_clique_edges": "small_world",
+  "topology_iterations": 10,
+  "small_world_c": 2,
+  "service_hostnames": {
+    "node_a": "node_a",
+    "node_b": "node_b",
+    "node_c": "node_c"
+  },
+  "node_labels": {
+    "node_a": {"0": 1.0},
+    "node_b": {"1": 1.0},
+    "node_c": {"0": 0.6, "1": 0.4}
+  },
+  "reliability": {
+    "node_a": {"uptime": 1.0, "bandwidth": 1.0, "latency": 0.05},
+    "node_b": {"uptime": 0.9, "bandwidth": 0.85, "latency": 0.1},
+    "node_c": {"uptime": 0.95, "bandwidth": 0.9, "latency": 0.08}
+  }
+}

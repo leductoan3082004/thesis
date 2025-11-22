@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# Data (we'll download in container)
+data/
+
+# Logs
+logs/
+*.log
+
+# Documentation
+*.md
+*.pdf
+*.txt
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+docker/
+
+# Tests
+tests/
+
+# Other
+checkpoints/
+.DS_Store

@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package secureagg;
+
+// TTP Service - Distributes signing keys to participants
+service TTPService {
+  rpc RegisterNode(RegisterRequest) returns (RegisterResponse);
+  rpc GetParticipants(ParticipantsRequest) returns (ParticipantsResponse);
+}
+
+message RegisterRequest {
+  string node_id = 1;
+  string address = 2;
+}
+
+message RegisterResponse {
+  bytes signing_private_key = 1;  // Ed25519 private key
+  bytes signing_public_key = 2;   // Ed25519 public key
+  bool success = 3;
+  string message = 4;
+}
+
+message ParticipantsRequest {}
+
+message ParticipantsResponse {
+  repeated NodeInfo participants = 1;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string address = 2;
+  bytes signing_public_key = 3;
+}
+
+// Aggregator Service - Coordinates secure aggregation rounds
+service AggregatorService {
+  rpc Round0AdvertiseKeys(KeyAdvertisement) returns (KeyAdvertisementAck);
+  rpc Round1ShareKeys(ShareKeysMessage) returns (ShareKeysAck);
+  rpc Round2MaskedInput(MaskedInputMessage) returns (MaskedInputAck);
+  rpc Round3ConsistencyCheck(ConsistencySignature) returns (ConsistencyAck);
+  rpc Round4Unmask(UnmaskShares) returns (UnmaskAck);
+  rpc GetGlobalModel(ModelRequest) returns (ModelResponse);
+}
+
+// Round 0: Advertise DH public keys
+message KeyAdvertisement {
+  string node_id = 1;
+  bytes c_public_key = 2;  // ECDH public key for encryption
+  bytes s_public_key = 3;  // ECDH public key for masking
+  bytes signature = 4;     // Signature over (c_PK || s_PK)
+}
+
+message KeyAdvertisementAck {
+  bool accepted = 1;
+  string message = 2;
+  repeated KeyAdvertisement all_keys = 3;  // Broadcast U1 list
+}
+
+// Round 1: Share encrypted secrets
+message ShareKeysMessage {
+  string node_id = 1;
+  map<string, bytes> encrypted_shares = 2;  // recipient_id -> AEAD ciphertext
+}
+
+message ShareKeysAck {
+  bool accepted = 1;
+  string message = 2;
+}
+
+// Round 2: Masked model update
+message MaskedInputMessage {
+  string node_id = 1;
+  repeated int64 masked_vector = 2;  // Quantized + masked model params
+}
+
+message MaskedInputAck {
+  bool accepted = 1;
+  string message = 2;
+  repeated string survivors = 3;  // U3 list
+}
+
+// Round 3: Consistency signatures
+message ConsistencySignature {
+  string node_id = 1;
+  bytes signature = 2;  // Sign(d_SK, U3)
+}
+
+message ConsistencyAck {
+  bool accepted = 1;
+  string message = 2;
+}
+
+// Round 4: Unmask shares
+message UnmaskShares {
+  string node_id = 1;
+  map<string, bytes> dropout_s_shares = 2;   // dropout_id -> s_SK share
+  map<string, bytes> survivor_b_shares = 3;  // survivor_id -> b seed share
+}
+
+message UnmaskAck {
+  bool accepted = 1;
+  string message = 2;
+  bool aggregation_complete = 3;
+}
+
+// Model distribution
+message ModelRequest {
+  int32 round = 1;
+}
+
+message ModelResponse {
+  repeated float model_weights = 1;
+  int32 round = 2;
+  string aggregator_id = 3;
+}
