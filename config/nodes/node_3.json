@@ -5,13 +5,13 @@
   "port": 50055,
   "dataset": {
     "name": "mnist",
-    "num_clients": 4,
+    "num_clients": 6,
     "alpha": 0.5,
     "seed": 42
   },
   "training": {
-    "num_rounds": 10,
-    "local_epochs": 2,
+    "num_rounds": 3,
+    "local_epochs": 1,
     "batch_size": 64
   },
   "secure_agg": {

@@ -20,6 +20,7 @@ from secure_aggregation.crypto.sign import SigningKeyPair, sign_message, verify_
 from secure_aggregation.crypto.dh import DHKeyPair, generate_dh_keypair, agree
 from secure_aggregation.data import dirichlet_partition
 from secure_aggregation.node import NodeEngine, NodeRuntimeConfig, ReliabilityScore
+from secure_aggregation.topology import elect_clique_aggregator
 from secure_aggregation.utils import configure_logging, get_logger
 
 logger = get_logger("node_service")
@@ -87,6 +88,12 @@ class NodeService:
         self.aggregator_address: Optional[str] = None
         self.aggregator_server: Optional[grpc.Server] = None
 
+        # Clique membership from TTP
+        self.clique_id: int = -1
+        self.clique_members: List[str] = []
+        self.clique_threshold: int = 0
+        self.assigned_data_indices: List[int] = []
+
         # DH keypairs for secure aggregation
         self.c_keypair: Optional[DHKeyPair] = None  # For encryption
         self.s_keypair: Optional[DHKeyPair] = None  # For masking
@@ -99,7 +106,7 @@ class NodeService:
             return json.load(f)
 
     def register_with_ttp(self) -> None:
-        """Register with TTP and receive signing keys."""
+        """Register with TTP and receive signing keys and clique assignment."""
         logger.info(f"Registering with TTP at {self.ttp_address}")
 
         max_retries = 10
@@ -119,7 +126,22 @@ class NodeService:
                         private_key=bytes(response.signing_private_key),
                         public_key=bytes(response.signing_public_key)
                     )
-                    logger.info(f"Successfully registered with TTP")
+
+                    # Extract clique assignment from TTP response
+                    self.clique_id = response.clique_id
+                    self.clique_members = list(response.clique_members)
+                    self.clique_threshold = response.clique_threshold
+                    self.assigned_data_indices = list(response.data_indices)
+
+                    # Use clique threshold if provided, otherwise fall back to config
+                    if self.clique_threshold > 0:
+                        self.threshold = self.clique_threshold
+
+                    logger.info(
+                        f"Registered with TTP: clique={self.clique_id}, "
+                        f"members={len(self.clique_members)}, threshold={self.threshold}, "
+                        f"data_samples={len(self.assigned_data_indices)}"
+                    )
                 else:
                     raise RuntimeError(f"TTP registration failed: {response.message}")
 
@@ -127,7 +149,7 @@ class NodeService:
                 participants_response = stub.GetParticipants(secureagg_pb2.ParticipantsRequest())
                 self.participants = list(participants_response.participants)
                 self.participant_map = {p.node_id: p.address for p in self.participants}
-                logger.info(f"Retrieved {len(self.participants)} participants")
+                logger.info(f"Retrieved {len(self.participants)} total participants")
 
                 channel.close()
                 return
@@ -139,28 +161,31 @@ class NodeService:
         raise RuntimeError("Failed to connect to TTP after max retries")
 
     def setup_data(self) -> None:
-        """Setup MNIST dataset with partitioning."""
+        """Setup MNIST dataset using indices assigned by TTP or local partition."""
         logger.info("Setting up MNIST dataset")
         tform = transforms.Compose([transforms.ToTensor()])
         train_ds = datasets.MNIST(root="/app/data", train=True, download=False, transform=tform)
         test_ds = datasets.MNIST(root="/app/data", train=False, download=False, transform=tform)
 
-        # Create partitions using Dirichlet distribution
-        labels = {i: int(train_ds[i][1]) for i in range(len(train_ds))}
-        num_clients = self.dataset_config["num_clients"]
-        alpha = self.dataset_config["alpha"]
-        seed = self.dataset_config.get("seed", 42)
+        # Use TTP-assigned indices if available, otherwise compute locally
+        if self.assigned_data_indices:
+            indices = self.assigned_data_indices
+            logger.info(f"Using {len(indices)} TTP-assigned data samples")
+        else:
+            # Fallback: compute partition locally
+            labels = {i: int(train_ds[i][1]) for i in range(len(train_ds))}
+            num_clients = self.dataset_config["num_clients"]
+            alpha = self.dataset_config["alpha"]
+            seed = self.dataset_config.get("seed", 42)
 
-        parts = dirichlet_partition(
-            list(range(len(train_ds))), labels, num_clients=num_clients, alpha=alpha, seed=seed
-        )
+            parts = dirichlet_partition(
+                list(range(len(train_ds))), labels, num_clients=num_clients, alpha=alpha, seed=seed
+            )
 
-        # Get this node's partition (based on node_id index)
-        node_index = int(self.node_id.split("_")[-1])
-        client_key = f"client_{node_index}"
-        indices = parts.get(client_key, [])
-
-        logger.info(f"Node {self.node_id} assigned {len(indices)} training samples")
+            node_index = int(self.node_id.split("_")[-1])
+            client_key = f"client_{node_index}"
+            indices = parts.get(client_key, [])
+            logger.info(f"Using {len(indices)} locally-computed data samples")
 
         batch_size = self.training_config["batch_size"]
         self.train_loader = DataLoader(Subset(train_ds, indices), batch_size=batch_size, shuffle=True)
@@ -216,11 +241,15 @@ class NodeService:
         return accuracy
 
     def elect_aggregator(self, round_idx: int) -> str:
-        """Elect aggregator for this round using reliability scores."""
-        # Simple deterministic election: round-robin by node_id
-        sorted_participants = sorted(self.participant_map.keys())
-        aggregator_id = sorted_participants[round_idx % len(sorted_participants)]
-        logger.info(f"Elected aggregator for round {round_idx}: {aggregator_id}")
+        """Elect aggregator within clique using round-robin."""
+        # Use clique members if available, otherwise fall back to all participants
+        if self.clique_members:
+            aggregator_id = elect_clique_aggregator(self.clique_members, round_idx)
+            logger.info(f"Elected clique aggregator for round {round_idx}: {aggregator_id} (clique {self.clique_id})")
+        else:
+            sorted_participants = sorted(self.participant_map.keys())
+            aggregator_id = sorted_participants[round_idx % len(sorted_participants)]
+            logger.info(f"Elected global aggregator for round {round_idx}: {aggregator_id}")
         return aggregator_id
 
     def start_aggregator_server(self) -> None:
@@ -229,11 +258,12 @@ class NodeService:
             logger.warning("Aggregator server already running")
             return
 
-        participant_ids = list(self.participant_map.keys())
+        # Use clique members if available, otherwise all participants
+        participant_ids = self.clique_members if self.clique_members else list(self.participant_map.keys())
         self.aggregator_server = serve_aggregator(
             self.node_id, self.port + 1000, self.threshold, participant_ids
         )
-        logger.info(f"Started aggregator server on port {self.port + 1000}")
+        logger.info(f"Started aggregator server on port {self.port + 1000} for {len(participant_ids)} clique members")
 
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
@@ -263,15 +293,31 @@ class NodeService:
         key_msg = self.c_keypair.public_key + self.s_keypair.public_key
         signature = sign_message(self.signing_keypair.private_key, key_msg)
 
-        response = stub.Round0AdvertiseKeys(
-            secureagg_pb2.KeyAdvertisement(
-                node_id=self.node_id,
-                c_public_key=self.c_keypair.public_key,
-                s_public_key=self.s_keypair.public_key,
-                signature=signature
-            ),
-            timeout=30
-        )
+        # Retry logic for initial aggregator connection.
+        max_retries = 30
+        retry_delay = 1
+        response = None
+        for attempt in range(max_retries):
+            try:
+                response = stub.Round0AdvertiseKeys(
+                    secureagg_pb2.KeyAdvertisement(
+                        node_id=self.node_id,
+                        c_public_key=self.c_keypair.public_key,
+                        s_public_key=self.s_keypair.public_key,
+                        signature=signature
+                    ),
+                    timeout=30
+                )
+                break
+            except grpc.RpcError as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Aggregator connection attempt {attempt + 1}/{max_retries} failed, retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    raise
+
+        if response is None:
+            raise RuntimeError("Failed to connect to aggregator")
 
         if not response.accepted:
             raise RuntimeError(f"Round 0 failed: {response.message}")
@@ -436,13 +482,23 @@ class NodeService:
         self.setup_data()
         self.setup_model()
 
-        # Wait for all nodes to be ready
-        logger.info("Waiting for all nodes to register...")
-        while len(self.participants) < self.dataset_config["num_clients"]:
-            time.sleep(2)
-            self.register_with_ttp()  # Refresh participants list
+        # Wait for clique members or all nodes to be ready
+        if self.clique_members:
+            expected_count = len(self.clique_members)
+            logger.info(f"Waiting for {expected_count} clique members to register...")
+            registered_clique_members = set(self.clique_members) & set(self.participant_map.keys())
+            while len(registered_clique_members) < expected_count:
+                time.sleep(2)
+                self.register_with_ttp()
+                registered_clique_members = set(self.clique_members) & set(self.participant_map.keys())
+            logger.info(f"All {len(registered_clique_members)} clique members ready. Starting training...")
+        else:
+            logger.info("Waiting for all nodes to register...")
+            while len(self.participants) < self.dataset_config["num_clients"]:
+                time.sleep(2)
+                self.register_with_ttp()
+            logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
 
-        logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
         time.sleep(2)
 
         # Run training loop

@@ -18,6 +18,11 @@ message RegisterResponse {
   bytes signing_public_key = 2;   // Ed25519 public key
   bool success = 3;
   string message = 4;
+  // Clique assignment from topology
+  int32 clique_id = 5;
+  repeated string clique_members = 6;
+  int32 clique_threshold = 7;
+  repeated int32 data_indices = 8;  // Assigned data indices for this node
 }
 
 message ParticipantsRequest {}

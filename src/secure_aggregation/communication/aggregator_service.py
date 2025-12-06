@@ -34,9 +34,18 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
 
         logger.info(f"Aggregator {node_id} initialized with threshold={threshold}, participants={len(participant_ids)}")
 
+    def _validate_participant(self, node_id: str) -> bool:
+        """Validate that node_id is in the allowed participant list (clique members)."""
+        return node_id in self.participant_ids
+
     def Round0AdvertiseKeys(self, request: secureagg_pb2.KeyAdvertisement, context) -> secureagg_pb2.KeyAdvertisementAck:
         """Collect DH public keys from participants (Round 0)."""
         node_id = request.node_id
+
+        # Reject nodes not in participant list (clique boundary validation)
+        if not self._validate_participant(node_id):
+            logger.warning(f"Rejected key advertisement from {node_id}: not a clique member")
+            return secureagg_pb2.KeyAdvertisementAck(accepted=False, message="Node not in clique")
 
         # If this is a duplicate but we already have all keys, return the full list
         if node_id in self.round0_keys:
@@ -91,6 +100,10 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         """Collect encrypted secret shares (Round 1)."""
         node_id = request.node_id
 
+        if not self._validate_participant(node_id):
+            logger.warning(f"Rejected shares from {node_id}: not a clique member")
+            return secureagg_pb2.ShareKeysAck(accepted=False, message="Node not in clique")
+
         if node_id in self.round1_shares:
             logger.warning(f"Duplicate shares from {node_id}")
             return secureagg_pb2.ShareKeysAck(accepted=False, message="Duplicate shares")
@@ -107,6 +120,10 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
     def Round2MaskedInput(self, request: secureagg_pb2.MaskedInputMessage, context) -> secureagg_pb2.MaskedInputAck:
         """Collect masked model updates (Round 2)."""
         node_id = request.node_id
+
+        if not self._validate_participant(node_id):
+            logger.warning(f"Rejected masked input from {node_id}: not a clique member")
+            return secureagg_pb2.MaskedInputAck(accepted=False, message="Node not in clique")
 
         if node_id in self.round2_masked:
             logger.warning(f"Duplicate masked input from {node_id}")
@@ -136,6 +153,10 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         """Collect consistency signatures (Round 3)."""
         node_id = request.node_id
 
+        if not self._validate_participant(node_id):
+            logger.warning(f"Rejected signature from {node_id}: not a clique member")
+            return secureagg_pb2.ConsistencyAck(accepted=False, message="Node not in clique")
+
         if node_id in self.round3_signatures:
             logger.warning(f"Duplicate signature from {node_id}")
             return secureagg_pb2.ConsistencyAck(accepted=False, message="Duplicate signature")
@@ -152,6 +173,10 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
     def Round4Unmask(self, request: secureagg_pb2.UnmaskShares, context) -> secureagg_pb2.UnmaskAck:
         """Collect unmasking shares and compute aggregate (Round 4)."""
         node_id = request.node_id
+
+        if not self._validate_participant(node_id):
+            logger.warning(f"Rejected unmask shares from {node_id}: not a clique member")
+            return secureagg_pb2.UnmaskAck(accepted=False, message="Node not in clique", aggregation_complete=False)
 
         if node_id in self.round4_unmasking:
             logger.warning(f"Duplicate unmask shares from {node_id}")

@@ -248,3 +248,78 @@ def metropolis_hastings_weights(num_nodes: int, edges: Iterable[Tuple[int, int]]
         row_sum = sum(weights[i])
         weights[i][i] = max(0.0, 1.0 - row_sum)
     return weights
+
+
+def compute_node_labels_from_partition(
+    partition: Mapping[str, Sequence[int]],
+    labels: Mapping[int, int],
+) -> Dict[str, Dict[str, int]]:
+    """
+    Convert a data partition to node label distributions.
+
+    Args:
+        partition: Mapping of node_id -> list of data indices assigned to that node.
+        labels: Mapping of data_index -> label (e.g., {0: 5, 1: 3, ...} for MNIST).
+
+    Returns:
+        Mapping of node_id -> {label: count} for each node.
+    """
+    node_labels: Dict[str, Dict[str, int]] = {}
+    for node_id, indices in partition.items():
+        counts: Counter[str] = Counter()
+        for idx in indices:
+            counts[str(labels[idx])] += 1
+        node_labels[node_id] = dict(counts)
+    return node_labels
+
+
+def compute_clique_threshold(clique_size: int) -> int:
+    """
+    Compute threshold as 2/3 majority of clique size.
+
+    Args:
+        clique_size: Number of nodes in the clique.
+
+    Returns:
+        Minimum number of survivors needed for secure aggregation.
+    """
+    if clique_size <= 0:
+        raise ValueError("clique_size must be positive")
+    return math.ceil(0.6667 * clique_size)
+
+
+def find_node_clique(node_id: str, cliques: Sequence[Set[str]]) -> Tuple[int, Set[str]]:
+    """
+    Find which clique a node belongs to.
+
+    Args:
+        node_id: The node identifier.
+        cliques: List of clique sets.
+
+    Returns:
+        Tuple of (clique_index, clique_members).
+
+    Raises:
+        ValueError: If node is not found in any clique.
+    """
+    for idx, clique in enumerate(cliques):
+        if node_id in clique:
+            return idx, clique
+    raise ValueError(f"Node '{node_id}' not found in any clique")
+
+
+def elect_clique_aggregator(clique_members: Iterable[str], round_idx: int) -> str:
+    """
+    Elect aggregator for a clique using round-robin.
+
+    Args:
+        clique_members: Set or list of node IDs in the clique.
+        round_idx: Current training round index.
+
+    Returns:
+        Node ID of the elected aggregator.
+    """
+    sorted_members = sorted(clique_members)
+    if not sorted_members:
+        raise ValueError("clique_members cannot be empty")
+    return sorted_members[round_idx % len(sorted_members)]

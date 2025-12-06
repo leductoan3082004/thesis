@@ -6,16 +6,21 @@ services:
       context: ..
       dockerfile: docker/node.Dockerfile
     container_name: ttp
-    command: ["python", "-m", "secure_aggregation.communication.ttp_service"]
+    command: ["python", "scripts/run_ttp_with_topology.py", "--num-clients", "6", "--clique-size", "3"]
     networks:
       - secureagg
     ports:
       - "50051:50051"
     environment:
       - PYTHONUNBUFFERED=1
+      - NUM_CLIENTS=6
+      - CLIQUE_SIZE=3
+      - ALPHA=0.5
+      - SEED=42
     volumes:
       - ../data:/app/data
       - ../logs:/app/logs
+      - ../config:/app/config
 
   node_0:
     build:
@@ -77,6 +82,42 @@ services:
       dockerfile: docker/node.Dockerfile
     container_name: node_3
     command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_3.json"]
+    networks:
+      - secureagg
+    depends_on:
+      - ttp
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_4:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_4
+    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_4.json"]
+    networks:
+      - secureagg
+    depends_on:
+      - ttp
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_5:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_5
+    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_5.json"]
     networks:
       - secureagg
     depends_on:
