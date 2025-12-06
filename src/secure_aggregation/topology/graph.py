@@ -145,6 +145,94 @@ def build_interclique_edges(
     return sorted(edges)
 
 
+def assign_node_edges(
+    cliques: Sequence[Set[str]],
+    interclique_edges: Sequence[Tuple[int, int]],
+) -> Tuple[List[Tuple[str, str]], Dict[str, int]]:
+    """
+    Assign inter-clique edges to specific nodes using load-balanced greedy selection.
+
+    For each inter-clique edge (clique_a, clique_b), picks the node with the lowest
+    current edge count from each clique to form the actual node-to-node connection.
+
+    Args:
+        cliques: List of node sets, where each set represents a clique.
+        interclique_edges: List of (clique_idx_a, clique_idx_b) tuples.
+
+    Returns:
+        A tuple of:
+        - List of (node_a, node_b) edges between specific nodes.
+        - Dict mapping each node to its final edge count.
+    """
+    node_edge_count: Dict[str, int] = {}
+
+    for clique in cliques:
+        clique_size = len(clique)
+        for node in clique:
+            node_edge_count[node] = clique_size - 1
+
+    node_to_node_edges: List[Tuple[str, str]] = []
+
+    for clique_a_idx, clique_b_idx in interclique_edges:
+        clique_a = cliques[clique_a_idx]
+        clique_b = cliques[clique_b_idx]
+
+        best_a = min(clique_a, key=lambda n: (node_edge_count[n], n))
+        best_b = min(clique_b, key=lambda n: (node_edge_count[n], n))
+
+        node_to_node_edges.append((best_a, best_b))
+        node_edge_count[best_a] += 1
+        node_edge_count[best_b] += 1
+
+    return node_to_node_edges, node_edge_count
+
+
+def build_full_topology(
+    node_labels: Mapping[str, Mapping[str, float] | str],
+    clique_size: int,
+    iterations: int = 1000,
+    edge_mode: str = "small_world",
+    small_world_c: int = 2,
+    seed: int | None = None,
+) -> Tuple[List[Set[str]], List[Tuple[str, str]], List[Tuple[str, str]], Dict[str, int]]:
+    """
+    Build the complete D-Cliques topology with node-level edges.
+
+    This is a convenience function that combines all topology construction steps:
+    1. Build D-cliques with greedy swaps
+    2. Build inter-clique edges
+    3. Assign node-to-node edges with load balancing
+
+    Args:
+        node_labels: Mapping of node_id -> label distribution or single label.
+        clique_size: Maximum size of each clique.
+        iterations: Number of greedy swap iterations.
+        edge_mode: Inter-clique edge mode ("ring", "small_world", "fractal", "fully_connected").
+        small_world_c: Parameter for small_world mode (number of power-of-2 offsets).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        A tuple of:
+        - cliques: List of node sets.
+        - intra_edges: List of (node_a, node_b) edges within cliques.
+        - inter_edges: List of (node_a, node_b) edges between cliques.
+        - node_edge_count: Dict mapping each node to its final edge count.
+    """
+    cliques = build_d_cliques(node_labels, clique_size, iterations, seed)
+    interclique_edges = build_interclique_edges(cliques, mode=edge_mode, small_world_c=small_world_c)
+
+    intra_edges: List[Tuple[str, str]] = []
+    for clique in cliques:
+        nodes = sorted(clique)
+        for i, n1 in enumerate(nodes):
+            for n2 in nodes[i + 1 :]:
+                intra_edges.append((n1, n2))
+
+    inter_edges, node_edge_count = assign_node_edges(cliques, interclique_edges)
+
+    return cliques, intra_edges, inter_edges, node_edge_count
+
+
 def metropolis_hastings_weights(num_nodes: int, edges: Iterable[Tuple[int, int]]) -> List[List[float]]:
     """
     Compute row-stochastic Metropolis-Hastings weights for an undirected graph.

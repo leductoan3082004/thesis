@@ -2,7 +2,9 @@ from collections import Counter
 from typing import Dict, Iterable, List, Set, Tuple
 
 from secure_aggregation.topology import (
+    assign_node_edges,
     build_d_cliques,
+    build_full_topology,
     build_interclique_edges,
     compute_label_distribution,
     compute_skew,
@@ -70,3 +72,66 @@ def test_metropolis_hastings_weights_are_row_stochastic() -> None:
     for row in weights:
         assert all(value >= 0 for value in row)
         assert abs(sum(row) - 1.0) < 1e-9
+
+
+def test_assign_node_edges_produces_correct_count() -> None:
+    cliques = [{"n0", "n1", "n2"}, {"n3", "n4", "n5"}, {"n6", "n7", "n8"}]
+    interclique_edges = [(0, 1), (1, 2), (0, 2)]
+    node_edges, edge_counts = assign_node_edges(cliques, interclique_edges)
+
+    assert len(node_edges) == 3
+
+    for node_a, node_b in node_edges:
+        clique_a_idx = next(i for i, c in enumerate(cliques) if node_a in c)
+        clique_b_idx = next(i for i, c in enumerate(cliques) if node_b in c)
+        assert clique_a_idx != clique_b_idx
+
+
+def test_assign_node_edges_load_balances() -> None:
+    cliques = [{"n0", "n1", "n2"}, {"n3", "n4", "n5"}, {"n6", "n7", "n8"}, {"n9", "n10", "n11"}]
+    interclique_edges = build_interclique_edges(cliques, mode="fully_connected")
+    _, edge_counts = assign_node_edges(cliques, interclique_edges)
+
+    for clique in cliques:
+        counts_in_clique = [edge_counts[n] for n in clique]
+        max_diff = max(counts_in_clique) - min(counts_in_clique)
+        assert max_diff <= 1, f"Load imbalance in clique: {counts_in_clique}"
+
+
+def test_build_full_topology_returns_all_components() -> None:
+    node_labels = {f"n{i}": {"A": 0.5, "B": 0.5} for i in range(12)}
+    cliques, intra_edges, inter_edges, edge_counts = build_full_topology(
+        node_labels, clique_size=3, iterations=10, edge_mode="small_world", seed=42
+    )
+
+    assert len(cliques) == 4
+    assert all(len(c) == 3 for c in cliques)
+
+    expected_intra = 4 * 3  # 4 cliques, each with C(3,2)=3 edges
+    assert len(intra_edges) == expected_intra
+
+    assert len(inter_edges) > 0
+
+    all_nodes = set()
+    for c in cliques:
+        all_nodes.update(c)
+    assert len(all_nodes) == 12
+    assert all(n in edge_counts for n in all_nodes)
+
+
+def test_build_full_topology_edges_connect_correct_nodes() -> None:
+    node_labels = {f"n{i}": {"A": 0.5, "B": 0.5} for i in range(9)}
+    cliques, intra_edges, inter_edges, _ = build_full_topology(
+        node_labels, clique_size=3, iterations=10, edge_mode="ring", seed=42
+    )
+
+    node_to_clique = {}
+    for idx, clique in enumerate(cliques):
+        for node in clique:
+            node_to_clique[node] = idx
+
+    for n1, n2 in intra_edges:
+        assert node_to_clique[n1] == node_to_clique[n2], "Intra-edge connects different cliques"
+
+    for n1, n2 in inter_edges:
+        assert node_to_clique[n1] != node_to_clique[n2], "Inter-edge connects same clique"
