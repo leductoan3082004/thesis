@@ -5,17 +5,31 @@
   "port": 50054,
   "dataset": {
     "name": "mnist",
-    "num_clients": 6,
+    "num_clients": 10,
     "alpha": 0.5,
     "seed": 42
   },
   "training": {
-    "num_rounds": 3,
+    "num_rounds": 50,
     "local_epochs": 1,
     "batch_size": 64
   },
   "secure_agg": {
     "threshold": 3,
     "scale": 1000000.0
+  },
+  "inter_cluster": {
+    "enabled": true,
+    "topology_file": "/app/config/topology.json",
+    "ipfs": {
+      "storage_path": "/app/data/ipfs"
+    },
+    "blockchain": {
+      "storage_path": "/app/data/blockchain.json"
+    },
+    "window_size": 10,
+    "alpha": 0.5,
+    "base_gamma": 0.2,
+    "freshness_window": 300.0
   }
 }

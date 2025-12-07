@@ -3,7 +3,7 @@
 import logging
 from concurrent import futures
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence, Set
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import grpc
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
@@ -41,6 +41,7 @@ class TopologyState:
     node_to_clique: Dict[str, int] = field(default_factory=dict)
     partition: Dict[str, List[int]] = field(default_factory=dict)
     thresholds: Dict[int, int] = field(default_factory=dict)
+    inter_edges: List[Tuple[str, str]] = field(default_factory=list)
 
 
 class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
@@ -95,12 +96,14 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             node_to_clique=node_to_clique,
             partition=partition,
             thresholds=thresholds,
+            inter_edges=inter_edges,
         )
 
         logger.info(
             f"Topology built: {len(cliques)} cliques, "
             f"clique sizes: {[len(c) for c in cliques]}, "
-            f"thresholds: {list(thresholds.values())}"
+            f"thresholds: {list(thresholds.values())}, "
+            f"inter_edges: {len(inter_edges)}"
         )
 
     def RegisterNode(self, request: secureagg_pb2.RegisterRequest, context) -> secureagg_pb2.RegisterResponse:

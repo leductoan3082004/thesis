@@ -126,6 +126,8 @@ The system will automatically:
 
 - **[RUN_INSTRUCTIONS.md](RUN_INSTRUCTIONS.md)**: Detailed usage guide with troubleshooting
 - **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)**: Complete technical overview
+- **[TOPOLOGY_IMPLEMENTATION.md](TOPOLOGY_IMPLEMENTATION.md)**: D-Cliques topology design and implementation
+- **[INTER_CLUSTER_AGGREGATION.md](INTER_CLUSTER_AGGREGATION.md)**: Inter-cluster flow with IPFS/Blockchain and robust merge algorithm
 - **[context_codex.md](context_codex.md)**: Protocol specification and design notes
 - **[plan.md](plan.md)**: Phase-by-phase implementation plan
 

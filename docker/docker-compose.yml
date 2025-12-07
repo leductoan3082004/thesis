@@ -6,32 +6,38 @@ services:
       context: ..
       dockerfile: docker/node.Dockerfile
     container_name: ttp
-    command: ["python", "scripts/run_ttp_with_topology.py", "--num-clients", "6", "--clique-size", "3"]
+    command: ["python", "scripts/run_ttp_with_topology.py", "--num-clients", "10", "--clique-size", "4", "--topology-output", "/app/config/topology.json"]
     networks:
       - secureagg
     ports:
       - "50051:50051"
     environment:
       - PYTHONUNBUFFERED=1
-      - NUM_CLIENTS=6
-      - CLIQUE_SIZE=3
+      - NUM_CLIENTS=10
+      - CLIQUE_SIZE=4
       - ALPHA=0.5
       - SEED=42
     volumes:
       - ../data:/app/data
       - ../logs:/app/logs
       - ../config:/app/config
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/app/config/topology.json') else 1)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
 
   node_0:
     build:
       context: ..
       dockerfile: docker/node.Dockerfile
     container_name: node_0
-    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_0.json"]
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_0.json"]
     networks:
       - secureagg
     depends_on:
-      - ttp
+      ttp:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
@@ -45,11 +51,12 @@ services:
       context: ..
       dockerfile: docker/node.Dockerfile
     container_name: node_1
-    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_1.json"]
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_1.json"]
     networks:
       - secureagg
     depends_on:
-      - ttp
+      ttp:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
@@ -63,11 +70,12 @@ services:
       context: ..
       dockerfile: docker/node.Dockerfile
     container_name: node_2
-    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_2.json"]
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_2.json"]
     networks:
       - secureagg
     depends_on:
-      - ttp
+      ttp:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
@@ -81,11 +89,12 @@ services:
       context: ..
       dockerfile: docker/node.Dockerfile
     container_name: node_3
-    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_3.json"]
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_3.json"]
     networks:
       - secureagg
     depends_on:
-      - ttp
+      ttp:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
@@ -99,11 +108,12 @@ services:
       context: ..
       dockerfile: docker/node.Dockerfile
     container_name: node_4
-    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_4.json"]
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_4.json"]
     networks:
       - secureagg
     depends_on:
-      - ttp
+      ttp:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
@@ -117,11 +127,88 @@ services:
       context: ..
       dockerfile: docker/node.Dockerfile
     container_name: node_5
-    command: ["python", "-m", "secure_aggregation.communication.node_service", "--config", "/app/config/nodes/node_5.json"]
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_5.json"]
     networks:
       - secureagg
     depends_on:
-      - ttp
+      ttp:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_6:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_6
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_6.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_7:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_7
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_7.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_8:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_8
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_8.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+
+  node_9:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_9
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_9.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt

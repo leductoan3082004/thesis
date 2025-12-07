@@ -123,9 +123,11 @@ class SecureAggregationNode:
 
     def __init__(self, node_id: str, signing_private=None, signing_public=None) -> None:
         self.node_id = node_id
-        self.signing_private, self.signing_public = (
-            (signing_private, signing_public) if signing_private and signing_public else generate_signing_keypair()
-        )
+        if signing_private and signing_public:
+            self.signing_private, self.signing_public = signing_private, signing_public
+        else:
+            keypair = generate_signing_keypair()
+            self.signing_private, self.signing_public = keypair.private_key, keypair.public_key
         self.c_private = None
         self.c_public = b""
         self.s_private = None

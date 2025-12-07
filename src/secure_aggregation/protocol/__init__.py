@@ -9,6 +9,13 @@ from .core import (
     SurvivorSignature,
     UnmaskingShares,
 )
+from .inter_cluster import (
+    AdaptiveClipper,
+    InterClusterMerger,
+    MergeConfig,
+    clip_delta,
+    compute_adaptive_gamma,
+)
 
 __all__ = [
     "AdvertiseMessage",
@@ -20,4 +27,9 @@ __all__ = [
     "SecureAggregationResult",
     "SurvivorSignature",
     "UnmaskingShares",
+    "AdaptiveClipper",
+    "InterClusterMerger",
+    "MergeConfig",
+    "clip_delta",
+    "compute_adaptive_gamma",
 ]

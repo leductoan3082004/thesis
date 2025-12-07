@@ -9,6 +9,8 @@ from pathlib import Path
 from torchvision import datasets, transforms
 
 from secure_aggregation.communication.ttp_service import TopologyConfig, serve
+from secure_aggregation.data import dirichlet_partition
+from secure_aggregation.topology import build_full_topology, compute_node_labels_from_partition
 from secure_aggregation.utils import configure_logging, get_logger
 
 logger = get_logger("ttp_startup")
@@ -24,6 +26,54 @@ def load_mnist_labels(data_dir: str = "/app/data") -> dict[int, int]:
     return labels
 
 
+def write_topology_file(
+    labels: dict[int, int],
+    num_clients: int,
+    clique_size: int,
+    alpha: float,
+    seed: int,
+    edge_mode: str,
+    iterations: int,
+    output_path: str,
+) -> None:
+    """Build topology and write to shared config file for nodes to read."""
+    dataset_indices = list(labels.keys())
+
+    partition = dirichlet_partition(
+        dataset=dataset_indices,
+        labels=labels,
+        num_clients=num_clients,
+        alpha=alpha,
+        seed=seed,
+    )
+
+    node_labels = compute_node_labels_from_partition(partition, labels)
+
+    cliques, intra_edges, inter_edges, edge_counts = build_full_topology(
+        node_labels=node_labels,
+        clique_size=clique_size,
+        iterations=iterations,
+        edge_mode=edge_mode,
+        seed=seed,
+    )
+
+    topology_data = {
+        "num_cliques": len(cliques),
+        "cliques": [sorted(list(c)) for c in cliques],
+        "inter_edges": [[e[0], e[1]] for e in inter_edges],
+        "edge_counts": edge_counts,
+    }
+
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w") as f:
+        json.dump(topology_data, f, indent=2)
+
+    logger.info(
+        f"Wrote topology to {output_path}: {len(cliques)} cliques, {len(inter_edges)} inter-edges"
+    )
+
+
 def main():
     configure_logging()
 
@@ -37,6 +87,8 @@ def main():
     parser.add_argument("--iterations", type=int, default=1000, help="Topology iterations")
     parser.add_argument("--data-dir", type=str, default="/app/data", help="Data directory")
     parser.add_argument("--config", type=str, help="JSON config file (overrides CLI args)")
+    parser.add_argument("--topology-output", type=str, default="/app/config/topology.json",
+                        help="Path to write topology config for nodes")
     args = parser.parse_args()
 
     # Load config from file if provided
@@ -68,6 +120,18 @@ def main():
 
     # Load MNIST labels
     labels = load_mnist_labels(args.data_dir)
+
+    # Write topology file for nodes to read inter_edges
+    write_topology_file(
+        labels=labels,
+        num_clients=num_clients,
+        clique_size=clique_size,
+        alpha=alpha,
+        seed=seed,
+        edge_mode=edge_mode,
+        iterations=iterations,
+        output_path=args.topology_output,
+    )
 
     # Create topology config
     topology_config = TopologyConfig(

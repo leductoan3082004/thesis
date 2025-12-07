@@ -9,6 +9,11 @@ from .graph import (
     compute_skew,
     elect_clique_aggregator,
     find_node_clique,
+    get_bridge_nodes,
+    get_clique_bridge_nodes,
+    get_inter_clique_neighbors,
+    get_neighbor_clique_indices,
+    is_bridge_node,
     metropolis_hastings_weights,
 )
 
@@ -23,5 +28,10 @@ __all__ = [
     "compute_skew",
     "elect_clique_aggregator",
     "find_node_clique",
+    "get_bridge_nodes",
+    "get_clique_bridge_nodes",
+    "get_inter_clique_neighbors",
+    "get_neighbor_clique_indices",
+    "is_bridge_node",
     "metropolis_hastings_weights",
 ]

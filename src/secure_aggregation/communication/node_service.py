@@ -5,9 +5,10 @@ import copy
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import grpc
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
@@ -15,12 +16,16 @@ from torchvision import datasets, transforms
 
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
 from secure_aggregation.communication.aggregator_service import serve as serve_aggregator
+from secure_aggregation.communication.bridge_service import BridgeClient, serve_bridge
+from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
 from secure_aggregation.config.models import NodeRole
-from secure_aggregation.crypto.sign import SigningKeyPair, sign_message, verify_signature
-from secure_aggregation.crypto.dh import DHKeyPair, generate_dh_keypair, agree
+from secure_aggregation.crypto.dh import DHKeyPair, generate_dh_keypair
+from secure_aggregation.crypto.sign import SigningKeyPair, sign_message
 from secure_aggregation.data import dirichlet_partition
-from secure_aggregation.node import NodeEngine, NodeRuntimeConfig, ReliabilityScore
-from secure_aggregation.topology import elect_clique_aggregator
+from secure_aggregation.node import ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
+from secure_aggregation.protocol import MergeConfig
+from secure_aggregation.storage.model_store import MockBlockchain, MockIPFS
+from secure_aggregation.topology import elect_clique_aggregator, get_inter_clique_neighbors, is_bridge_node
 from secure_aggregation.utils import configure_logging, get_logger
 
 logger = get_logger("node_service")
@@ -97,6 +102,19 @@ class NodeService:
         # DH keypairs for secure aggregation
         self.c_keypair: Optional[DHKeyPair] = None  # For encryption
         self.s_keypair: Optional[DHKeyPair] = None  # For masking
+
+        # Inter-cluster aggregation state
+        self.inter_cluster_config = self.config.get("inter_cluster", {})
+        self.inter_cluster_enabled = self.inter_cluster_config.get("enabled", False)
+        self.inter_edges: List[Tuple[str, str]] = []
+        self.is_bridge_node = False
+        self.neighbor_bridge_addresses: List[str] = []
+        self.ecm_buffer: Optional[ECMBuffer] = None
+        self.bridge_server: Optional[grpc.Server] = None
+        self.bridge_client: Optional[BridgeClient] = None
+        self.inter_cluster_aggregator: Optional[InterClusterAggregator] = None
+        self.ipfs: Optional[MockIPFS] = None
+        self.blockchain: Optional[MockBlockchain] = None
 
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
 
@@ -272,6 +290,98 @@ class NodeService:
             self.aggregator_server = None
             logger.info("Stopped aggregator server")
 
+    def setup_inter_cluster(self) -> None:
+        """Setup inter-cluster aggregation components."""
+        if not self.inter_cluster_enabled:
+            logger.info("Inter-cluster aggregation disabled")
+            return
+
+        ipfs_config = self.inter_cluster_config.get("ipfs", {})
+        blockchain_config = self.inter_cluster_config.get("blockchain", {})
+
+        ipfs_path = ipfs_config.get("storage_path", "/app/data/ipfs")
+        blockchain_path = blockchain_config.get("storage_path", "/app/data/blockchain.json")
+
+        self.ipfs = MockIPFS(storage_path=ipfs_path)
+        self.blockchain = MockBlockchain(storage_path=blockchain_path)
+
+        merge_config = MergeConfig(
+            window_size=self.inter_cluster_config.get("window_size", 10),
+            alpha=self.inter_cluster_config.get("alpha", 0.5),
+            base_gamma=self.inter_cluster_config.get("base_gamma", 0.2),
+        )
+
+        self.ecm_buffer = ECMBuffer(
+            freshness_window=self.inter_cluster_config.get("freshness_window", 300.0)
+        )
+
+        self.inter_cluster_aggregator = InterClusterAggregator(
+            cluster_id=f"cluster_{self.clique_id}",
+            ipfs=self.ipfs,
+            blockchain=self.blockchain,
+            merge_config=merge_config,
+        )
+
+        logger.info(
+            f"Inter-cluster aggregation enabled: "
+            f"ipfs={ipfs_path}, blockchain={blockchain_path}"
+        )
+
+    def setup_bridge_node(self, inter_edges: List[Tuple[str, str]]) -> None:
+        """Setup bridge node if this node has inter-clique connections."""
+        self.inter_edges = inter_edges
+        self.is_bridge_node = is_bridge_node(self.node_id, inter_edges)
+
+        if not self.is_bridge_node:
+            logger.info(f"Node {self.node_id} is not a bridge node")
+            return
+
+        neighbors = get_inter_clique_neighbors(self.node_id, inter_edges)
+        self.neighbor_bridge_addresses = [
+            f"{n}:{self.port + 2000}" for n in neighbors
+        ]
+
+        logger.info(
+            f"Node {self.node_id} is a bridge node with {len(neighbors)} "
+            f"inter-clique neighbors: {neighbors}"
+        )
+
+        if self.inter_cluster_enabled and self.ecm_buffer:
+            self.bridge_server = serve_bridge(
+                self.node_id,
+                self.port + 2000,
+                self.ecm_buffer,
+            )
+            self.bridge_client = BridgeClient(self.node_id)
+            logger.info(f"Bridge server started on port {self.port + 2000}")
+
+    def stop_bridge_server(self) -> None:
+        """Stop bridge server."""
+        if self.bridge_server:
+            self.bridge_server.stop(0)
+            self.bridge_server = None
+        if self.bridge_client:
+            self.bridge_client.close()
+            self.bridge_client = None
+        logger.info("Bridge server stopped")
+
+    def gossip_ecm(self, cid: str, model_hash: str, round_num: int) -> None:
+        """Gossip ECM to neighbor cluster bridge nodes."""
+        if not self.is_bridge_node or not self.bridge_client:
+            return
+
+        cluster_id = f"cluster_{self.clique_id}"
+        accepted = self.bridge_client.broadcast_ecm(
+            self.neighbor_bridge_addresses,
+            cluster_id,
+            round_num,
+            cid,
+            model_hash,
+        )
+        logger.info(
+            f"Gossiped ECM to {accepted}/{len(self.neighbor_bridge_addresses)} neighbors"
+        )
+
     def run_secure_aggregation_round(self) -> List[float]:
         """Run one round of secure aggregation protocol."""
         logger.info(f"Starting secure aggregation round {self.current_round}")
@@ -439,6 +549,8 @@ class NodeService:
             time.sleep(3)
 
             # Run secure aggregation
+            cid: Optional[str] = None
+            model_hash: Optional[str] = None
             try:
                 logger.info("Phase 2: Secure aggregation")
                 aggregated_weights = self.run_secure_aggregation_round()
@@ -448,6 +560,26 @@ class NodeService:
                     logger.info("Phase 3: Updating model with aggregated weights")
                     dequantized = dequantize_vector([int(w) for w in aggregated_weights], self.scale)
                     load_params(self.model, dequantized)
+
+                    # Inter-cluster merge (aggregator only)
+                    if self.is_aggregator and self.inter_cluster_enabled and self.inter_cluster_aggregator:
+                        logger.info("Phase 4: Inter-cluster merge")
+                        intra_model = np.array(dequantized, dtype=np.float32)
+
+                        # Collect ECMs from bridge nodes' buffers
+                        if self.ecm_buffer:
+                            for ecm in self.ecm_buffer.get_fresh_ecms():
+                                self.inter_cluster_aggregator.receive_ecms(
+                                    self.node_id, [ecm]
+                                )
+
+                        merged_model, cid, model_hash = self.inter_cluster_aggregator.process_round(
+                            intra_model, round_idx
+                        )
+
+                        dequantized = merged_model.tolist()
+                        load_params(self.model, dequantized)
+                        logger.info(f"Inter-cluster merge complete: cid={cid[:16] if cid else 'N/A'}...")
 
                 # Evaluate after aggregation
                 acc_after = self.evaluate()
@@ -462,6 +594,11 @@ class NodeService:
                 if self.is_aggregator:
                     time.sleep(2)  # Wait for other nodes to finish
                     self.stop_aggregator_server()
+
+            # ECM gossip (bridge nodes only)
+            if cid and model_hash and self.is_bridge_node:
+                logger.info("Phase 5: ECM gossip to neighbor clusters")
+                self.gossip_ecm(cid, model_hash, round_idx)
 
             # Sync point: wait for next round
             logger.info(f"Round {round_idx} complete. Waiting before next round...")
@@ -482,6 +619,24 @@ class NodeService:
         self.setup_data()
         self.setup_model()
 
+        # Setup inter-cluster aggregation
+        self.setup_inter_cluster()
+
+        # Load inter_edges from topology file or config
+        inter_edges: List[Tuple[str, str]] = []
+        topology_file = self.inter_cluster_config.get("topology_file", "/app/config/topology.json")
+        if Path(topology_file).exists():
+            with open(topology_file) as f:
+                topology_data = json.load(f)
+            inter_edges = [(e[0], e[1]) for e in topology_data.get("inter_edges", [])]
+            logger.info(f"Loaded {len(inter_edges)} inter-edges from {topology_file}")
+        else:
+            inter_edges_config = self.inter_cluster_config.get("inter_edges", [])
+            inter_edges = [(e[0], e[1]) for e in inter_edges_config]
+
+        if inter_edges:
+            self.setup_bridge_node(inter_edges)
+
         # Wait for clique members or all nodes to be ready
         if self.clique_members:
             expected_count = len(self.clique_members)
@@ -501,8 +656,12 @@ class NodeService:
 
         time.sleep(2)
 
-        # Run training loop
-        self.run_training_loop()
+        try:
+            # Run training loop
+            self.run_training_loop()
+        finally:
+            # Cleanup bridge server
+            self.stop_bridge_server()
 
         logger.info(f"Node {self.node_id} finished")
 

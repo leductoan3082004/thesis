@@ -323,3 +323,110 @@ def elect_clique_aggregator(clique_members: Iterable[str], round_idx: int) -> st
     if not sorted_members:
         raise ValueError("clique_members cannot be empty")
     return sorted_members[round_idx % len(sorted_members)]
+
+
+def get_bridge_nodes(inter_edges: Sequence[Tuple[str, str]]) -> Set[str]:
+    """
+    Identify all bridge nodes (nodes with inter-clique connections).
+
+    Args:
+        inter_edges: List of (node_a, node_b) inter-clique edges.
+
+    Returns:
+        Set of node IDs that are bridge nodes.
+    """
+    bridge_nodes: Set[str] = set()
+    for node_a, node_b in inter_edges:
+        bridge_nodes.add(node_a)
+        bridge_nodes.add(node_b)
+    return bridge_nodes
+
+
+def get_inter_clique_neighbors(node_id: str, inter_edges: Sequence[Tuple[str, str]]) -> List[str]:
+    """
+    Get all inter-clique neighbors for a given node.
+
+    Args:
+        node_id: The node identifier.
+        inter_edges: List of (node_a, node_b) inter-clique edges.
+
+    Returns:
+        List of node IDs that are inter-clique neighbors.
+    """
+    neighbors: List[str] = []
+    for a, b in inter_edges:
+        if a == node_id:
+            neighbors.append(b)
+        elif b == node_id:
+            neighbors.append(a)
+    return neighbors
+
+
+def is_bridge_node(node_id: str, inter_edges: Sequence[Tuple[str, str]]) -> bool:
+    """
+    Check if a node is a bridge node.
+
+    Args:
+        node_id: The node identifier.
+        inter_edges: List of (node_a, node_b) inter-clique edges.
+
+    Returns:
+        True if node has inter-clique connections.
+    """
+    for a, b in inter_edges:
+        if a == node_id or b == node_id:
+            return True
+    return False
+
+
+def get_clique_bridge_nodes(
+    clique_idx: int,
+    cliques: Sequence[Set[str]],
+    inter_edges: Sequence[Tuple[str, str]],
+) -> Set[str]:
+    """
+    Get bridge nodes within a specific clique.
+
+    Args:
+        clique_idx: Index of the clique.
+        cliques: List of clique sets.
+        inter_edges: List of (node_a, node_b) inter-clique edges.
+
+    Returns:
+        Set of bridge node IDs in the specified clique.
+    """
+    clique_members = cliques[clique_idx]
+    all_bridge_nodes = get_bridge_nodes(inter_edges)
+    return clique_members & all_bridge_nodes
+
+
+def get_neighbor_clique_indices(
+    clique_idx: int,
+    cliques: Sequence[Set[str]],
+    inter_edges: Sequence[Tuple[str, str]],
+) -> Set[int]:
+    """
+    Get indices of cliques connected to the given clique.
+
+    Args:
+        clique_idx: Index of the clique.
+        cliques: List of clique sets.
+        inter_edges: List of (node_a, node_b) inter-clique edges.
+
+    Returns:
+        Set of clique indices that are neighbors.
+    """
+    clique_members = cliques[clique_idx]
+    node_to_clique = {}
+    for idx, clique in enumerate(cliques):
+        for node in clique:
+            node_to_clique[node] = idx
+
+    neighbor_indices: Set[int] = set()
+    for a, b in inter_edges:
+        if a in clique_members:
+            neighbor_indices.add(node_to_clique[b])
+        elif b in clique_members:
+            neighbor_indices.add(node_to_clique[a])
+
+    return neighbor_indices

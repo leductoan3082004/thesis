@@ -1,3 +1,4 @@
+from .ecm_buffer import ECM, ECMBuffer
 from .engine import (
     GossipCache,
     ModelSnapshot,
@@ -7,6 +8,8 @@ from .engine import (
 )
 
 __all__ = [
+    "ECM",
+    "ECMBuffer",
     "GossipCache",
     "ModelSnapshot",
     "NodeEngine",

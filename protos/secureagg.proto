@@ -118,3 +118,33 @@ message ModelResponse {
   int32 round = 2;
   string aggregator_id = 3;
 }
+
+// Inter-cluster ECM (External Cluster Model) messages
+message ECMMessage {
+  string cid = 1;           // IPFS content identifier
+  string hash = 2;          // SHA256 hash for verification
+  string source_cluster = 3; // Origin cluster ID
+}
+
+message ECMSubmitRequest {
+  string node_id = 1;
+  repeated ECMMessage ecms = 2;  // ECMs from neighbor clusters
+}
+
+message ECMSubmitResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ECMBroadcast {
+  string cluster_id = 1;
+  int32 round = 2;
+  string cid = 3;
+  string hash = 4;
+}
+
+// Bridge node service for inter-cluster ECM gossip
+service BridgeService {
+  rpc SubmitECMs(ECMSubmitRequest) returns (ECMSubmitResponse);
+  rpc ReceiveECM(ECMBroadcast) returns (ECMSubmitResponse);
+}
