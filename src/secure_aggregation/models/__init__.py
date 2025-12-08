@@ -1,4 +1,7 @@
-# Models module - currently unused by the secure aggregation system.
-# Reserved for future model abstractions.
+from secure_aggregation.models.registry import ModelRegistry
+from secure_aggregation.models.vector import VectorModel
 
-__all__ = []
+__all__ = [
+    "ModelRegistry",
+    "VectorModel",
+]

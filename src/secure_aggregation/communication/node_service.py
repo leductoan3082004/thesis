@@ -19,11 +19,11 @@ from secure_aggregation.communication.aggregator_service import serve as serve_a
 from secure_aggregation.communication.bridge_service import BridgeClient, serve_bridge
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
 from secure_aggregation.config.models import NodeRole
-from secure_aggregation.crypto.dh import DHKeyPair, generate_dh_keypair
-from secure_aggregation.crypto.sign import SigningKeyPair, sign_message
+from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition
 from secure_aggregation.node import ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
-from secure_aggregation.protocol import MergeConfig
+from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
+from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
 from secure_aggregation.storage.model_store import MockBlockchain, MockIPFS
 from secure_aggregation.topology import elect_clique_aggregator, get_inter_clique_neighbors, is_bridge_node
 from secure_aggregation.utils import configure_logging, get_logger
@@ -65,6 +65,11 @@ def dequantize_vector(ints: List[int], scale: float) -> List[float]:
     return [float(i) / scale for i in ints]
 
 
+def _encode_share(x: int, share: int) -> bytes:
+    """Pack (x, share) tuple for transport."""
+    return _int_to_bytes(x, 2) + _int_to_bytes(share, SHARE_BYTES)
+
+
 class NodeService:
     """Node service that coordinates training and secure aggregation."""
 
@@ -98,10 +103,6 @@ class NodeService:
         self.clique_members: List[str] = []
         self.clique_threshold: int = 0
         self.assigned_data_indices: List[int] = []
-
-        # DH keypairs for secure aggregation
-        self.c_keypair: Optional[DHKeyPair] = None  # For encryption
-        self.s_keypair: Optional[DHKeyPair] = None  # For masking
 
         # Inter-cluster aggregation state
         self.inter_cluster_config = self.config.get("inter_cluster", {})
@@ -278,8 +279,15 @@ class NodeService:
 
         # Use clique members if available, otherwise all participants
         participant_ids = self.clique_members if self.clique_members else list(self.participant_map.keys())
+        signing_public_keys: Dict[str, bytes] = {}
+        if self.participants:
+            signing_public_keys = {p.node_id: bytes(p.signing_public_key) for p in self.participants}
         self.aggregator_server = serve_aggregator(
-            self.node_id, self.port + 1000, self.threshold, participant_ids
+            self.node_id,
+            self.port + 1000,
+            self.threshold,
+            participant_ids,
+            signing_public_keys=signing_public_keys or None,
         )
         logger.info(f"Started aggregator server on port {self.port + 1000} for {len(participant_ids)} clique members")
 
@@ -385,10 +393,12 @@ class NodeService:
     def run_secure_aggregation_round(self) -> List[float]:
         """Run one round of secure aggregation protocol."""
         logger.info(f"Starting secure aggregation round {self.current_round}")
-
-        # Generate DH keypairs
-        self.c_keypair = generate_dh_keypair()
-        self.s_keypair = generate_dh_keypair()
+        # Client-side secure aggregation state
+        client = SecureAggregationNode(
+            self.node_id,
+            signing_private=self.signing_keypair.private_key if self.signing_keypair else None,
+            signing_public=self.signing_keypair.public_key if self.signing_keypair else None,
+        )
 
         # Get aggregator address
         agg_port = int(self.aggregator_address.split(":")[-1]) + 1000
@@ -400,8 +410,7 @@ class NodeService:
 
         # Round 0: Advertise keys
         logger.info("Round 0: Advertising keys")
-        key_msg = self.c_keypair.public_key + self.s_keypair.public_key
-        signature = sign_message(self.signing_keypair.private_key, key_msg)
+        advert_msg = client.advertise_keys()
 
         # Retry logic for initial aggregator connection.
         max_retries = 30
@@ -412,9 +421,9 @@ class NodeService:
                 response = stub.Round0AdvertiseKeys(
                     secureagg_pb2.KeyAdvertisement(
                         node_id=self.node_id,
-                        c_public_key=self.c_keypair.public_key,
-                        s_public_key=self.s_keypair.public_key,
-                        signature=signature
+                        c_public_key=advert_msg.c_public,
+                        s_public_key=advert_msg.s_public,
+                        signature=advert_msg.signature,
                     ),
                     timeout=30
                 )
@@ -432,72 +441,138 @@ class NodeService:
         if not response.accepted:
             raise RuntimeError(f"Round 0 failed: {response.message}")
 
-        # Wait for U1 list
-        while not response.all_keys:
+        # Wait for ALL clique members to advertise (not just threshold).
+        expected_participants = len(self.clique_members)
+        while len(response.all_keys) < expected_participants:
             time.sleep(1)
             response = stub.Round0AdvertiseKeys(
                 secureagg_pb2.KeyAdvertisement(
                     node_id=self.node_id,
-                    c_public_key=self.c_keypair.public_key,
-                    s_public_key=self.s_keypair.public_key,
-                    signature=signature
+                    c_public_key=advert_msg.c_public,
+                    s_public_key=advert_msg.s_public,
+                    signature=advert_msg.signature,
                 ),
                 timeout=30
             )
 
         logger.info(f"Round 0 complete: received {len(response.all_keys)} participants")
 
+        # Pass received advertisements to client
+        ordered_participants = [p.node_id for p in response.all_keys]
+        adverts = [
+            AdvertiseMessage(
+                node_id=p.node_id,
+                c_public=bytes(p.c_public_key),
+                s_public=bytes(p.s_public_key),
+                signature=bytes(p.signature),
+                signing_public=None,
+            )
+            for p in response.all_keys
+        ]
+        client.receive_advertisements(adverts)
+
         # Round 1: Share keys (simplified - just send empty shares)
         logger.info("Round 1: Sharing keys")
-        shares = {p.node_id: b"" for p in response.all_keys if p.node_id != self.node_id}
+        ct_list = client.create_round1_ciphertexts(ordered_participants, self.threshold)
         response1 = stub.Round1ShareKeys(
-            secureagg_pb2.ShareKeysMessage(node_id=self.node_id, encrypted_shares=shares),
-            timeout=30
+            secureagg_pb2.ShareKeysMessage(
+                node_id=self.node_id,
+                ciphertexts=[
+                    secureagg_pb2.Round1Ciphertext(
+                        sender_id=ct.sender_id,
+                        recipient_id=ct.recipient_id,
+                        iv=ct.iv,
+                        ciphertext=ct.ciphertext,
+                        tag=ct.tag,
+                    )
+                    for ct in ct_list
+                ],
+            ),
+            timeout=30,
         )
+        mailbox = [
+            Round1Ciphertext(
+                sender_id=ct.sender_id,
+                recipient_id=ct.recipient_id,
+                iv=bytes(ct.iv),
+                ciphertext=bytes(ct.ciphertext),
+                tag=bytes(ct.tag),
+            )
+            for ct in response1.mailbox
+        ]
+        # Poll until mailbox has entries from all n participants (each sends to all including self).
+        expected_mail = len(ordered_participants)
+        while len(mailbox) < expected_mail:
+            time.sleep(1)
+            response1 = stub.Round1ShareKeys(
+                secureagg_pb2.ShareKeysMessage(node_id=self.node_id, ciphertexts=[]),
+                timeout=30,
+            )
+            mailbox = [
+                Round1Ciphertext(
+                    sender_id=ct.sender_id,
+                    recipient_id=ct.recipient_id,
+                    iv=bytes(ct.iv),
+                    ciphertext=bytes(ct.ciphertext),
+                    tag=bytes(ct.tag),
+                )
+                for ct in response1.mailbox
+            ]
+        client.receive_round1_ciphertexts(mailbox)
 
         # Round 2: Send masked input
         logger.info("Round 2: Sending masked model")
         model_vec = flatten_params(self.model)
         quantized = quantize_vector(model_vec, self.scale)
 
+        masked = client.create_masked_input(quantized)
+        masked_bytes = [_int_to_bytes(val, SHARE_BYTES) for val in masked.masked_vector]
         response2 = stub.Round2MaskedInput(
-            secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=quantized),
-            timeout=30
+            secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes),
+            timeout=30,
         )
 
         # Wait for survivors list
         while not response2.survivors:
             time.sleep(1)
             response2 = stub.Round2MaskedInput(
-                secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=quantized),
-                timeout=30
+                secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes),
+                timeout=30,
             )
 
         logger.info(f"Round 2 complete: {len(response2.survivors)} survivors")
 
         # Round 3: Consistency check
         logger.info("Round 3: Consistency check")
-        survivors_msg = ",".join(sorted(response2.survivors)).encode()
-        sig3 = sign_message(self.signing_keypair.private_key, survivors_msg)
-
+        survivor_sig = client.sign_survivor_list(response2.survivors)
         response3 = stub.Round3ConsistencyCheck(
-            secureagg_pb2.ConsistencySignature(node_id=self.node_id, signature=sig3),
-            timeout=30
+            secureagg_pb2.ConsistencySignature(node_id=self.node_id, signature=survivor_sig.signature),
+            timeout=30,
         )
 
         # Round 4: Unmask (simplified - send empty shares)
         logger.info("Round 4: Unmasking")
+        dropouts = set(ordered_participants) - set(response2.survivors)
+        unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
         response4 = stub.Round4Unmask(
-            secureagg_pb2.UnmaskShares(node_id=self.node_id, dropout_s_shares={}, survivor_b_shares={}),
-            timeout=30
+            secureagg_pb2.UnmaskShares(
+                node_id=self.node_id,
+                dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
+                survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
+            ),
+            timeout=30,
         )
 
         # Wait for aggregation to complete
         while not response4.aggregation_complete:
             time.sleep(1)
             response4 = stub.Round4Unmask(
-                secureagg_pb2.UnmaskShares(node_id=self.node_id, dropout_s_shares={}, survivor_b_shares={}),
-                timeout=30
+                secureagg_pb2.UnmaskShares(
+                    node_id=self.node_id,
+                    dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
+                    survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
+                ),
+                timeout=30,
             )
 
         logger.info("Round 4 complete: aggregation done")
@@ -542,11 +617,10 @@ class NodeService:
             if self.is_aggregator:
                 logger.info(f"*** This node is the AGGREGATOR for round {round_idx} ***")
                 self.start_aggregator_server()
-                time.sleep(2)  # Give server time to start
 
-            # All nodes wait for aggregator to be ready
+            # All nodes wait for aggregator to be ready (same total wait time for all)
             logger.info(f"Waiting for aggregator {self.aggregator_id} to be ready...")
-            time.sleep(3)
+            time.sleep(5)
 
             # Run secure aggregation
             cid: Optional[str] = None

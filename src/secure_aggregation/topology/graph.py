@@ -275,7 +275,11 @@ def compute_node_labels_from_partition(
 
 def compute_clique_threshold(clique_size: int) -> int:
     """
-    Compute threshold as 2/3 majority of clique size.
+    Compute threshold as 2/3 majority of clique size, capped at n-1.
+
+    The cap at n-1 is required because in the unmasking phase, each node
+    can only provide b-shares for OTHER survivors (not itself). So the
+    maximum collectible b-shares per survivor is n-1.
 
     Args:
         clique_size: Number of nodes in the clique.
@@ -285,7 +289,8 @@ def compute_clique_threshold(clique_size: int) -> int:
     """
     if clique_size <= 0:
         raise ValueError("clique_size must be positive")
-    return math.ceil(0.6667 * clique_size)
+    two_thirds = math.ceil(0.6667 * clique_size)
+    return min(two_thirds, clique_size - 1) if clique_size > 1 else 1
 
 
 def find_node_clique(node_id: str, cliques: Sequence[Set[str]]) -> Tuple[int, Set[str]]:

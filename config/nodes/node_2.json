@@ -5,21 +5,21 @@
   "port": 50054,
   "dataset": {
     "name": "mnist",
-    "num_clients": 10,
+    "num_clients": 3,
     "alpha": 0.5,
     "seed": 42
   },
   "training": {
-    "num_rounds": 50,
+    "num_rounds": 5,
     "local_epochs": 1,
     "batch_size": 64
   },
   "secure_agg": {
-    "threshold": 3,
+    "threshold": 2,
     "scale": 1000000.0
   },
   "inter_cluster": {
-    "enabled": true,
+    "enabled": false,
     "topology_file": "/app/config/topology.json",
     "ipfs": {
       "storage_path": "/app/data/ipfs"

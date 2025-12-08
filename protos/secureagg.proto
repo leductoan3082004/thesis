@@ -64,18 +64,28 @@ message KeyAdvertisementAck {
 // Round 1: Share encrypted secrets
 message ShareKeysMessage {
   string node_id = 1;
-  map<string, bytes> encrypted_shares = 2;  // recipient_id -> AEAD ciphertext
+  repeated Round1Ciphertext ciphertexts = 2;
 }
 
 message ShareKeysAck {
   bool accepted = 1;
   string message = 2;
+  repeated Round1Ciphertext mailbox = 3;
+}
+
+// Round 1 ciphertext (per recipient)
+message Round1Ciphertext {
+  string sender_id = 1;
+  string recipient_id = 2;
+  bytes iv = 3;
+  bytes ciphertext = 4;
+  bytes tag = 5;
 }
 
 // Round 2: Masked model update
 message MaskedInputMessage {
   string node_id = 1;
-  repeated int64 masked_vector = 2;  // Quantized + masked model params
+  repeated bytes masked_vector = 2;  // Quantized + masked model params (big-endian)
 }
 
 message MaskedInputAck {

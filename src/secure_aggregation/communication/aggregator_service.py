@@ -2,260 +2,277 @@
 
 import logging
 from concurrent import futures
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import grpc
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
-from secure_aggregation.protocol import SecureAggregationAggregator, SecureAggregationConfig
+from secure_aggregation.protocol import (
+    AdvertiseMessage,
+    MaskedInput,
+    Round1Ciphertext as Round1CiphertextModel,
+    SecureAggregationAggregator,
+    SecureAggregationConfig,
+    SurvivorSignature,
+    UnmaskingShares as UnmaskingSharesModel,
+)
+from secure_aggregation.protocol.core import _bytes_to_int
+from secure_aggregation.protocol.core import _int_to_bytes as int_to_bytes
+from secure_aggregation.protocol.core import DH_PRIV_BYTES, SHARE_BYTES
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("aggregator_service")
 
 
-class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
-    """Aggregator that coordinates the 4-round secure aggregation protocol."""
+def _decode_round1_ciphertexts(requests: Sequence[secureagg_pb2.Round1Ciphertext]) -> List[Round1CiphertextModel]:
+    return [
+        Round1CiphertextModel(
+            sender_id=ct.sender_id,
+            recipient_id=ct.recipient_id,
+            iv=bytes(ct.iv),
+            ciphertext=bytes(ct.ciphertext),
+            tag=bytes(ct.tag),
+        )
+        for ct in requests
+    ]
 
-    def __init__(self, node_id: str, threshold: int, participant_ids: List[str]) -> None:
+
+def _encode_round1_ciphertexts(ciphertexts: Sequence[Round1CiphertextModel]) -> List[secureagg_pb2.Round1Ciphertext]:
+    return [
+        secureagg_pb2.Round1Ciphertext(
+            sender_id=ct.sender_id,
+            recipient_id=ct.recipient_id,
+            iv=ct.iv,
+            ciphertext=ct.ciphertext,
+            tag=ct.tag,
+        )
+        for ct in ciphertexts
+    ]
+
+
+def _encode_unmask_share(x: int, share: int) -> bytes:
+    """Pack (x, share) into bytes for transport."""
+    return int_to_bytes(x, 2) + int_to_bytes(share, SHARE_BYTES)
+
+
+def _decode_unmask_share(data: bytes) -> Tuple[int, int]:
+    """Unpack bytes into (x, share) tuple."""
+    x = int.from_bytes(data[:2], "big")
+    share = _bytes_to_int(data[2:])
+    return x, share
+
+
+class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
+    """Aggregator that coordinates the full 4-round secure aggregation protocol."""
+
+    def __init__(
+        self,
+        node_id: str,
+        threshold: int,
+        participant_ids: List[str],
+        signing_public_keys: Optional[Mapping[str, bytes]] = None,
+    ) -> None:
         self.node_id = node_id
         self.threshold = threshold
         self.participant_ids = participant_ids
-
-        # Protocol state storage
-        self.round0_keys: Dict[str, tuple] = {}  # node_id -> (c_pk, s_pk, sig)
-        self.round1_shares: Dict[str, Dict[str, bytes]] = {}  # node_id -> {recipient -> ciphertext}
-        self.round2_masked: Dict[str, List[int]] = {}  # node_id -> masked_vector
-        self.round3_signatures: Dict[str, bytes] = {}  # node_id -> signature
-        self.round4_unmasking: Dict[str, tuple] = {}  # node_id -> (dropout_shares, survivor_shares)
-
-        self.u1_list: List[tuple] = []  # List of (node_id, c_pk, s_pk, sig)
-        self.u3_survivors: List[str] = []
+        config = SecureAggregationConfig(participants=participant_ids, threshold=threshold)
+        self.aggregator = SecureAggregationAggregator(config=config, signing_public_keys=signing_public_keys)
         self.aggregated_result: Optional[List[float]] = None
         self.current_round = 0
+        self._adverts: Dict[str, AdvertiseMessage] = {}
+        self._adverts_committed = False
+        self._round3_signatures: Dict[str, bytes] = {}
+        self._round4_payloads: List[UnmaskingSharesModel] = []
 
-        logger.info(f"Aggregator {node_id} initialized with threshold={threshold}, participants={len(participant_ids)}")
+        logger.info(
+            f"Aggregator {node_id} initialized with threshold={threshold}, participants={len(participant_ids)}"
+        )
 
     def _validate_participant(self, node_id: str) -> bool:
-        """Validate that node_id is in the allowed participant list (clique members)."""
         return node_id in self.participant_ids
 
     def Round0AdvertiseKeys(self, request: secureagg_pb2.KeyAdvertisement, context) -> secureagg_pb2.KeyAdvertisementAck:
         """Collect DH public keys from participants (Round 0)."""
         node_id = request.node_id
 
-        # Reject nodes not in participant list (clique boundary validation)
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected key advertisement from {node_id}: not a clique member")
             return secureagg_pb2.KeyAdvertisementAck(accepted=False, message="Node not in clique")
 
-        # If this is a duplicate but we already have all keys, return the full list
-        if node_id in self.round0_keys:
-            logger.warning(f"Duplicate key advertisement from {node_id}")
-            # If we already have threshold participants, return the U1 list
-            if len(self.round0_keys) >= self.threshold and self.u1_list:
-                all_keys = [
-                    secureagg_pb2.KeyAdvertisement(
-                        node_id=nid, c_public_key=c_pk, s_public_key=s_pk, signature=sig
-                    )
-                    for nid, c_pk, s_pk, sig in self.u1_list
-                ]
-                logger.info(f"Round 0 complete: {len(self.u1_list)} participants")
-                return secureagg_pb2.KeyAdvertisementAck(
-                    accepted=True,
-                    all_keys=all_keys,
-                    message=f"Round 0 complete with {len(self.u1_list)} participants"
-                )
-            # Otherwise, still waiting for more participants
-            return secureagg_pb2.KeyAdvertisementAck(accepted=True, message="Waiting for more participants")
+        try:
+            advert = AdvertiseMessage(
+                node_id=node_id,
+                c_public=bytes(request.c_public_key),
+                s_public=bytes(request.s_public_key),
+                signature=bytes(request.signature),
+                signing_public=None,  # Expected from signing_public_keys provided at init
+            )
+            if node_id not in self._adverts:
+                self._adverts[node_id] = advert
+            # Once we have threshold, commit into aggregator once.
+            if not self._adverts_committed and len(self._adverts) >= self.threshold:
+                self.aggregator.receive_advertisements(list(self._adverts.values()))
+                self._adverts_committed = True
+            elif self._adverts_committed and node_id not in self.aggregator.advertisements:
+                # Add late adverts after initial commit.
+                self.aggregator.receive_advertisements([advert])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Round0 advert rejected from {node_id}: {exc}")
+            return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
 
-        self.round0_keys[node_id] = (
-            bytes(request.c_public_key),
-            bytes(request.s_public_key),
-            bytes(request.signature)
+        # Once we have threshold, return full list.
+        all_keys = self.aggregator.broadcast_advertisements() if self._adverts_committed else []
+        ack_keys = [
+            secureagg_pb2.KeyAdvertisement(
+                node_id=adv.node_id,
+                c_public_key=adv.c_public,
+                s_public_key=adv.s_public,
+                signature=adv.signature,
+            )
+            for adv in all_keys
+        ]
+        return secureagg_pb2.KeyAdvertisementAck(
+            accepted=True,
+            message="Round 0 OK" if len(all_keys) >= self.threshold else "Waiting for more participants",
+            all_keys=ack_keys if len(all_keys) >= self.threshold else [],
         )
 
-        logger.info(f"Received keys from {node_id} ({len(self.round0_keys)}/{len(self.participant_ids)})")
-
-        # Wait until we have threshold participants
-        if len(self.round0_keys) >= self.threshold:
-            # Build U1 list
-            self.u1_list = [
-                (nid, c_pk, s_pk, sig)
-                for nid, (c_pk, s_pk, sig) in self.round0_keys.items()
-            ]
-
-            # Broadcast U1 to all
-            all_keys = [
-                secureagg_pb2.KeyAdvertisement(
-                    node_id=nid, c_public_key=c_pk, s_public_key=s_pk, signature=sig
-                )
-                for nid, c_pk, s_pk, sig in self.u1_list
-            ]
-
-            logger.info(f"Round 0 complete: {len(self.u1_list)} participants")
-            return secureagg_pb2.KeyAdvertisementAck(accepted=True, message="Round 0 complete", all_keys=all_keys)
-
-        return secureagg_pb2.KeyAdvertisementAck(accepted=True, message="Waiting for more participants")
-
     def Round1ShareKeys(self, request: secureagg_pb2.ShareKeysMessage, context) -> secureagg_pb2.ShareKeysAck:
-        """Collect encrypted secret shares (Round 1)."""
+        """Collect encrypted secret shares (Round 1) and deliver mailbox."""
         node_id = request.node_id
-
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected shares from {node_id}: not a clique member")
             return secureagg_pb2.ShareKeysAck(accepted=False, message="Node not in clique")
 
-        if node_id in self.round1_shares:
-            logger.warning(f"Duplicate shares from {node_id}")
-            return secureagg_pb2.ShareKeysAck(accepted=False, message="Duplicate shares")
-
-        self.round1_shares[node_id] = dict(request.encrypted_shares)
-        logger.info(f"Received shares from {node_id} ({len(self.round1_shares)}/{len(self.u1_list)})")
-
-        if len(self.round1_shares) >= self.threshold:
-            logger.info("Round 1 complete")
-            return secureagg_pb2.ShareKeysAck(accepted=True, message="Round 1 complete")
-
-        return secureagg_pb2.ShareKeysAck(accepted=True, message="Waiting for more shares")
+        try:
+            ciphertexts = _decode_round1_ciphertexts(request.ciphertexts)
+            self.aggregator.receive_round1_ciphertexts(ciphertexts)
+            mailbox = self.aggregator.deliver_round1_ciphertexts(node_id)
+            return secureagg_pb2.ShareKeysAck(
+                accepted=True,
+                message="Round 1 OK",
+                mailbox=_encode_round1_ciphertexts(mailbox),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Round1 processing failed for {node_id}: {exc}")
+            mailbox = self.aggregator.deliver_round1_ciphertexts(node_id)
+            return secureagg_pb2.ShareKeysAck(
+                accepted=False,
+                message=str(exc),
+                mailbox=_encode_round1_ciphertexts(mailbox),
+            )
 
     def Round2MaskedInput(self, request: secureagg_pb2.MaskedInputMessage, context) -> secureagg_pb2.MaskedInputAck:
         """Collect masked model updates (Round 2)."""
         node_id = request.node_id
-
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected masked input from {node_id}: not a clique member")
             return secureagg_pb2.MaskedInputAck(accepted=False, message="Node not in clique")
-
-        if node_id in self.round2_masked:
-            logger.warning(f"Duplicate masked input from {node_id}")
-            # If we already have threshold participants, return the survivors list
-            if len(self.round2_masked) >= self.threshold and self.u3_survivors:
-                logger.info(f"Round 2 complete: {len(self.u3_survivors)} survivors")
-                return secureagg_pb2.MaskedInputAck(
-                    accepted=True, message=f"Round 2 complete with {len(self.u3_survivors)} survivors", survivors=self.u3_survivors
+        try:
+            # Check if this node has already submitted (polling case).
+            if node_id not in self.aggregator.masked_inputs:
+                masked = MaskedInput(
+                    node_id=node_id,
+                    masked_vector=[int.from_bytes(v, byteorder="big") for v in request.masked_vector],
                 )
-            # Otherwise, still waiting for more participants
-            return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for more inputs")
-
-        self.round2_masked[node_id] = list(request.masked_vector)
-        logger.info(f"Received masked input from {node_id} ({len(self.round2_masked)}/{len(self.u1_list)})")
-
-        if len(self.round2_masked) >= self.threshold:
-            # Determine survivors (U3)
-            self.u3_survivors = list(self.round2_masked.keys())
-            logger.info(f"Round 2 complete: {len(self.u3_survivors)} survivors")
-            return secureagg_pb2.MaskedInputAck(
-                accepted=True, message="Round 2 complete", survivors=self.u3_survivors
-            )
-
-        return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for more inputs")
+                self.aggregator.receive_masked_input(masked)
+            # Wait for ALL participants before returning survivors (not just threshold).
+            if len(self.aggregator.masked_inputs) >= len(self.participant_ids):
+                survivors = self.aggregator.broadcast_survivors()
+                return secureagg_pb2.MaskedInputAck(accepted=True, message="Round 2 OK", survivors=survivors)
+            return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for all participants", survivors=[])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Round2 processing failed for {node_id}: {exc}")
+            survivors = self.aggregator.survivors or []
+            return secureagg_pb2.MaskedInputAck(accepted=False, message=str(exc), survivors=survivors)
 
     def Round3ConsistencyCheck(self, request: secureagg_pb2.ConsistencySignature, context) -> secureagg_pb2.ConsistencyAck:
         """Collect consistency signatures (Round 3)."""
         node_id = request.node_id
-
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected signature from {node_id}: not a clique member")
             return secureagg_pb2.ConsistencyAck(accepted=False, message="Node not in clique")
-
-        if node_id in self.round3_signatures:
-            logger.warning(f"Duplicate signature from {node_id}")
-            return secureagg_pb2.ConsistencyAck(accepted=False, message="Duplicate signature")
-
-        self.round3_signatures[node_id] = bytes(request.signature)
-        logger.info(f"Received signature from {node_id} ({len(self.round3_signatures)}/{len(self.u3_survivors)})")
-
-        if len(self.round3_signatures) >= len(self.u3_survivors):
-            logger.info("Round 3 complete")
-            return secureagg_pb2.ConsistencyAck(accepted=True, message="Round 3 complete")
-
-        return secureagg_pb2.ConsistencyAck(accepted=True, message="Waiting for more signatures")
+        try:
+            sig = SurvivorSignature(node_id=node_id, signature=bytes(request.signature))
+            self._round3_signatures[node_id] = sig.signature
+            if len(self._round3_signatures) >= len(self.aggregator.survivors):
+                sigs = [SurvivorSignature(node_id=n, signature=s) for n, s in self._round3_signatures.items()]
+                self.aggregator.verify_survivor_signatures(sigs)
+                return secureagg_pb2.ConsistencyAck(accepted=True, message="Round 3 OK")
+            return secureagg_pb2.ConsistencyAck(accepted=True, message="Waiting for more signatures")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Round3 processing failed for {node_id}: {exc}")
+            return secureagg_pb2.ConsistencyAck(accepted=False, message=str(exc))
 
     def Round4Unmask(self, request: secureagg_pb2.UnmaskShares, context) -> secureagg_pb2.UnmaskAck:
         """Collect unmasking shares and compute aggregate (Round 4)."""
         node_id = request.node_id
-
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected unmask shares from {node_id}: not a clique member")
             return secureagg_pb2.UnmaskAck(accepted=False, message="Node not in clique", aggregation_complete=False)
-
-        if node_id in self.round4_unmasking:
-            logger.warning(f"Duplicate unmask shares from {node_id}")
-            # If aggregation is already complete, return success
-            if len(self.round4_unmasking) >= self.threshold and self.aggregated_result is not None:
-                logger.info("Round 4 complete - aggregation already done")
-                return secureagg_pb2.UnmaskAck(
-                    accepted=True, message="Aggregation complete", aggregation_complete=True
+        try:
+            # Only accept first submission from each node to prevent duplicates during polling.
+            already_submitted = any(p.node_id == node_id for p in self._round4_payloads)
+            if not already_submitted:
+                drop_shares = {k: _decode_unmask_share(v) for k, v in request.dropout_s_shares.items()}
+                surv_shares = {k: _decode_unmask_share(v) for k, v in request.survivor_b_shares.items()}
+                payload = UnmaskingSharesModel(
+                    node_id=node_id,
+                    s_shares_for_dropouts=drop_shares,
+                    b_shares_for_survivors=surv_shares,
                 )
-            # Otherwise, still waiting for more participants
-            return secureagg_pb2.UnmaskAck(accepted=True, message="Waiting for unmask shares", aggregation_complete=False)
-
-        self.round4_unmasking[node_id] = (
-            dict(request.dropout_s_shares),
-            dict(request.survivor_b_shares)
-        )
-        logger.info(f"Received unmask shares from {node_id} ({len(self.round4_unmasking)}/{len(self.u3_survivors)})")
-
-        if len(self.round4_unmasking) >= self.threshold:
-            # Compute aggregate (simplified - just average the masked inputs)
-            logger.info("Round 4 complete - computing aggregate")
-            self.aggregated_result = self._compute_aggregate()
+                self._round4_payloads.append(payload)
+            if len(self._round4_payloads) >= self.threshold:
+                result = self.aggregator.receive_unmasking_shares(self._round4_payloads)
+                self.aggregated_result = result.aggregate_mean
+                return secureagg_pb2.UnmaskAck(
+                    accepted=True,
+                    message="Aggregation complete",
+                    aggregation_complete=True,
+                )
             return secureagg_pb2.UnmaskAck(
-                accepted=True, message="Aggregation complete", aggregation_complete=True
+                accepted=True,
+                message="Waiting for more unmask shares",
+                aggregation_complete=False,
             )
-
-        return secureagg_pb2.UnmaskAck(accepted=True, message="Waiting for unmask shares", aggregation_complete=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Round4 processing failed for {node_id}: {exc}")
+            return secureagg_pb2.UnmaskAck(accepted=False, message=str(exc), aggregation_complete=False)
 
     def GetGlobalModel(self, request: secureagg_pb2.ModelRequest, context) -> secureagg_pb2.ModelResponse:
         """Return the aggregated global model."""
         if self.aggregated_result is None:
             return secureagg_pb2.ModelResponse(model_weights=[], round=self.current_round, aggregator_id=self.node_id)
-
         logger.info(f"Serving global model (round {self.current_round})")
         return secureagg_pb2.ModelResponse(
             model_weights=self.aggregated_result,
             round=self.current_round,
-            aggregator_id=self.node_id
+            aggregator_id=self.node_id,
         )
-
-    def _compute_aggregate(self) -> List[float]:
-        """Compute the aggregated model by averaging masked inputs."""
-        if not self.round2_masked:
-            return []
-
-        # Get vector dimension
-        first_vec = next(iter(self.round2_masked.values()))
-        dim = len(first_vec)
-
-        # Simple averaging (in reality, we'd unmask first)
-        aggregate = [0.0] * dim
-        for masked_vec in self.round2_masked.values():
-            for i, val in enumerate(masked_vec):
-                aggregate[i] += float(val)
-
-        # Average
-        num_participants = len(self.round2_masked)
-        aggregate = [x / num_participants for x in aggregate]
-
-        logger.info(f"Computed aggregate from {num_participants} participants")
-        return aggregate
 
     def reset_for_next_round(self) -> None:
         """Reset state for next aggregation round."""
-        self.round0_keys.clear()
-        self.round1_shares.clear()
-        self.round2_masked.clear()
-        self.round3_signatures.clear()
-        self.round4_unmasking.clear()
-        self.u1_list.clear()
-        self.u3_survivors.clear()
+        self.aggregator = SecureAggregationAggregator(
+            config=SecureAggregationConfig(participants=self.participant_ids, threshold=self.threshold),
+            signing_public_keys=self.aggregator.signing_public_keys,
+        )
         self.aggregated_result = None
+        self._adverts.clear()
+        self._adverts_committed = False
+        self._round3_signatures.clear()
+        self._round4_payloads.clear()
         self.current_round += 1
         logger.info(f"Reset for round {self.current_round}")
 
 
-def serve(node_id: str, port: int, threshold: int, participant_ids: List[str]) -> grpc.Server:
+def serve(
+    node_id: str,
+    port: int,
+    threshold: int,
+    participant_ids: List[str],
+    signing_public_keys: Optional[Mapping[str, bytes]] = None,
+) -> grpc.Server:
     """Start the aggregator gRPC server."""
-    servicer = AggregatorServicer(node_id, threshold, participant_ids)
+    servicer = AggregatorServicer(node_id, threshold, participant_ids, signing_public_keys=signing_public_keys)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     secureagg_pb2_grpc.add_AggregatorServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")

@@ -14,6 +14,11 @@ class SigningKeyPair:
     private_key: bytes
     public_key: bytes
 
+    def __iter__(self):
+        # Allow tuple unpacking: priv, pub = generate_signing_keypair()
+        yield self.private_key
+        yield self.public_key
+
 
 def generate_signing_keypair() -> SigningKeyPair:
     """

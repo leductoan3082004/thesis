@@ -25,6 +25,14 @@ SHARE_BYTES = 66  # enough to hold elements in the 521-bit field
 DH_PRIV_BYTES = 32
 B_SEED_BYTES = 32
 MASK_BYTES_PER_COORD = 8
+HALF_PRIME = PRIME // 2
+
+
+def _mod_to_signed(val: int) -> int:
+    """Convert value from modular field [0, PRIME-1] back to signed integer."""
+    if val > HALF_PRIME:
+        return val - PRIME
+    return val
 
 
 def _int_to_bytes(value: int, length: int) -> bytes:
@@ -385,5 +393,7 @@ class SecureAggregationAggregator:
             seed = survivor_b_seeds[survivor]
             mask = _mask_from_seed(seed, self.vector_length)
             aggregate = _vector_sub(aggregate, mask)
-        mean = [val / len(self.survivors) for val in aggregate]
-        return SecureAggregationResult(survivors=list(self.survivors), aggregate_sum=aggregate, aggregate_mean=mean)
+        # Convert from modular field back to signed integers.
+        signed_aggregate = [_mod_to_signed(val) for val in aggregate]
+        mean = [val / len(self.survivors) for val in signed_aggregate]
+        return SecureAggregationResult(survivors=list(self.survivors), aggregate_sum=signed_aggregate, aggregate_mean=mean)
