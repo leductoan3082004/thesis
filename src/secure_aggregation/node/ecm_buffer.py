@@ -13,12 +13,14 @@ from typing import Dict, List, Optional
 
 @dataclass
 class ECM:
-    """External Cluster Model reference."""
+    """External Cluster Model reference with convergence status."""
 
     cid: str
     hash: str
     source_cluster: Optional[str] = None
     received_at: float = 0.0
+    cluster_converged: bool = False
+    cluster_delta_norm: float = 0.0
 
     def __post_init__(self) -> None:
         if self.received_at == 0.0:

@@ -1,14 +1,18 @@
 """
-Storage abstractions for IPFS and Blockchain with mock implementations.
+Storage abstractions for IPFS and Blockchain with mock and real implementations.
 
-These interfaces allow seamless replacement with real IPFS/blockchain
-when they become available. The mock implementations use shared storage
-(directory or in-memory) to simulate the global nature of these services.
+These interfaces allow seamless switching between mock implementations
+(for testing/development) and real implementations (for production).
+
+Real implementations:
+- KuboIPFS: Connects to IPFS Kubo HTTP API
+- RegistryBlockchain: Uses a simple HTTP registry service
 """
 
 import hashlib
+import io
 import json
-import os
+import logging
 import pickle
 import threading
 from abc import ABC, abstractmethod
@@ -16,7 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import httpx
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def compute_model_hash(model: np.ndarray) -> str:
@@ -258,3 +265,184 @@ class MockBlockchain(BlockchainInterface):
         else:
             with self._registry_lock:
                 self._memory_registry.clear()
+
+
+class KuboIPFS(IPFSInterface):
+    """
+    Real IPFS implementation using Kubo HTTP API.
+
+    Connects to an IPFS daemon (typically running on port 5001) and stores
+    models as content-addressed data. The returned CID is the actual IPFS
+    content identifier.
+    """
+
+    def __init__(
+        self,
+        api_url: str = "http://localhost:5001",
+        timeout: float = 30.0,
+    ) -> None:
+        """
+        Initialize Kubo IPFS client.
+
+        Args:
+            api_url: URL of the IPFS HTTP API (e.g., "http://ipfs-node-1:5001").
+            timeout: Request timeout in seconds.
+        """
+        self._api_url = api_url.rstrip("/")
+        self._timeout = timeout
+        self._client = httpx.Client(timeout=timeout)
+
+    def add(self, model: np.ndarray) -> str:
+        """Store model in IPFS and return CID."""
+        serialized = pickle.dumps(model)
+
+        # IPFS API expects multipart form data.
+        files = {"file": ("model.pkl", io.BytesIO(serialized), "application/octet-stream")}
+
+        try:
+            response = self._client.post(
+                f"{self._api_url}/api/v0/add",
+                files=files,
+                params={"pin": "true"},
+            )
+            response.raise_for_status()
+            result = response.json()
+            cid = result["Hash"]
+            logger.debug(f"Added model to IPFS with CID: {cid}")
+            return cid
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to add model to IPFS: {e}")
+            raise RuntimeError(f"IPFS add failed: {e}") from e
+
+    def get(self, cid: str) -> Optional[np.ndarray]:
+        """Retrieve model from IPFS by CID."""
+        try:
+            response = self._client.post(
+                f"{self._api_url}/api/v0/cat",
+                params={"arg": cid},
+            )
+            response.raise_for_status()
+            model = pickle.loads(response.content)
+            logger.debug(f"Retrieved model from IPFS with CID: {cid}")
+            return model
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 500:
+                # CID not found or not reachable.
+                logger.warning(f"CID not found in IPFS: {cid}")
+                return None
+            logger.error(f"Failed to get model from IPFS: {e}")
+            raise RuntimeError(f"IPFS get failed: {e}") from e
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to get model from IPFS: {e}")
+            raise RuntimeError(f"IPFS get failed: {e}") from e
+
+    def exists(self, cid: str) -> bool:
+        """Check if CID exists in IPFS."""
+        try:
+            # Use stat to check existence without downloading content.
+            response = self._client.post(
+                f"{self._api_url}/api/v0/files/stat",
+                params={"arg": f"/ipfs/{cid}"},
+            )
+            return response.status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    def provide(self, cid: str) -> None:
+        """Announce CID to the DHT so other peers can find it."""
+        try:
+            self._client.post(
+                f"{self._api_url}/api/v0/routing/provide",
+                params={"arg": cid},
+                timeout=60.0,
+            )
+            logger.debug(f"Provided CID to DHT: {cid}")
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to provide CID to DHT: {e}")
+
+    def close(self) -> None:
+        """Close the HTTP client."""
+        self._client.close()
+
+
+class RegistryBlockchain(BlockchainInterface):
+    """
+    Blockchain implementation using a simple HTTP registry service.
+
+    This provides a centralized registry that acts like a blockchain ledger
+    for storing model anchors. In production, this could be replaced with
+    a real blockchain (Ethereum, Solana, etc.) or a distributed registry.
+    """
+
+    def __init__(
+        self,
+        registry_url: str = "http://localhost:8000",
+        timeout: float = 10.0,
+    ) -> None:
+        """
+        Initialize registry blockchain client.
+
+        Args:
+            registry_url: URL of the registry service.
+            timeout: Request timeout in seconds.
+        """
+        self._registry_url = registry_url.rstrip("/")
+        self._timeout = timeout
+        self._client = httpx.Client(timeout=timeout)
+
+    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> None:
+        """Record model reference in registry."""
+        try:
+            response = self._client.post(
+                f"{self._registry_url}/anchors",
+                json={
+                    "cluster_id": cluster_id,
+                    "round_num": round_num,
+                    "cid": cid,
+                    "hash": hash_val,
+                },
+            )
+            response.raise_for_status()
+            logger.debug(f"Anchored model: cluster={cluster_id}, round={round_num}, cid={cid}")
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to anchor model: {e}")
+            raise RuntimeError(f"Registry anchor failed: {e}") from e
+
+    def get_anchor(self, cluster_id: str, round_num: int) -> Optional[Tuple[str, str]]:
+        """Retrieve anchored reference (cid, hash) from registry."""
+        try:
+            response = self._client.get(
+                f"{self._registry_url}/anchors/{cluster_id}/{round_num}",
+            )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            data = response.json()
+            return (data["cid"], data["hash"])
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to get anchor: {e}")
+            raise RuntimeError(f"Registry get_anchor failed: {e}") from e
+
+    def get_latest_anchor(self, cluster_id: str) -> Optional[ModelAnchor]:
+        """Get most recent anchor for a cluster from registry."""
+        try:
+            response = self._client.get(
+                f"{self._registry_url}/anchors/{cluster_id}/latest",
+            )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            data = response.json()
+            return ModelAnchor(
+                cluster_id=data["cluster_id"],
+                round_num=data["round_num"],
+                cid=data["cid"],
+                hash=data["hash"],
+            )
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to get latest anchor: {e}")
+            raise RuntimeError(f"Registry get_latest_anchor failed: {e}") from e
+
+    def close(self) -> None:
+        """Close the HTTP client."""
+        self._client.close()

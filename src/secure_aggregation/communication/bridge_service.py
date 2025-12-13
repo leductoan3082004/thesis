@@ -51,16 +51,19 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
         request: secureagg_pb2.ECMBroadcast,
         context,
     ) -> secureagg_pb2.ECMSubmitResponse:
-        """Receive ECM broadcast from neighbor cluster."""
+        """Receive ECM broadcast from neighbor cluster with convergence status."""
         ecm = ECM(
             cid=request.cid,
             hash=request.hash,
             source_cluster=request.cluster_id,
+            cluster_converged=request.cluster_converged,
+            cluster_delta_norm=request.cluster_delta_norm,
         )
         self.ecm_buffer.add(ecm)
         logger.info(
             f"Received ECM from cluster {request.cluster_id} "
-            f"round {request.round}: cid={request.cid[:8]}..."
+            f"round {request.round}: cid={request.cid[:8]}... "
+            f"(converged={request.cluster_converged})"
         )
 
         return secureagg_pb2.ECMSubmitResponse(
@@ -144,6 +147,65 @@ class BridgeClient:
         logger.info(
             f"Broadcast ECM to {accepted}/{len(neighbor_addresses)} neighbors "
             f"(cluster={cluster_id}, round={round_num})"
+        )
+        return accepted
+
+    def send_ecm_with_convergence(
+        self,
+        neighbor_address: str,
+        cluster_id: str,
+        round_num: int,
+        cid: str,
+        model_hash: str,
+        cluster_converged: bool,
+        cluster_delta_norm: float,
+    ) -> bool:
+        """Send ECM with convergence status to a neighbor cluster bridge node."""
+        try:
+            stub = self._get_stub(neighbor_address)
+            request = secureagg_pb2.ECMBroadcast(
+                cluster_id=cluster_id,
+                round=round_num,
+                cid=cid,
+                hash=model_hash,
+                cluster_converged=cluster_converged,
+                cluster_delta_norm=cluster_delta_norm,
+            )
+            response = stub.ReceiveECM(request, timeout=10)
+            if response.accepted:
+                logger.debug(f"ECM with convergence sent to {neighbor_address}")
+            return response.accepted
+        except grpc.RpcError as e:
+            logger.warning(f"Failed to send ECM to {neighbor_address}: {e}")
+            return False
+
+    def broadcast_ecm_with_convergence(
+        self,
+        neighbor_addresses: List[str],
+        cluster_id: str,
+        round_num: int,
+        cid: str,
+        model_hash: str,
+        cluster_converged: bool,
+        cluster_delta_norm: float,
+    ) -> int:
+        """
+        Broadcast ECM with convergence status to all neighbor cluster bridge nodes.
+
+        Returns:
+            Number of neighbors that accepted the ECM.
+        """
+        accepted = 0
+        for addr in neighbor_addresses:
+            if self.send_ecm_with_convergence(
+                addr, cluster_id, round_num, cid, model_hash,
+                cluster_converged, cluster_delta_norm
+            ):
+                accepted += 1
+
+        logger.info(
+            f"Broadcast ECM with convergence to {accepted}/{len(neighbor_addresses)} neighbors "
+            f"(cluster={cluster_id}, round={round_num}, converged={cluster_converged})"
         )
         return accepted
 

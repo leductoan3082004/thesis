@@ -15,16 +15,24 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
-from secure_aggregation.communication.aggregator_service import serve as serve_aggregator
+from secure_aggregation.communication.aggregator_service import AggregatorServicer, serve as serve_aggregator
 from secure_aggregation.communication.bridge_service import BridgeClient, serve_bridge
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
+from secure_aggregation.convergence import ConvergenceConfig, ConvergenceTracker
 from secure_aggregation.config.models import NodeRole
 from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition
 from secure_aggregation.node import ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
-from secure_aggregation.storage.model_store import MockBlockchain, MockIPFS
+from secure_aggregation.storage.model_store import (
+    BlockchainInterface,
+    IPFSInterface,
+    KuboIPFS,
+    MockBlockchain,
+    MockIPFS,
+    RegistryBlockchain,
+)
 from secure_aggregation.topology import elect_clique_aggregator, get_inter_clique_neighbors, is_bridge_node
 from secure_aggregation.utils import configure_logging, get_logger
 
@@ -114,8 +122,13 @@ class NodeService:
         self.bridge_server: Optional[grpc.Server] = None
         self.bridge_client: Optional[BridgeClient] = None
         self.inter_cluster_aggregator: Optional[InterClusterAggregator] = None
-        self.ipfs: Optional[MockIPFS] = None
-        self.blockchain: Optional[MockBlockchain] = None
+        self.ipfs: Optional[IPFSInterface] = None
+        self.blockchain: Optional[BlockchainInterface] = None
+
+        # Convergence state
+        self.convergence_config = ConvergenceConfig.from_dict(self.config.get("convergence"))
+        self.convergence_tracker: Optional[ConvergenceTracker] = None
+        self.aggregator_servicer: Optional[AggregatorServicer] = None
 
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
 
@@ -282,12 +295,13 @@ class NodeService:
         signing_public_keys: Dict[str, bytes] = {}
         if self.participants:
             signing_public_keys = {p.node_id: bytes(p.signing_public_key) for p in self.participants}
-        self.aggregator_server = serve_aggregator(
+        self.aggregator_server, self.aggregator_servicer = serve_aggregator(
             self.node_id,
             self.port + 1000,
             self.threshold,
             participant_ids,
             signing_public_keys=signing_public_keys or None,
+            ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
         )
         logger.info(f"Started aggregator server on port {self.port + 1000} for {len(participant_ids)} clique members")
 
@@ -296,6 +310,7 @@ class NodeService:
         if self.aggregator_server:
             self.aggregator_server.stop(0)
             self.aggregator_server = None
+            self.aggregator_servicer = None
             logger.info("Stopped aggregator server")
 
     def setup_inter_cluster(self) -> None:
@@ -307,11 +322,20 @@ class NodeService:
         ipfs_config = self.inter_cluster_config.get("ipfs", {})
         blockchain_config = self.inter_cluster_config.get("blockchain", {})
 
-        ipfs_path = ipfs_config.get("storage_path", "/app/data/ipfs")
-        blockchain_path = blockchain_config.get("storage_path", "/app/data/blockchain.json")
+        use_mock = self.inter_cluster_config.get("use_mock", True)
 
-        self.ipfs = MockIPFS(storage_path=ipfs_path)
-        self.blockchain = MockBlockchain(storage_path=blockchain_path)
+        if use_mock:
+            ipfs_path = ipfs_config.get("storage_path", "/app/data/ipfs")
+            blockchain_path = blockchain_config.get("storage_path", "/app/data/blockchain.json")
+            self.ipfs = MockIPFS(storage_path=ipfs_path)
+            self.blockchain = MockBlockchain(storage_path=blockchain_path)
+            logger.info(f"Using mock storage: ipfs={ipfs_path}, blockchain={blockchain_path}")
+        else:
+            ipfs_url = ipfs_config.get("api_url", "http://ipfs-node-1:5001")
+            registry_url = blockchain_config.get("registry_url", "http://registry:8000")
+            self.ipfs = KuboIPFS(api_url=ipfs_url)
+            self.blockchain = RegistryBlockchain(registry_url=registry_url)
+            logger.info(f"Using real storage: ipfs={ipfs_url}, registry={registry_url}")
 
         merge_config = MergeConfig(
             window_size=self.inter_cluster_config.get("window_size", 10),
@@ -328,11 +352,6 @@ class NodeService:
             ipfs=self.ipfs,
             blockchain=self.blockchain,
             merge_config=merge_config,
-        )
-
-        logger.info(
-            f"Inter-cluster aggregation enabled: "
-            f"ipfs={ipfs_path}, blockchain={blockchain_path}"
         )
 
     def setup_bridge_node(self, inter_edges: List[Tuple[str, str]]) -> None:
@@ -389,6 +408,63 @@ class NodeService:
         logger.info(
             f"Gossiped ECM to {accepted}/{len(self.neighbor_bridge_addresses)} neighbors"
         )
+
+    def forward_ecms_to_aggregator(self) -> int:
+        """Forward buffered ECMs from this bridge node to the current aggregator.
+
+        Bridge nodes receive ECMs from neighbor clusters. If the bridge node is not
+        the aggregator, it must forward these ECMs to the aggregator so that the
+        aggregator can merge neighbor models with the intra-cluster model.
+
+        Returns:
+            Number of ECMs forwarded, or 0 if not applicable.
+        """
+        if not self.is_bridge_node:
+            return 0
+        if self.is_aggregator:
+            return 0
+        if not self.ecm_buffer:
+            return 0
+
+        fresh_ecms = self.ecm_buffer.get_fresh_ecms()
+        if not fresh_ecms:
+            logger.debug("No fresh ECMs to forward to aggregator")
+            return 0
+
+        agg_port = int(self.aggregator_address.split(":")[-1]) + 1000
+        agg_host = self.aggregator_address.split(":")[0]
+        agg_addr = f"{agg_host}:{agg_port}"
+
+        try:
+            channel = grpc.insecure_channel(agg_addr)
+            stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
+
+            ecm_messages = [
+                secureagg_pb2.ECMMessage(
+                    cid=ecm.cid,
+                    hash=ecm.hash,
+                    source_cluster=ecm.source_cluster or "",
+                )
+                for ecm in fresh_ecms
+            ]
+
+            request = secureagg_pb2.ECMSubmitRequest(
+                node_id=self.node_id,
+                ecms=ecm_messages,
+            )
+
+            response = stub.SubmitECMs(request, timeout=10)
+            if response.accepted:
+                logger.info(
+                    f"Forwarded {len(fresh_ecms)} ECMs to aggregator {self.aggregator_id}"
+                )
+                return len(fresh_ecms)
+            else:
+                logger.warning(f"Aggregator rejected ECMs: {response.message}")
+                return 0
+        except grpc.RpcError as e:
+            logger.warning(f"Failed to forward ECMs to aggregator: {e}")
+            return 0
 
     def run_secure_aggregation_round(self) -> List[float]:
         """Run one round of secure aggregation protocol."""
@@ -588,23 +664,39 @@ class NodeService:
         return aggregated
 
     def run_training_loop(self) -> None:
-        """Main training loop with secure aggregation."""
-        num_rounds = self.training_config["num_rounds"]
+        """Convergence-driven training loop with secure aggregation.
+
+        Training continues until either:
+        1. Global convergence is achieved (model delta below tolerance for patience rounds,
+           and all neighbor clusters have also converged)
+        2. Maximum rounds limit is reached (safety cap)
+        """
         local_epochs = self.training_config["local_epochs"]
+        max_rounds = self.convergence_config.max_rounds
 
-        logger.info(f"Starting training loop for {num_rounds} rounds")
+        # Initialize convergence tracker
+        self.convergence_tracker = ConvergenceTracker(
+            self.convergence_config, f"cluster_{self.clique_id}"
+        )
 
-        for round_idx in range(num_rounds):
-            self.current_round = round_idx
+        logger.info(
+            f"Starting convergence-driven training (max_rounds={max_rounds}, "
+            f"tol_abs={self.convergence_config.tol_abs}, patience={self.convergence_config.patience})"
+        )
+
+        should_stop = False
+        stop_reason = ""
+
+        while self.current_round < max_rounds and not should_stop:
+            round_idx = self.current_round
             logger.info(f"\n{'='*60}")
-            logger.info(f"Round {round_idx + 1}/{num_rounds}")
+            logger.info(f"Round {round_idx + 1}/{max_rounds}")
             logger.info(f"{'='*60}")
 
-            # Local training
+            # Phase 1: Local training
             logger.info("Phase 1: Local training")
             self.train_local(local_epochs)
 
-            # Evaluate before aggregation
             acc_before = self.evaluate()
             logger.info(f"Accuracy before aggregation: {acc_before:.4f}")
 
@@ -613,49 +705,107 @@ class NodeService:
             self.aggregator_address = self.participant_map[self.aggregator_id]
             self.is_aggregator = (self.aggregator_id == self.node_id)
 
-            # Start aggregator server if elected
             if self.is_aggregator:
                 logger.info(f"*** This node is the AGGREGATOR for round {round_idx} ***")
                 self.start_aggregator_server()
 
-            # All nodes wait for aggregator to be ready (same total wait time for all)
             logger.info(f"Waiting for aggregator {self.aggregator_id} to be ready...")
             time.sleep(5)
 
-            # Run secure aggregation
             cid: Optional[str] = None
             model_hash: Optional[str] = None
             try:
+                # Phase 2: Secure aggregation
                 logger.info("Phase 2: Secure aggregation")
                 aggregated_weights = self.run_secure_aggregation_round()
 
-                # Update model with aggregated weights
+                # Phase 2.5: Bridge nodes forward ECMs to aggregator
+                if self.inter_cluster_enabled and self.is_bridge_node and not self.is_aggregator:
+                    forwarded = self.forward_ecms_to_aggregator()
+                    if forwarded > 0:
+                        logger.info(f"Phase 2.5: Forwarded {forwarded} ECMs to aggregator")
+
                 if aggregated_weights:
                     logger.info("Phase 3: Updating model with aggregated weights")
                     dequantized = dequantize_vector([int(w) for w in aggregated_weights], self.scale)
                     load_params(self.model, dequantized)
 
-                    # Inter-cluster merge (aggregator only)
+                    # Phase 4: Inter-cluster merge (aggregator only)
                     if self.is_aggregator and self.inter_cluster_enabled and self.inter_cluster_aggregator:
+                        # Wait briefly for ECMs from bridge nodes to arrive
+                        time.sleep(2)
                         logger.info("Phase 4: Inter-cluster merge")
                         intra_model = np.array(dequantized, dtype=np.float32)
 
-                        # Collect ECMs from bridge nodes' buffers
                         if self.ecm_buffer:
                             for ecm in self.ecm_buffer.get_fresh_ecms():
-                                self.inter_cluster_aggregator.receive_ecms(
-                                    self.node_id, [ecm]
-                                )
+                                self.inter_cluster_aggregator.receive_ecms(self.node_id, [ecm])
+                                # Update neighbor convergence status from ECM
+                                if hasattr(ecm, "cluster_converged"):
+                                    self.convergence_tracker.receive_neighbor_convergence(
+                                        ecm.source_cluster, ecm.cluster_converged
+                                    )
 
                         merged_model, cid, model_hash = self.inter_cluster_aggregator.process_round(
                             intra_model, round_idx
                         )
 
+                        # Update convergence state with merged model
+                        conv_state = self.convergence_tracker.update(merged_model)
+                        should_stop = conv_state.should_stop
+                        stop_reason = conv_state.stop_reason
+
+                        # Store convergence state in aggregator servicer for distribution
+                        if self.aggregator_servicer:
+                            self.aggregator_servicer.set_convergence_state(
+                                model_cid=cid,
+                                model_hash=model_hash,
+                                should_stop=should_stop,
+                                stop_reason=stop_reason,
+                                delta_norm=conv_state.delta_norm,
+                                cluster_converged=conv_state.cluster_converged,
+                            )
+
                         dequantized = merged_model.tolist()
                         load_params(self.model, dequantized)
                         logger.info(f"Inter-cluster merge complete: cid={cid[:16] if cid else 'N/A'}...")
 
-                # Evaluate after aggregation
+                    elif self.is_aggregator and self.convergence_config.enabled:
+                        # Aggregator without inter-cluster: still track convergence
+                        model_array = np.array(dequantized, dtype=np.float32)
+                        conv_state = self.convergence_tracker.update(model_array)
+                        should_stop = conv_state.should_stop
+                        stop_reason = conv_state.stop_reason
+
+                        if self.aggregator_servicer:
+                            self.aggregator_servicer.set_convergence_state(
+                                model_cid=None,
+                                model_hash=None,
+                                should_stop=should_stop,
+                                stop_reason=stop_reason,
+                                delta_norm=conv_state.delta_norm,
+                                cluster_converged=conv_state.cluster_converged,
+                            )
+
+                    elif not self.is_aggregator:
+                        # Non-aggregator: fetch convergence decision from aggregator
+                        model_response = self._fetch_convergence_status()
+                        if model_response:
+                            should_stop = model_response.should_stop
+                            stop_reason = model_response.stop_reason
+
+                            # If IPFS CID provided, fetch merged model from IPFS
+                            if model_response.model_cid and self.ipfs:
+                                logger.info(f"Fetching merged model from IPFS: {model_response.model_cid[:16]}...")
+                                merged_from_ipfs = self.ipfs.get(model_response.model_cid)
+                                if merged_from_ipfs is not None:
+                                    load_params(self.model, merged_from_ipfs.tolist())
+
+                            # Bridge nodes need CID for ECM gossip even when not aggregator
+                            if self.is_bridge_node and model_response.model_cid:
+                                cid = model_response.model_cid
+                                model_hash = model_response.model_hash
+
                 acc_after = self.evaluate()
                 logger.info(f"Accuracy after aggregation: {acc_after:.4f}")
                 logger.info(f"Improvement: {acc_after - acc_before:+.4f}")
@@ -664,23 +814,70 @@ class NodeService:
                 logger.error(f"Secure aggregation failed: {e}", exc_info=True)
 
             finally:
-                # Stop aggregator server
                 if self.is_aggregator:
-                    time.sleep(2)  # Wait for other nodes to finish
+                    time.sleep(2)
                     self.stop_aggregator_server()
 
-            # ECM gossip (bridge nodes only)
+            # Phase 5: ECM gossip with convergence status (bridge nodes only)
             if cid and model_hash and self.is_bridge_node:
                 logger.info("Phase 5: ECM gossip to neighbor clusters")
-                self.gossip_ecm(cid, model_hash, round_idx)
+                cluster_converged = self.convergence_tracker.state.cluster_converged if self.convergence_tracker else False
+                delta_norm = self.convergence_tracker.state.delta_norm if self.convergence_tracker else 0.0
+                self.gossip_ecm_with_convergence(cid, model_hash, round_idx, cluster_converged, delta_norm)
 
-            # Sync point: wait for next round
+            if should_stop:
+                logger.info(f"Stopping training: {stop_reason}")
+                break
+
             logger.info(f"Round {round_idx} complete. Waiting before next round...")
             time.sleep(5)
+            self.current_round += 1
 
         logger.info("\n" + "="*60)
-        logger.info("Training loop completed")
+        logger.info(f"Training completed after {self.current_round + 1} rounds (reason: {stop_reason or 'max_rounds'})")
         logger.info("="*60)
+
+    def _fetch_convergence_status(self) -> Optional[secureagg_pb2.ModelResponse]:
+        """Fetch convergence status from aggregator."""
+        try:
+            agg_port = int(self.aggregator_address.split(":")[-1]) + 1000
+            agg_host = self.aggregator_address.split(":")[0]
+            agg_addr = f"{agg_host}:{agg_port}"
+
+            channel = grpc.insecure_channel(agg_addr)
+            stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
+            response = stub.GetGlobalModel(
+                secureagg_pb2.ModelRequest(round=self.current_round),
+                timeout=10
+            )
+            channel.close()
+            return response
+        except Exception as e:
+            logger.warning(f"Failed to fetch convergence status: {e}")
+            return None
+
+    def gossip_ecm_with_convergence(
+        self, cid: str, model_hash: str, round_num: int,
+        cluster_converged: bool, delta_norm: float
+    ) -> None:
+        """Gossip ECM with convergence status to neighbor cluster bridge nodes."""
+        if not self.is_bridge_node or not self.bridge_client:
+            return
+
+        cluster_id = f"cluster_{self.clique_id}"
+        accepted = self.bridge_client.broadcast_ecm_with_convergence(
+            self.neighbor_bridge_addresses,
+            cluster_id,
+            round_num,
+            cid,
+            model_hash,
+            cluster_converged,
+            delta_norm,
+        )
+        logger.info(
+            f"Gossiped ECM with convergence (converged={cluster_converged}) to "
+            f"{accepted}/{len(self.neighbor_bridge_addresses)} neighbors"
+        )
 
     def start(self) -> None:
         """Start the node service."""

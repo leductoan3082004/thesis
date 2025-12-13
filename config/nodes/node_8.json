@@ -31,5 +31,13 @@
     "alpha": 0.5,
     "base_gamma": 0.2,
     "freshness_window": 300.0
+  },
+  "convergence": {
+    "enabled": true,
+    "max_rounds": 100,
+    "tol_abs": 1e-5,
+    "tol_rel": 0.001,
+    "patience": 3,
+    "require_neighbor_convergence": true
   }
 }

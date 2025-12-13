@@ -1,0 +1,237 @@
+"""Tests for convergence tracking logic."""
+
+import numpy as np
+import pytest
+
+from secure_aggregation.convergence import ConvergenceConfig, ConvergenceState, ConvergenceTracker
+
+
+class TestConvergenceConfig:
+    """Tests for ConvergenceConfig dataclass."""
+
+    def test_default_values(self) -> None:
+        config = ConvergenceConfig()
+        assert config.enabled is True
+        assert config.max_rounds == 999999999
+        assert config.tol_abs == 1e-5
+        assert config.tol_rel == 0.001
+        assert config.patience == 3
+        assert config.require_neighbor_convergence is True
+
+    def test_from_dict_with_values(self) -> None:
+        data = {
+            "enabled": False,
+            "max_rounds": 50,
+            "tol_abs": 1e-6,
+            "tol_rel": 0.01,
+            "patience": 5,
+            "require_neighbor_convergence": False,
+        }
+        config = ConvergenceConfig.from_dict(data)
+        assert config.enabled is False
+        assert config.max_rounds == 50
+        assert config.tol_abs == 1e-6
+        assert config.tol_rel == 0.01
+        assert config.patience == 5
+        assert config.require_neighbor_convergence is False
+
+    def test_from_dict_with_none(self) -> None:
+        config = ConvergenceConfig.from_dict(None)
+        assert config.enabled is True
+        assert config.max_rounds == 999999999
+
+    def test_from_dict_with_partial_values(self) -> None:
+        data = {"max_rounds": 200}
+        config = ConvergenceConfig.from_dict(data)
+        assert config.max_rounds == 200
+        assert config.tol_abs == 1e-5  # default
+
+
+class TestConvergenceTracker:
+    """Tests for ConvergenceTracker class."""
+
+    def test_initial_state(self) -> None:
+        config = ConvergenceConfig()
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        assert tracker.state.round_idx == 0
+        assert tracker.state.prev_model is None
+        assert tracker.state.convergence_streak == 0
+        assert tracker.state.cluster_converged is False
+        assert tracker.state.should_stop is False
+
+    def test_first_update_no_convergence(self) -> None:
+        config = ConvergenceConfig()
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        model = np.array([1.0, 2.0, 3.0])
+        state = tracker.update(model)
+
+        # First update can't converge (no previous model to compare)
+        assert state.convergence_streak == 0
+        assert state.cluster_converged is False
+        assert state.should_stop is False
+        assert state.round_idx == 1
+
+    def test_convergence_detection_with_stable_model(self) -> None:
+        config = ConvergenceConfig(tol_abs=0.1, patience=2)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        # First model
+        model1 = np.array([1.0, 2.0, 3.0])
+        tracker.update(model1)
+
+        # Second model - very small change (below tolerance)
+        model2 = np.array([1.0, 2.0, 3.00001])
+        state = tracker.update(model2)
+        assert state.convergence_streak == 1
+        assert state.cluster_converged is False
+
+        # Third model - another small change
+        model3 = np.array([1.0, 2.0, 3.00002])
+        state = tracker.update(model3)
+        assert state.convergence_streak == 2
+        assert state.cluster_converged is True
+        assert state.should_stop is True
+        assert state.stop_reason == "global_convergence"
+
+    def test_convergence_streak_reset_on_large_change(self) -> None:
+        config = ConvergenceConfig(tol_abs=0.1, patience=3)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        # Build up streak
+        model1 = np.array([1.0, 2.0, 3.0])
+        tracker.update(model1)
+
+        model2 = np.array([1.0, 2.0, 3.00001])
+        state = tracker.update(model2)
+        assert state.convergence_streak == 1
+
+        # Large change - streak should reset
+        model3 = np.array([1.0, 2.0, 5.0])
+        state = tracker.update(model3)
+        assert state.convergence_streak == 0
+        assert state.cluster_converged is False
+
+    def test_max_rounds_stop(self) -> None:
+        config = ConvergenceConfig(max_rounds=3, tol_abs=1e-10)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        # Run until max rounds
+        for i in range(4):
+            model = np.array([float(i), float(i + 1), float(i + 2)])
+            state = tracker.update(model)
+
+        assert state.should_stop is True
+        assert state.stop_reason == "max_rounds_reached"
+
+    def test_neighbor_convergence_required(self) -> None:
+        config = ConvergenceConfig(
+            tol_abs=0.1, patience=1, require_neighbor_convergence=True
+        )
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        # Set up neighbor that hasn't converged
+        tracker.receive_neighbor_convergence("cluster_1", False)
+
+        # Make local model converge
+        model1 = np.array([1.0, 2.0, 3.0])
+        tracker.update(model1)
+
+        model2 = np.array([1.0, 2.0, 3.00001])
+        state = tracker.update(model2)
+
+        # Should be locally converged but not globally (neighbor not ready)
+        assert state.cluster_converged is True
+        assert state.should_stop is False
+
+        # Now neighbor converges
+        tracker.receive_neighbor_convergence("cluster_1", True)
+
+        model3 = np.array([1.0, 2.0, 3.00002])
+        state = tracker.update(model3)
+
+        # Now should stop
+        assert state.should_stop is True
+        assert state.stop_reason == "global_convergence"
+
+    def test_neighbor_convergence_not_required(self) -> None:
+        config = ConvergenceConfig(
+            tol_abs=0.1, patience=1, require_neighbor_convergence=False
+        )
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        # Set up neighbor that hasn't converged
+        tracker.receive_neighbor_convergence("cluster_1", False)
+
+        # Make local model converge
+        model1 = np.array([1.0, 2.0, 3.0])
+        tracker.update(model1)
+
+        model2 = np.array([1.0, 2.0, 3.00001])
+        state = tracker.update(model2)
+
+        # Should stop even though neighbor hasn't converged
+        assert state.cluster_converged is True
+        assert state.should_stop is True
+
+    def test_disabled_convergence(self) -> None:
+        config = ConvergenceConfig(enabled=False)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        model1 = np.array([1.0, 2.0, 3.0])
+        tracker.update(model1)
+
+        model2 = np.array([1.0, 2.0, 3.00001])
+        state = tracker.update(model2)
+
+        # Convergence tracking disabled - should not converge
+        assert state.convergence_streak == 0
+        assert state.cluster_converged is False
+        assert state.should_stop is False
+
+    def test_reset(self) -> None:
+        config = ConvergenceConfig(tol_abs=0.1, patience=1)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        model1 = np.array([1.0, 2.0, 3.0])
+        tracker.update(model1)
+
+        model2 = np.array([1.0, 2.0, 3.00001])
+        state = tracker.update(model2)
+        assert state.cluster_converged is True
+
+        # Reset
+        tracker.reset()
+
+        assert tracker.state.round_idx == 0
+        assert tracker.state.prev_model is None
+        assert tracker.state.convergence_streak == 0
+        assert tracker.state.cluster_converged is False
+
+    def test_delta_norm_calculation(self) -> None:
+        config = ConvergenceConfig(tol_abs=0.1, patience=3)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        model1 = np.array([0.0, 0.0, 0.0])
+        tracker.update(model1)
+
+        model2 = np.array([3.0, 4.0, 0.0])  # L2 norm of delta = 5.0
+        state = tracker.update(model2)
+
+        assert abs(state.delta_norm - 5.0) < 1e-6
+
+    def test_relative_tolerance(self) -> None:
+        config = ConvergenceConfig(tol_abs=1e-10, tol_rel=0.01, patience=1)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        # Large model where 1% change is significant
+        model1 = np.array([100.0, 200.0, 300.0])
+        tracker.update(model1)
+
+        # 0.5% change - below relative tolerance
+        model2 = np.array([100.5, 200.0, 300.0])
+        state = tracker.update(model2)
+
+        assert state.convergence_streak == 1
+        assert state.cluster_converged is True

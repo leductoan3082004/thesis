@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  ipfs-node-1:
+    image: ipfs/kubo:v0.29.0
+    container_name: ipfs-node-1
+    restart: always
+    hostname: ipfs-node-1
+    environment:
+      NODE_NAME: "ipfs-node-1"
+      BOOTSTRAP_PEERS: "/dns4/ipfs-node-2/tcp/4001/p2p/12D3KooWFU4goqVKyhYVCZRkqkddD4CbtnN2r93r6JzHKj3iuX6r,/dns4/ipfs-node-3/tcp/4001/p2p/12D3KooWGENvSuyVENrUwZudh2eTWz2Ca6g47BrtTkhC8hG6CE1A"
+    volumes:
+      - ../data/ipfs/node-1:/data/ipfs
+      - ./ipfs-bootstrap.sh:/container-bootstrap.sh
+    networks:
+      - secureagg
+    ports:
+      - "5001:5001"
+      - "8080:8080"
+    entrypoint: ["/bin/sh", "/container-bootstrap.sh"]
+
+  ipfs-node-2:
+    image: ipfs/kubo:v0.29.0
+    container_name: ipfs-node-2
+    restart: always
+    hostname: ipfs-node-2
+    environment:
+      NODE_NAME: "ipfs-node-2"
+      BOOTSTRAP_PEERS: "/dns4/ipfs-node-1/tcp/4001/p2p/12D3KooWEAqEVyD1KCpUA5g64sobt36bSECKmYk6hfTG7xcMQ4dt,/dns4/ipfs-node-3/tcp/4001/p2p/12D3KooWGENvSuyVENrUwZudh2eTWz2Ca6g47BrtTkhC8hG6CE1A"
+    volumes:
+      - ../data/ipfs/node-2:/data/ipfs
+      - ./ipfs-bootstrap.sh:/container-bootstrap.sh
+    networks:
+      - secureagg
+    ports:
+      - "5002:5001"
+    entrypoint: ["/bin/sh", "/container-bootstrap.sh"]
+
+  ipfs-node-3:
+    image: ipfs/kubo:v0.29.0
+    container_name: ipfs-node-3
+    restart: always
+    hostname: ipfs-node-3
+    environment:
+      NODE_NAME: "ipfs-node-3"
+      BOOTSTRAP_PEERS: "/dns4/ipfs-node-1/tcp/4001/p2p/12D3KooWEAqEVyD1KCpUA5g64sobt36bSECKmYk6hfTG7xcMQ4dt,/dns4/ipfs-node-2/tcp/4001/p2p/12D3KooWFU4goqVKyhYVCZRkqkddD4CbtnN2r93r6JzHKj3iuX6r"
+    volumes:
+      - ../data/ipfs/node-3:/data/ipfs
+      - ./ipfs-bootstrap.sh:/container-bootstrap.sh
+    networks:
+      - secureagg
+    ports:
+      - "5003:5001"
+    entrypoint: ["/bin/sh", "/container-bootstrap.sh"]
+
+  registry:
+    build:
+      context: ..
+      dockerfile: docker/registry.Dockerfile
+    container_name: model-registry
+    restart: always
+    hostname: registry
+    environment:
+      REGISTRY_STORAGE_PATH: "/data/registry.json"
+    volumes:
+      - ../data/registry:/data
+    networks:
+      - secureagg
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+networks:
+  secureagg:
+    driver: bridge

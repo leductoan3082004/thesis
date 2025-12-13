@@ -45,6 +45,8 @@ service AggregatorService {
   rpc Round3ConsistencyCheck(ConsistencySignature) returns (ConsistencyAck);
   rpc Round4Unmask(UnmaskShares) returns (UnmaskAck);
   rpc GetGlobalModel(ModelRequest) returns (ModelResponse);
+  // Bridge nodes forward ECMs to aggregator for inter-cluster merge
+  rpc SubmitECMs(ECMSubmitRequest) returns (ECMSubmitResponse);
 }
 
 // Round 0: Advertise DH public keys
@@ -127,6 +129,14 @@ message ModelResponse {
   repeated float model_weights = 1;
   int32 round = 2;
   string aggregator_id = 3;
+  // Convergence signaling fields
+  bool should_stop = 4;
+  string stop_reason = 5;
+  float delta_norm = 6;
+  bool cluster_converged = 7;
+  // IPFS reference for merged model (nodes fetch from IPFS if set)
+  string model_cid = 8;
+  string model_hash = 9;
 }
 
 // Inter-cluster ECM (External Cluster Model) messages
@@ -151,6 +161,9 @@ message ECMBroadcast {
   int32 round = 2;
   string cid = 3;
   string hash = 4;
+  // Convergence status for cross-cluster coordination
+  bool cluster_converged = 5;
+  float cluster_delta_norm = 6;
 }
 
 // Bridge node service for inter-cluster ECM gossip

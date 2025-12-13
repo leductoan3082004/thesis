@@ -18,6 +18,7 @@ from secure_aggregation.protocol import (
 from secure_aggregation.protocol.core import _bytes_to_int
 from secure_aggregation.protocol.core import _int_to_bytes as int_to_bytes
 from secure_aggregation.protocol.core import DH_PRIV_BYTES, SHARE_BYTES
+from secure_aggregation.node import ECM, ECMBuffer
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("aggregator_service")
@@ -70,6 +71,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         threshold: int,
         participant_ids: List[str],
         signing_public_keys: Optional[Mapping[str, bytes]] = None,
+        ecm_buffer: Optional[ECMBuffer] = None,
     ) -> None:
         self.node_id = node_id
         self.threshold = threshold
@@ -83,9 +85,37 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round3_signatures: Dict[str, bytes] = {}
         self._round4_payloads: List[UnmaskingSharesModel] = []
 
+        # ECM buffer for receiving ECMs from bridge nodes
+        self.ecm_buffer = ecm_buffer
+
+        # Convergence state for global coordination
+        self.merged_model_cid: Optional[str] = None
+        self.merged_model_hash: Optional[str] = None
+        self.should_stop: bool = False
+        self.stop_reason: str = ""
+        self.delta_norm: float = 0.0
+        self.cluster_converged: bool = False
+
         logger.info(
             f"Aggregator {node_id} initialized with threshold={threshold}, participants={len(participant_ids)}"
         )
+
+    def set_convergence_state(
+        self,
+        model_cid: Optional[str],
+        model_hash: Optional[str],
+        should_stop: bool,
+        stop_reason: str,
+        delta_norm: float,
+        cluster_converged: bool,
+    ) -> None:
+        """Store IPFS reference and convergence info for distribution to all nodes."""
+        self.merged_model_cid = model_cid
+        self.merged_model_hash = model_hash
+        self.should_stop = should_stop
+        self.stop_reason = stop_reason
+        self.delta_norm = delta_norm
+        self.cluster_converged = cluster_converged
 
     def _validate_participant(self, node_id: str) -> bool:
         return node_id in self.participant_ids
@@ -239,14 +269,75 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             return secureagg_pb2.UnmaskAck(accepted=False, message=str(exc), aggregation_complete=False)
 
     def GetGlobalModel(self, request: secureagg_pb2.ModelRequest, context) -> secureagg_pb2.ModelResponse:
-        """Return the aggregated global model."""
+        """Return the global model with convergence signals.
+
+        If inter-cluster merge was performed, returns IPFS reference (cid, hash)
+        so nodes can fetch the merged model from IPFS. Otherwise returns the
+        intra-cluster aggregated weights directly.
+        """
         if self.aggregated_result is None:
-            return secureagg_pb2.ModelResponse(model_weights=[], round=self.current_round, aggregator_id=self.node_id)
-        logger.info(f"Serving global model (round {self.current_round})")
+            return secureagg_pb2.ModelResponse(
+                model_weights=[],
+                round=self.current_round,
+                aggregator_id=self.node_id,
+                should_stop=False,
+                stop_reason="",
+                delta_norm=0.0,
+                cluster_converged=False,
+                model_cid="",
+                model_hash="",
+            )
+
+        logger.info(
+            f"Serving global model (round {self.current_round}, "
+            f"should_stop={self.should_stop}, delta={self.delta_norm:.2e}, "
+            f"cid={self.merged_model_cid[:16] if self.merged_model_cid else 'N/A'}...)"
+        )
         return secureagg_pb2.ModelResponse(
             model_weights=self.aggregated_result,
             round=self.current_round,
             aggregator_id=self.node_id,
+            should_stop=self.should_stop,
+            stop_reason=self.stop_reason,
+            delta_norm=self.delta_norm,
+            cluster_converged=self.cluster_converged,
+            model_cid=self.merged_model_cid or "",
+            model_hash=self.merged_model_hash or "",
+        )
+
+    def SubmitECMs(
+        self,
+        request: secureagg_pb2.ECMSubmitRequest,
+        context,
+    ) -> secureagg_pb2.ECMSubmitResponse:
+        """Receive ECMs forwarded by bridge nodes for inter-cluster merge."""
+        if self.ecm_buffer is None:
+            logger.warning("Received ECMs but no ECM buffer configured")
+            return secureagg_pb2.ECMSubmitResponse(
+                accepted=False,
+                message="ECM buffer not configured on aggregator",
+            )
+
+        received_count = 0
+        for ecm_msg in request.ecms:
+            ecm = ECM(
+                cid=ecm_msg.cid,
+                hash=ecm_msg.hash,
+                source_cluster=ecm_msg.source_cluster,
+            )
+            self.ecm_buffer.add(ecm)
+            received_count += 1
+            logger.debug(
+                f"Received ECM from bridge {request.node_id}: "
+                f"cid={ecm.cid[:8]}... cluster={ecm.source_cluster}"
+            )
+
+        logger.info(
+            f"Aggregator received {received_count} ECMs from bridge node {request.node_id}"
+        )
+        return secureagg_pb2.ECMSubmitResponse(
+            accepted=True,
+            message=f"Received {received_count} ECMs",
         )
 
     def reset_for_next_round(self) -> None:
@@ -256,6 +347,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             signing_public_keys=self.aggregator.signing_public_keys,
         )
         self.aggregated_result = None
+        self.merged_model_cid = None
+        self.merged_model_hash = None
         self._adverts.clear()
         self._adverts_committed = False
         self._round3_signatures.clear()
@@ -270,12 +363,23 @@ def serve(
     threshold: int,
     participant_ids: List[str],
     signing_public_keys: Optional[Mapping[str, bytes]] = None,
-) -> grpc.Server:
-    """Start the aggregator gRPC server."""
-    servicer = AggregatorServicer(node_id, threshold, participant_ids, signing_public_keys=signing_public_keys)
+    ecm_buffer: Optional[ECMBuffer] = None,
+) -> Tuple[grpc.Server, AggregatorServicer]:
+    """Start the aggregator gRPC server.
+
+    Returns:
+        Tuple of (server, servicer) so caller can access servicer for convergence state.
+    """
+    servicer = AggregatorServicer(
+        node_id,
+        threshold,
+        participant_ids,
+        signing_public_keys=signing_public_keys,
+        ecm_buffer=ecm_buffer,
+    )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     secureagg_pb2_grpc.add_AggregatorServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")
     server.start()
     logger.info(f"Aggregator server started on port {port}")
-    return server
+    return server, servicer
