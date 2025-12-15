@@ -1,4 +1,5 @@
 import math
+import os
 import random
 from collections import Counter, defaultdict
 from typing import Dict, Iterable, List, Mapping, MutableSequence, Sequence, Set, Tuple
@@ -109,21 +110,45 @@ def _add_edge(edges: Set[Tuple[int, int]], a: int, b: int) -> None:
 
 
 def build_interclique_edges(
-    cliques: Sequence[Set[str]], mode: str = "small_world", small_world_c: int = 2
+    cliques: Sequence[Set[str]],
+    mode: str = "ring_star",
+    small_world_c: int = 2,
+    ring_star_extra: int = 0,
 ) -> List[Tuple[int, int]]:
     """
     Construct inter-clique edges between clique indices.
+
+    Args:
+        cliques: Collection of node sets.
+        mode: Inter-clique topology mode.
+        small_world_c: Number of power-of-two offsets when mode == "small_world".
+        ring_star_extra: Extra random edges per clique when mode == "ring_star".
     """
     num = len(cliques)
     edges: Set[Tuple[int, int]] = set()
     if num <= 1:
         return []
-    if mode not in {"ring", "fractal", "small_world", "fully_connected"}:
+    if mode not in {"ring", "fractal", "small_world", "fully_connected", "ring_star"}:
         raise ValueError(f"Unknown edge mode '{mode}'")
+    if small_world_c <= 0 and mode == "small_world":
+        raise ValueError("small_world_c must be positive")
+    if ring_star_extra < 0:
+        raise ValueError("ring_star_extra must be non-negative")
     # Base connectivity keeps the graph connected.
     for i in range(num):
         _add_edge(edges, i, (i + 1) % num)
     if mode == "ring":
+        return sorted(edges)
+    if mode == "ring_star":
+        # Choose the clique with the most nodes (ties broken by lowest index).
+        central_idx = max(range(num), key=lambda idx: (len(cliques[idx]), -idx))
+        for i in range(num):
+            if i == central_idx:
+                continue
+            _add_edge(edges, central_idx, i)
+        if ring_star_extra > 0:
+            rng = random.Random(num)
+            _add_ring_star_extra_edges(edges, num, ring_star_extra, rng)
         return sorted(edges)
     if mode == "fully_connected":
         for i in range(num):
@@ -136,13 +161,114 @@ def build_interclique_edges(
             _add_edge(edges, i, (i + stride) % num)
         return sorted(edges)
     # small_world
-    if small_world_c <= 0:
-        raise ValueError("small_world_c must be positive")
     for k in range(small_world_c):
         offset = 2**k
         for i in range(num):
             _add_edge(edges, i, (i + offset) % num)
     return sorted(edges)
+
+
+def _add_ring_star_extra_edges(
+    edges: Set[Tuple[int, int]],
+    num_cliques: int,
+    extra_per_clique: int,
+    rng: random.Random,
+) -> None:
+    """Add additional random edges for ring_star mode while avoiding duplicates."""
+    adjacency: List[Set[int]] = [set() for _ in range(num_cliques)]
+    for a, b in edges:
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+
+    for clique_idx in range(num_cliques):
+        for _ in range(extra_per_clique):
+            candidates = [j for j in range(num_cliques) if j != clique_idx and j not in adjacency[clique_idx]]
+            if not candidates:
+                break
+            target = rng.choice(candidates)
+            _add_edge(edges, clique_idx, target)
+            adjacency[clique_idx].add(target)
+            adjacency[target].add(clique_idx)
+
+
+def _identify_central_clique(
+    cliques: Sequence[Set[str]],
+    interclique_edges: Sequence[Tuple[int, int]],
+) -> Tuple[int | None, List[str]]:
+    """
+    Determine whether any clique is connected to every other clique (ring-star hub).
+
+    Returns:
+        Tuple of (central_clique_index or None, preferred_bridge_nodes).
+    """
+    clique_degrees: Counter[int] = Counter()
+    for a, b in interclique_edges:
+        clique_degrees[a] += 1
+        clique_degrees[b] += 1
+    if not clique_degrees:
+        return None, []
+    candidate = max(
+        range(len(cliques)),
+        key=lambda idx: (clique_degrees[idx], len(cliques[idx]), -idx),
+    )
+    if len(cliques) > 2 and clique_degrees[candidate] >= len(cliques) - 1:
+        central_clique = sorted(cliques[candidate])
+        bridge_target = min(_get_central_bridge_target(), len(central_clique))
+        return candidate, central_clique[:bridge_target]
+    return None, []
+
+
+def _get_central_bridge_target() -> int:
+    """Return desired number of bridge nodes for a ring-star hub."""
+    raw = os.getenv("RING_STAR_BRIDGE_NODES")
+    if raw is None:
+        return 2
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("RING_STAR_BRIDGE_NODES must be an integer") from exc
+    if value <= 0:
+        raise ValueError("RING_STAR_BRIDGE_NODES must be positive")
+    return value
+
+
+def _select_regular_node(clique_nodes: Set[str], node_edge_count: Mapping[str, int]) -> str:
+    return min(clique_nodes, key=lambda n: (node_edge_count[n], n))
+
+
+def _select_central_bridge_node(
+    clique_nodes: Set[str],
+    node_edge_count: Mapping[str, int],
+    preferred_nodes: Sequence[str],
+    central_limit: int,
+    central_served_counts: Dict[str, int],
+    central_assignments: Dict[int, str],
+    target_clique_idx: int,
+) -> str:
+    """
+    Pick a central bridge node while ensuring coverage and degree limits.
+
+    Each outer clique is pinned to a single central node. New assignments favor
+    the node that has served the fewest cliques and is still below the n/2 limit.
+    """
+    if target_clique_idx in central_assignments:
+        assigned = central_assignments[target_clique_idx]
+        if assigned in clique_nodes:
+            return assigned
+
+    intersection = [node for node in preferred_nodes if node in clique_nodes]
+    if not intersection:
+        return _select_regular_node(clique_nodes, node_edge_count)
+
+    def _key(node: str) -> Tuple[bool, int, int, str]:
+        served = central_served_counts.get(node, 0)
+        over_limit = central_limit > 0 and served >= central_limit
+        return (over_limit, served, node_edge_count[node], node)
+
+    best = min(intersection, key=_key)
+    central_assignments[target_clique_idx] = best
+    central_served_counts[best] = central_served_counts.get(best, 0) + 1
+    return best
 
 
 def assign_node_edges(
@@ -154,6 +280,11 @@ def assign_node_edges(
 
     For each inter-clique edge (clique_a, clique_b), picks the node with the lowest
     current edge count from each clique to form the actual node-to-node connection.
+    When a clique is connected to every other clique (the ring-star hub), up to
+    three nodes inside that clique are preferentially selected to serve as bridge
+    nodes so they become the high-connectivity backbone for convergence checks.
+    Each hub node is capped at serving ceil(num_cliques / 2) unique neighbor cliques
+    to keep coverage balanced.
 
     Args:
         cliques: List of node sets, where each set represents a clique.
@@ -165,20 +296,46 @@ def assign_node_edges(
         - Dict mapping each node to its final edge count.
     """
     node_edge_count: Dict[str, int] = {}
-
     for clique in cliques:
         clique_size = len(clique)
         for node in clique:
             node_edge_count[node] = clique_size - 1
 
-    node_to_node_edges: List[Tuple[str, str]] = []
+    central_idx, central_bridge_nodes = _identify_central_clique(cliques, interclique_edges)
+    central_limit = math.ceil(len(cliques) / 2) if central_idx is not None else 0
+    central_served_counts: Dict[str, int] = {node: 0 for node in central_bridge_nodes}
+    central_assignments: Dict[int, str] = {}
 
+    node_to_node_edges: List[Tuple[str, str]] = []
     for clique_a_idx, clique_b_idx in interclique_edges:
         clique_a = cliques[clique_a_idx]
         clique_b = cliques[clique_b_idx]
 
-        best_a = min(clique_a, key=lambda n: (node_edge_count[n], n))
-        best_b = min(clique_b, key=lambda n: (node_edge_count[n], n))
+        if central_idx is not None and clique_a_idx == central_idx:
+            best_a = _select_central_bridge_node(
+                clique_a,
+                node_edge_count,
+                central_bridge_nodes,
+                central_limit,
+                central_served_counts,
+                central_assignments,
+                target_clique_idx=clique_b_idx,
+            )
+        else:
+            best_a = _select_regular_node(clique_a, node_edge_count)
+
+        if central_idx is not None and clique_b_idx == central_idx:
+            best_b = _select_central_bridge_node(
+                clique_b,
+                node_edge_count,
+                central_bridge_nodes,
+                central_limit,
+                central_served_counts,
+                central_assignments,
+                target_clique_idx=clique_a_idx,
+            )
+        else:
+            best_b = _select_regular_node(clique_b, node_edge_count)
 
         node_to_node_edges.append((best_a, best_b))
         node_edge_count[best_a] += 1
@@ -193,6 +350,7 @@ def build_full_topology(
     iterations: int = 1000,
     edge_mode: str = "small_world",
     small_world_c: int = 2,
+    ring_star_extra: int = 0,
     seed: int | None = None,
 ) -> Tuple[List[Set[str]], List[Tuple[str, str]], List[Tuple[str, str]], Dict[str, int]]:
     """
@@ -209,6 +367,7 @@ def build_full_topology(
         iterations: Number of greedy swap iterations.
         edge_mode: Inter-clique edge mode ("ring", "small_world", "fractal", "fully_connected").
         small_world_c: Parameter for small_world mode (number of power-of-2 offsets).
+        ring_star_extra: Additional random edges per clique when using ring_star mode.
         seed: Random seed for reproducibility.
 
     Returns:
@@ -219,7 +378,12 @@ def build_full_topology(
         - node_edge_count: Dict mapping each node to its final edge count.
     """
     cliques = build_d_cliques(node_labels, clique_size, iterations, seed)
-    interclique_edges = build_interclique_edges(cliques, mode=edge_mode, small_world_c=small_world_c)
+    interclique_edges = build_interclique_edges(
+        cliques,
+        mode=edge_mode,
+        small_world_c=small_world_c,
+        ring_star_extra=ring_star_extra,
+    )
 
     intra_edges: List[Tuple[str, str]] = []
     for clique in cliques:
