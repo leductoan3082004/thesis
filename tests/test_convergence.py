@@ -1,7 +1,6 @@
 """Tests for convergence tracking logic."""
 
 import numpy as np
-import pytest
 
 from secure_aggregation.convergence import ConvergenceConfig, ConvergenceState, ConvergenceTracker
 
@@ -17,6 +16,8 @@ class TestConvergenceConfig:
         assert config.tol_rel == 0.001
         assert config.patience == 3
         assert config.require_neighbor_convergence is True
+        assert config.central_checker_id is None
+        assert config.signal_timeout == 30.0
 
     def test_from_dict_with_values(self) -> None:
         data = {
@@ -26,6 +27,8 @@ class TestConvergenceConfig:
             "tol_rel": 0.01,
             "patience": 5,
             "require_neighbor_convergence": False,
+            "central_checker_id": "central_0",
+            "signal_timeout": 12.5,
         }
         config = ConvergenceConfig.from_dict(data)
         assert config.enabled is False
@@ -34,6 +37,8 @@ class TestConvergenceConfig:
         assert config.tol_rel == 0.01
         assert config.patience == 5
         assert config.require_neighbor_convergence is False
+        assert config.central_checker_id == "central_0"
+        assert config.signal_timeout == 12.5
 
     def test_from_dict_with_none(self) -> None:
         config = ConvergenceConfig.from_dict(None)
@@ -235,3 +240,30 @@ class TestConvergenceTracker:
 
         assert state.convergence_streak == 1
         assert state.cluster_converged is True
+
+    def test_central_signal_flow(self) -> None:
+        signals = []
+
+        def sender(signal) -> None:
+            signals.append(signal)
+
+        config = ConvergenceConfig(tol_abs=0.1, patience=1, central_checker_id="central_0")
+        tracker = ConvergenceTracker(config, "cluster_0", signal_sender=sender)
+
+        model1 = np.array([1.0, 2.0, 3.0])
+        tracker.update(model1)
+        assert len(signals) == 1
+        assert signals[-1].converged is False
+        assert signals[-1].destination == "central_0"
+
+        model2 = np.array([1.0, 2.0, 3.00001])
+        state = tracker.update(model2)
+        assert len(signals) == 2
+        assert signals[-1].converged is True
+        assert state.cluster_converged is True
+        assert state.should_stop is False  # waiting for central confirmation
+
+        tracker.receive_global_convergence(round_idx=state.round_idx)
+        state = tracker.update(np.array([1.0, 2.0, 3.00002]))
+        assert state.should_stop is True
+        assert state.stop_reason == "global_convergence"

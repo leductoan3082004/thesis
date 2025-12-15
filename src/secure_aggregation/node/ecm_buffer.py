@@ -21,6 +21,8 @@ class ECM:
     received_at: float = 0.0
     cluster_converged: bool = False
     cluster_delta_norm: float = 0.0
+    round_idx: int = -1
+    is_signal: bool = False
 
     def __post_init__(self) -> None:
         if self.received_at == 0.0:
@@ -104,12 +106,20 @@ class ECMBuffer:
         Used by aggregator to deduplicate and fetch external models.
         """
         fresh = self.get_fresh_ecms()
-        return {ecm.cid: ecm.hash for ecm in fresh}
+        return {ecm.cid: ecm.hash for ecm in fresh if not ecm.is_signal}
 
     def clear(self) -> None:
         """Clear all ECMs from buffer."""
         with self._lock:
             self._buffer.clear()
+
+    def pop_signal_ecms(self) -> List[ECM]:
+        """Remove and return ECMs that represent convergence signals."""
+        with self._lock:
+            signals = [ecm for ecm in self._buffer.values() if ecm.is_signal]
+            for ecm in signals:
+                self._buffer.pop(ecm.cid, None)
+            return signals
 
     def remove_stale(self, now: Optional[float] = None) -> int:
         """

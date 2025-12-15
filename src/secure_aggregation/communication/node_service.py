@@ -18,7 +18,13 @@ from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
 from secure_aggregation.communication.aggregator_service import AggregatorServicer, serve as serve_aggregator
 from secure_aggregation.communication.bridge_service import BridgeClient, serve_bridge
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
-from secure_aggregation.convergence import ConvergenceConfig, ConvergenceTracker
+from secure_aggregation.convergence import ConvergenceConfig, ConvergenceSignal, ConvergenceTracker
+from secure_aggregation.convergence.central_broadcast import (
+    fetch_central_metadata,
+    fetch_global_convergence_round,
+)
+from secure_aggregation.convergence.central_checker import CentralChecker
+from secure_aggregation.convergence.central_coordinator import CentralCheckerCoordinator
 from secure_aggregation.config.models import NodeRole
 from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition
@@ -118,6 +124,8 @@ class NodeService:
         self.inter_edges: List[Tuple[str, str]] = []
         self.is_bridge_node = False
         self.neighbor_bridge_addresses: List[str] = []
+        self.neighbor_address_map: Dict[str, str] = {}
+        self.central_neighbor_addresses: Dict[str, str] = {}
         self.ecm_buffer: Optional[ECMBuffer] = None
         self.bridge_server: Optional[grpc.Server] = None
         self.bridge_client: Optional[BridgeClient] = None
@@ -128,6 +136,10 @@ class NodeService:
         # Convergence state
         self.convergence_config = ConvergenceConfig.from_dict(self.config.get("convergence"))
         self.convergence_tracker: Optional[ConvergenceTracker] = None
+        self.central_coordinator: Optional[CentralCheckerCoordinator] = None
+        self.central_metadata = None
+        self._pending_convergence_signal: Optional[ConvergenceSignal] = None
+        self.central_checker: Optional[CentralChecker] = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
 
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
@@ -353,6 +365,8 @@ class NodeService:
             blockchain=self.blockchain,
             merge_config=merge_config,
         )
+        self.central_coordinator = CentralCheckerCoordinator(self.blockchain)
+        self._refresh_central_metadata()
 
     def setup_bridge_node(self, inter_edges: List[Tuple[str, str]]) -> None:
         """Setup bridge node if this node has inter-clique connections."""
@@ -364,9 +378,8 @@ class NodeService:
             return
 
         neighbors = get_inter_clique_neighbors(self.node_id, inter_edges)
-        self.neighbor_bridge_addresses = [
-            f"{n}:{self.port + 2000}" for n in neighbors
-        ]
+        self.neighbor_address_map = {n: f"{n}:{self.port + 2000}" for n in neighbors}
+        self.neighbor_bridge_addresses = list(self.neighbor_address_map.values())
 
         logger.info(
             f"Node {self.node_id} is a bridge node with {len(neighbors)} "
@@ -381,6 +394,7 @@ class NodeService:
             )
             self.bridge_client = BridgeClient(self.node_id)
             logger.info(f"Bridge server started on port {self.port + 2000}")
+        self._update_central_neighbor_addresses()
 
     def stop_bridge_server(self) -> None:
         """Stop bridge server."""
@@ -391,6 +405,50 @@ class NodeService:
             self.bridge_client.close()
             self.bridge_client = None
         logger.info("Bridge server stopped")
+
+    def _refresh_central_metadata(self) -> None:
+        """Fetch central metadata from blockchain and update coordinator."""
+        if not self.blockchain:
+            return
+        metadata = fetch_central_metadata(self.blockchain)
+        if metadata:
+            self.central_metadata = metadata
+            if self.central_coordinator:
+                self.central_coordinator.update_metadata(metadata)
+            self._update_central_neighbor_addresses()
+            if (
+                self.convergence_tracker
+                and metadata.checker_candidates
+                and not self.convergence_config.central_checker_id
+            ):
+                self.convergence_config.central_checker_id = metadata.checker_candidates[0]
+                self.convergence_tracker.config.central_checker_id = metadata.checker_candidates[0]
+            self._maybe_init_central_checker()
+
+    def _update_central_neighbor_addresses(self) -> None:
+        """Build mapping to central neighbor addresses when metadata is available."""
+        self.central_neighbor_addresses = {}
+        if not self.central_metadata:
+            return
+        for node_id in self.central_metadata.central_nodes:
+            address = self.neighbor_address_map.get(node_id)
+            if address:
+                self.central_neighbor_addresses[node_id] = address
+
+    def _maybe_init_central_checker(self) -> None:
+        """Instantiate central checker if this node is a candidate."""
+        if not self.central_metadata:
+            self.central_checker = None
+            return
+        if self.node_id in self.central_metadata.checker_candidates:
+            if self.central_checker is None:
+                self.central_checker = CentralChecker(
+                    self.blockchain,
+                    total_cliques=self.central_metadata.total_cliques,
+                    cluster_ids=self.central_metadata.cluster_ids,
+                )
+        else:
+            self.central_checker = None
 
     def gossip_ecm(self, cid: str, model_hash: str, round_num: int) -> None:
         """Gossip ECM to neighbor cluster bridge nodes."""
@@ -427,6 +485,7 @@ class NodeService:
             return 0
 
         fresh_ecms = self.ecm_buffer.get_fresh_ecms()
+        fresh_ecms = [ecm for ecm in fresh_ecms if not ecm.is_signal]
         if not fresh_ecms:
             logger.debug("No fresh ECMs to forward to aggregator")
             return 0
@@ -678,6 +737,8 @@ class NodeService:
         self.convergence_tracker = ConvergenceTracker(
             self.convergence_config, f"cluster_{self.clique_id}"
         )
+        self.convergence_tracker.set_signal_sender(self._handle_convergence_signal)
+        self._refresh_central_metadata()
 
         logger.info(
             f"Starting convergence-driven training (max_rounds={max_rounds}, "
@@ -692,6 +753,9 @@ class NodeService:
             logger.info(f"\n{'='*60}")
             logger.info(f"Round {round_idx + 1}/{max_rounds}")
             logger.info(f"{'='*60}")
+            self._maybe_broadcast_checker_health(round_idx)
+            self._process_incoming_signals()
+            self._check_global_convergence_signal()
 
             # Phase 1: Local training
             logger.info("Phase 1: Local training")
@@ -824,9 +888,11 @@ class NodeService:
                 cluster_converged = self.convergence_tracker.state.cluster_converged if self.convergence_tracker else False
                 delta_norm = self.convergence_tracker.state.delta_norm if self.convergence_tracker else 0.0
                 self.gossip_ecm_with_convergence(cid, model_hash, round_idx, cluster_converged, delta_norm)
+                self._dispatch_pending_convergence_signal(round_idx)
 
             if should_stop:
                 logger.info(f"Stopping training: {stop_reason}")
+                self._check_global_convergence_signal()
                 break
 
             logger.info(f"Round {round_idx} complete. Waiting before next round...")
@@ -878,6 +944,85 @@ class NodeService:
             f"Gossiped ECM with convergence (converged={cluster_converged}) to "
             f"{accepted}/{len(self.neighbor_bridge_addresses)} neighbors"
         )
+
+    def _handle_convergence_signal(self, signal: ConvergenceSignal) -> None:
+        """Callback from ConvergenceTracker when local convergence state changes."""
+        self._pending_convergence_signal = signal
+        if signal.converged and self.convergence_config.signal_timeout > 0:
+            time.sleep(self.convergence_config.signal_timeout)
+        self._dispatch_pending_convergence_signal(signal.round_idx)
+
+    def _dispatch_pending_convergence_signal(self, round_idx: int) -> None:
+        if (
+            not self._pending_convergence_signal
+            or not self.is_bridge_node
+            or not self.bridge_client
+        ):
+            return
+        checker_id = None
+        if self.central_coordinator:
+            checker_id = self.central_coordinator.select_active_checker(round_idx)
+        if checker_id is None and self.central_metadata and self.central_metadata.central_nodes:
+            checker_id = self.central_metadata.central_nodes[round_idx % len(self.central_metadata.central_nodes)]
+        if checker_id is None:
+            return
+        if not self._send_signal_to_checker(self._pending_convergence_signal, checker_id):
+            logger.debug(f"Failed to send convergence signal to {checker_id}")
+        else:
+            logger.info(
+                f"Sent convergence signal (converged={self._pending_convergence_signal.converged}) "
+                f"to checker {checker_id}"
+            )
+            self._pending_convergence_signal = None
+
+    def _send_signal_to_checker(self, signal: ConvergenceSignal, checker_id: str) -> bool:
+        address = self.central_neighbor_addresses.get(checker_id)
+        if not address:
+            return False
+        cluster_converged = signal.converged
+        delta_norm = self.convergence_tracker.state.delta_norm if self.convergence_tracker else 0.0
+        cid = f"signal::{signal.cluster_id}::{signal.round_idx}"
+        try:
+            return self.bridge_client.send_ecm_with_convergence(
+                address,
+                f"cluster_{self.clique_id}",
+                signal.round_idx,
+                cid=cid,
+                model_hash="signal",
+                cluster_converged=cluster_converged,
+                cluster_delta_norm=delta_norm,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to dispatch convergence signal to {checker_id}: {exc}")
+            return False
+
+    def _maybe_broadcast_checker_health(self, round_idx: int) -> None:
+        if not self.central_metadata or not self.central_coordinator:
+            return
+        if self.node_id not in self.central_metadata.central_nodes:
+            return
+        candidates = self.central_metadata.central_nodes
+        idx = candidates.index(self.node_id)
+        rotation = round_idx % len(candidates)
+        # Highest priority rotates each round.
+        priority = len(candidates) - ((idx - rotation) % len(candidates))
+        self.central_coordinator.announce_health(self.node_id, round_idx, priority, alive=True)
+
+    def _process_incoming_signals(self) -> None:
+        if not self.central_checker or not self.ecm_buffer:
+            return
+        signals = self.ecm_buffer.pop_signal_ecms()
+        for ecm in signals:
+            if not ecm.source_cluster or ecm.round_idx < 0:
+                continue
+            self.central_checker.record_signal(ecm.source_cluster, ecm.round_idx, ecm.cluster_converged)
+
+    def _check_global_convergence_signal(self) -> None:
+        if not self.convergence_tracker:
+            return
+        round_idx = fetch_global_convergence_round(self.blockchain)
+        if round_idx is not None:
+            self.convergence_tracker.receive_global_convergence(round_idx)
 
     def start(self) -> None:
         """Start the node service."""

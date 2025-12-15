@@ -52,12 +52,16 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
         context,
     ) -> secureagg_pb2.ECMSubmitResponse:
         """Receive ECM broadcast from neighbor cluster with convergence status."""
+        cid = request.cid or f"signal::{request.cluster_id}::{request.round}"
+        is_signal = cid.startswith("signal::")
         ecm = ECM(
-            cid=request.cid,
+            cid=cid,
             hash=request.hash,
             source_cluster=request.cluster_id,
             cluster_converged=request.cluster_converged,
             cluster_delta_norm=request.cluster_delta_norm,
+            round_idx=request.round,
+            is_signal=is_signal,
         )
         self.ecm_buffer.add(ecm)
         logger.info(

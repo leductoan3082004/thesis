@@ -1,6 +1,7 @@
 """Trusted Third Party (TTP) service for key distribution and topology management."""
 
 import logging
+import os
 from concurrent import futures
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -9,11 +10,15 @@ import grpc
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
 from secure_aggregation.crypto.sign import SigningKeyPair, generate_signing_keypair
 from secure_aggregation.data import dirichlet_partition
+from secure_aggregation.convergence.central_broadcast import CentralMetadata, publish_central_metadata
+from secure_aggregation.storage.model_store import BlockchainInterface, MockBlockchain, RegistryBlockchain
 from secure_aggregation.topology import (
     build_full_topology,
     compute_clique_threshold,
     compute_node_labels_from_partition,
     find_node_clique,
+    identify_central_clique,
+    build_interclique_edges,
 )
 from secure_aggregation.utils import get_logger
 
@@ -55,9 +60,20 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
         self.registered_nodes: Dict[str, tuple[bytes, bytes, str]] = {}  # node_id -> (sk, pk, address)
         self.topology: TopologyState = TopologyState()
 
+        self.metadata_blockchain = self._create_metadata_blockchain()
+
         if topology_config and labels:
             self._build_topology(topology_config, labels)
         logger.info("TTP service initialized")
+
+    def _create_metadata_blockchain(self) -> Optional[BlockchainInterface]:
+        registry_url = os.environ.get("CENTRAL_METADATA_REGISTRY_URL")
+        storage_path = os.environ.get("CENTRAL_METADATA_STORAGE_PATH")
+        if registry_url:
+            return RegistryBlockchain(registry_url=registry_url)
+        if storage_path:
+            return MockBlockchain(storage_path=storage_path)
+        return None
 
     def _build_topology(self, config: TopologyConfig, labels: Mapping[int, int]) -> None:
         """Build D-Cliques topology from data labels at startup."""
@@ -99,11 +115,37 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             inter_edges=inter_edges,
         )
 
+        self._publish_central_metadata(cliques, config)
+
         logger.info(
             f"Topology built: {len(cliques)} cliques, "
             f"clique sizes: {[len(c) for c in cliques]}, "
             f"thresholds: {list(thresholds.values())}, "
             f"inter_edges: {len(inter_edges)}"
+        )
+
+    def _publish_central_metadata(self, cliques: List[Set[str]], config: TopologyConfig) -> None:
+        """Anchor central node metadata once topology is ready."""
+        if not self.metadata_blockchain:
+            return
+        clique_edges = build_interclique_edges(
+            cliques,
+            mode=config.inter_clique_edges,
+            small_world_c=config.small_world_c,
+        )
+        central_idx, central_nodes = identify_central_clique(cliques, clique_edges)
+        if central_idx is None or not central_nodes:
+            return
+        metadata = CentralMetadata(
+            central_clique_idx=central_idx,
+            central_nodes=central_nodes,
+            checker_candidates=central_nodes[:2] if len(central_nodes) > 1 else central_nodes,
+            version=0,
+        )
+        publish_central_metadata(self.metadata_blockchain, metadata)
+        logger.info(
+            f"Published central metadata: clique={central_idx}, nodes={central_nodes}, "
+            f"candidates={metadata.checker_candidates}"
         )
 
     def RegisterNode(self, request: secureagg_pb2.RegisterRequest, context) -> secureagg_pb2.RegisterResponse:

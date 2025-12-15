@@ -191,7 +191,7 @@ def _add_ring_star_extra_edges(
             adjacency[target].add(clique_idx)
 
 
-def _identify_central_clique(
+def identify_central_clique(
     cliques: Sequence[Set[str]],
     interclique_edges: Sequence[Tuple[int, int]],
 ) -> Tuple[int | None, List[str]]:
@@ -207,11 +207,12 @@ def _identify_central_clique(
         clique_degrees[b] += 1
     if not clique_degrees:
         return None, []
-    candidate = max(
-        range(len(cliques)),
-        key=lambda idx: (clique_degrees[idx], len(cliques[idx]), -idx),
-    )
-    if len(cliques) > 2 and clique_degrees[candidate] >= len(cliques) - 1:
+    degree_list = [clique_degrees.get(idx, 0) for idx in range(len(cliques))]
+    max_degree = max(degree_list)
+    if degree_list.count(max_degree) != 1:
+        return None, []
+    candidate = degree_list.index(max_degree)
+    if len(cliques) > 2 and max_degree >= len(cliques) - 1:
         central_clique = sorted(cliques[candidate])
         bridge_target = min(_get_central_bridge_target(), len(central_clique))
         return candidate, central_clique[:bridge_target]
@@ -283,8 +284,9 @@ def assign_node_edges(
     When a clique is connected to every other clique (the ring-star hub), up to
     three nodes inside that clique are preferentially selected to serve as bridge
     nodes so they become the high-connectivity backbone for convergence checks.
-    Each hub node is capped at serving ceil(num_cliques / 2) unique neighbor cliques
-    to keep coverage balanced.
+    Each hub node is capped at serving all other cliques (n-1) and the algorithm
+    adds direct edges so every hub node maintains a one-hop connection to each
+    outer clique.
 
     Args:
         cliques: List of node sets, where each set represents a clique.
@@ -301,12 +303,21 @@ def assign_node_edges(
         for node in clique:
             node_edge_count[node] = clique_size - 1
 
-    central_idx, central_bridge_nodes = _identify_central_clique(cliques, interclique_edges)
-    central_limit = math.ceil(len(cliques) / 2) if central_idx is not None else 0
+    central_idx, central_bridge_nodes = identify_central_clique(cliques, interclique_edges)
+    central_limit = (len(cliques) - 1) if central_idx is not None else 0
     central_served_counts: Dict[str, int] = {node: 0 for node in central_bridge_nodes}
     central_assignments: Dict[int, str] = {}
 
     node_to_node_edges: List[Tuple[str, str]] = []
+    adjacency: Dict[str, Set[str]] = defaultdict(set)
+
+    def _record_edge(a: str, b: str) -> None:
+        node_to_node_edges.append((a, b))
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+        node_edge_count[a] += 1
+        node_edge_count[b] += 1
+
     for clique_a_idx, clique_b_idx in interclique_edges:
         clique_a = cliques[clique_a_idx]
         clique_b = cliques[clique_b_idx]
@@ -337,9 +348,19 @@ def assign_node_edges(
         else:
             best_b = _select_regular_node(clique_b, node_edge_count)
 
-        node_to_node_edges.append((best_a, best_b))
-        node_edge_count[best_a] += 1
-        node_edge_count[best_b] += 1
+        _record_edge(best_a, best_b)
+
+    if central_idx is not None and central_bridge_nodes:
+        for clique_idx, clique in enumerate(cliques):
+            if clique_idx == central_idx:
+                continue
+            for central_node in central_bridge_nodes:
+                if any(neigh in clique for neigh in adjacency.get(central_node, set())):
+                    continue
+                target_node = _select_regular_node(clique, node_edge_count)
+                central_assignments[clique_idx] = central_node
+                central_served_counts[central_node] = central_served_counts.get(central_node, 0) + 1
+                _record_edge(central_node, target_node)
 
     return node_to_node_edges, node_edge_count
 
