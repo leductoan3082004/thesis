@@ -136,10 +136,13 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
         central_idx, central_nodes = identify_central_clique(cliques, clique_edges)
         if central_idx is None or not central_nodes:
             return
+        cluster_ids = [f"cluster_{i}" for i in range(len(cliques))]
         metadata = CentralMetadata(
             central_clique_idx=central_idx,
             central_nodes=central_nodes,
             checker_candidates=central_nodes[:2] if len(central_nodes) > 1 else central_nodes,
+            total_cliques=len(cliques),
+            cluster_ids=cluster_ids,
             version=0,
         )
         publish_central_metadata(self.metadata_blockchain, metadata)

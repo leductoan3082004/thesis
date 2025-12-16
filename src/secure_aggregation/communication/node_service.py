@@ -24,7 +24,6 @@ from secure_aggregation.convergence.central_broadcast import (
     fetch_global_convergence_round,
 )
 from secure_aggregation.convergence.central_checker import CentralChecker
-from secure_aggregation.convergence.central_coordinator import CentralCheckerCoordinator
 from secure_aggregation.config.models import NodeRole
 from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition
@@ -136,7 +135,6 @@ class NodeService:
         # Convergence state
         self.convergence_config = ConvergenceConfig.from_dict(self.config.get("convergence"))
         self.convergence_tracker: Optional[ConvergenceTracker] = None
-        self.central_coordinator: Optional[CentralCheckerCoordinator] = None
         self.central_metadata = None
         self._pending_convergence_signal: Optional[ConvergenceSignal] = None
         self.central_checker: Optional[CentralChecker] = None
@@ -365,7 +363,6 @@ class NodeService:
             blockchain=self.blockchain,
             merge_config=merge_config,
         )
-        self.central_coordinator = CentralCheckerCoordinator(self.blockchain)
         self._refresh_central_metadata()
 
     def setup_bridge_node(self, inter_edges: List[Tuple[str, str]]) -> None:
@@ -413,8 +410,6 @@ class NodeService:
         metadata = fetch_central_metadata(self.blockchain)
         if metadata:
             self.central_metadata = metadata
-            if self.central_coordinator:
-                self.central_coordinator.update_metadata(metadata)
             self._update_central_neighbor_addresses()
             if (
                 self.convergence_tracker
@@ -753,7 +748,6 @@ class NodeService:
             logger.info(f"\n{'='*60}")
             logger.info(f"Round {round_idx + 1}/{max_rounds}")
             logger.info(f"{'='*60}")
-            self._maybe_broadcast_checker_health(round_idx)
             self._process_incoming_signals()
             self._check_global_convergence_signal()
 
@@ -959,19 +953,16 @@ class NodeService:
             or not self.bridge_client
         ):
             return
-        checker_id = None
-        if self.central_coordinator:
-            checker_id = self.central_coordinator.select_active_checker(round_idx)
-        if checker_id is None and self.central_metadata and self.central_metadata.central_nodes:
-            checker_id = self.central_metadata.central_nodes[round_idx % len(self.central_metadata.central_nodes)]
-        if checker_id is None:
+        if not self.central_neighbor_addresses:
             return
-        if not self._send_signal_to_checker(self._pending_convergence_signal, checker_id):
-            logger.debug(f"Failed to send convergence signal to {checker_id}")
-        else:
+        success = False
+        for checker_id in self.central_neighbor_addresses.keys():
+            if self._send_signal_to_checker(self._pending_convergence_signal, checker_id):
+                success = True
+        if success:
             logger.info(
                 f"Sent convergence signal (converged={self._pending_convergence_signal.converged}) "
-                f"to checker {checker_id}"
+                f"to {len(self.central_neighbor_addresses)} central neighbors"
             )
             self._pending_convergence_signal = None
 
@@ -995,18 +986,6 @@ class NodeService:
         except Exception as exc:
             logger.warning(f"Failed to dispatch convergence signal to {checker_id}: {exc}")
             return False
-
-    def _maybe_broadcast_checker_health(self, round_idx: int) -> None:
-        if not self.central_metadata or not self.central_coordinator:
-            return
-        if self.node_id not in self.central_metadata.central_nodes:
-            return
-        candidates = self.central_metadata.central_nodes
-        idx = candidates.index(self.node_id)
-        rotation = round_idx % len(candidates)
-        # Highest priority rotates each round.
-        priority = len(candidates) - ((idx - rotation) % len(candidates))
-        self.central_coordinator.announce_health(self.node_id, round_idx, priority, alive=True)
 
     def _process_incoming_signals(self) -> None:
         if not self.central_checker or not self.ecm_buffer:

@@ -34,8 +34,8 @@ class CentralMetadata:
             central_clique_idx=data["central_clique_idx"],
             central_nodes=list(data["central_nodes"]),
             checker_candidates=list(data["checker_candidates"]),
-            total_cliques=data["total_cliques"],
-            cluster_ids=list(data["cluster_ids"]),
+            total_cliques=data.get("total_cliques", len(data.get("cluster_ids", []))),
+            cluster_ids=list(data.get("cluster_ids", [])),
             version=data.get("version", 0),
         )
 

@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence
 
-from secure_aggregation.convergence.central_broadcast import publish_global_convergence
+from secure_aggregation.convergence.central_broadcast import (
+    fetch_global_convergence_round,
+    publish_global_convergence,
+)
 from secure_aggregation.storage.model_store import BlockchainInterface
 
 
@@ -43,4 +46,6 @@ class CentralChecker:
         self._finalized_rounds.add(round_idx)
         self._round_signals.pop(round_idx, None)
         if self.blockchain is not None:
-            publish_global_convergence(self.blockchain, round_idx)
+            existing = fetch_global_convergence_round(self.blockchain)
+            if existing is None or existing != round_idx:
+                publish_global_convergence(self.blockchain, round_idx)
