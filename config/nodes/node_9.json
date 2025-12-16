@@ -22,16 +22,22 @@
     "enabled": true,
     "topology_file": "/app/config/topology.json",
     "ipfs": {
-      "storage_path": "/app/data/ipfs"
+      "api_url": "http://ipfs-node-3:5001"
     },
     "blockchain": {
-      "storage_path": "/app/data/blockchain.json"
+      "gateway_url": "http://localhost:9000",
+      "identity": "trainer-node-010",
+      "private_key_path": "config/keys/trainer-node-010_sk.pem",
+      "state_path": "data/blockchain/trainer-node-010.json",
+      "jwt_role": "trainer",
+      "jwt_state": "system"
     },
     "window_size": 10,
     "alpha": 0.5,
     "base_gamma": 0.2,
     "freshness_window": 300.0,
-    "max_neighbors": 4
+    "max_neighbors": 4,
+    "use_mock": false
   },
   "convergence": {
     "enabled": true,

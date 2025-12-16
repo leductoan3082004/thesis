@@ -26,7 +26,12 @@
       "api_url": "http://ipfs-node-1:5001"
     },
     "blockchain": {
-      "registry_url": "http://registry:8000"
+      "gateway_url": "http://localhost:9000",
+      "identity": "trainer-node-003",
+      "private_key_path": "config/keys/trainer-node-003_sk.pem",
+      "state_path": "data/blockchain/trainer-node-003.json",
+      "jwt_role": "trainer",
+      "jwt_state": "system"
     },
     "window_size": 10,
     "alpha": 0.5,

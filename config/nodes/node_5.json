@@ -23,10 +23,15 @@
     "use_mock": false,
     "topology_file": "/app/config/topology.json",
     "ipfs": {
-      "api_url": "http://ipfs-node-1:5001"
+      "api_url": "http://ipfs-node-2:5001"
     },
     "blockchain": {
-      "registry_url": "http://registry:8000"
+      "gateway_url": "http://localhost:9000",
+      "identity": "trainer-node-006",
+      "private_key_path": "config/keys/trainer-node-006_sk.pem",
+      "state_path": "data/blockchain/trainer-node-006.json",
+      "jwt_role": "trainer",
+      "jwt_state": "system"
     },
     "window_size": 10,
     "alpha": 0.5,
