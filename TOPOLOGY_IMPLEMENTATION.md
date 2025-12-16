@@ -191,7 +191,7 @@ Output: List of cliques with minimized label skew
 
 - `ring_star` (default): ensure ring connectivity, then select the largest clique (ties → lowest index) as the central hub and connect it to every other clique, forming a star overlay on the ring. Each designated hub node is wired directly to every outer clique so all data paths are one hop.
 - `ring_star_extra`: optional integer (`ring_star_extra`) adds that many additional pseudo-random edges per clique (beyond the ring + star). This densifies the overlay so the hub nodes can maintain high degree without starving other cliques of redundancy.
-- `RING_STAR_BRIDGE_NODES` (env var, default `2`): controls how many hub members become “central” bridge nodes. These nodes handle inter-clique edges for the ring-star hub.
+- `RING_STAR_NUMBER_OF_CENTRAL_NODES` (env var, default `2`): controls how many hub members become “central” bridge nodes. These nodes handle inter-clique edges for the ring-star hub.
 - `small_world`: after the base ring, add offsets `2^k` for `k = 0..small_world_c-1`, connecting clique `i` to `(i + offset) mod L`.
 - Other modes keep the existing behavior: `ring` (ring only), `fractal` (ring + stride jump), `fully_connected` (clique-complete graph).
 
@@ -204,7 +204,7 @@ For each clique-edge (C_a, C_b):
     Increment edge counts
 ```
 
-For `ring_star`, the node-level assignment guarantees at least **RING_STAR_BRIDGE_NODES** high-connectivity bridge nodes inside the central clique (or all members if the clique is smaller). Edges touching the hub always pick from that set, and the algorithm adds direct edges so each hub node connects to every outer clique, keeping paths to the central checker to a single hop. Extra random edges reuse the same nodes but never require multi-hop routing.
+For `ring_star`, the node-level assignment guarantees at least **RING_STAR_NUMBER_OF_CENTRAL_NODES** high-connectivity bridge nodes inside the central clique (or all members if the clique is smaller). Edges touching the hub always pick from that set, and the algorithm adds direct edges so each hub node connects to every outer clique, keeping paths to the central checker to a single hop. Extra random edges reuse the same nodes but never require multi-hop routing.
 
 ### Key Formulas
 

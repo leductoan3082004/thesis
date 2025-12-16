@@ -221,15 +221,15 @@ def identify_central_clique(
 
 def _get_central_bridge_target() -> int:
     """Return desired number of bridge nodes for a ring-star hub."""
-    raw = os.getenv("RING_STAR_BRIDGE_NODES")
+    raw = os.getenv("RING_STAR_NUMBER_OF_CENTRAL_NODES")
     if raw is None:
         return 2
     try:
         value = int(raw)
     except ValueError as exc:
-        raise ValueError("RING_STAR_BRIDGE_NODES must be an integer") from exc
+        raise ValueError("RING_STAR_NUMBER_OF_CENTRAL_NODES must be an integer") from exc
     if value <= 0:
-        raise ValueError("RING_STAR_BRIDGE_NODES must be positive")
+        raise ValueError("RING_STAR_NUMBER_OF_CENTRAL_NODES must be positive")
     return value
 
 
