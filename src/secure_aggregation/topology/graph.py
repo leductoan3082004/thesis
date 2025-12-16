@@ -475,7 +475,7 @@ def compute_clique_threshold(clique_size: int) -> int:
     if clique_size <= 0:
         raise ValueError("clique_size must be positive")
     two_thirds = math.ceil(0.6667 * clique_size)
-    return min(two_thirds, clique_size - 1) if clique_size > 1 else 1
+    return two_thirds
 
 
 def find_node_clique(node_id: str, cliques: Sequence[Set[str]]) -> Tuple[int, Set[str]]:

@@ -1,6 +1,20 @@
 version: "3.9"
 
 services:
+  node:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node
+    command: ["sleep", "infinity"]
+    networks:
+      - secureagg
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+
   ipfs-node-1:
     image: ipfs/kubo:v0.29.0
     container_name: ipfs-node-1

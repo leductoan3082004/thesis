@@ -8,7 +8,7 @@ This module provides:
 """
 
 import logging
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -47,7 +47,8 @@ class InterClusterAggregator:
         self.cluster_id = cluster_id
         self.ipfs = ipfs
         self.blockchain = blockchain
-        self.merger = InterClusterMerger(merge_config)
+        self.merge_config = merge_config or MergeConfig()
+        self.merger = InterClusterMerger(self.merge_config)
         self.ecm_buffer = ECMBuffer(freshness_window=300.0)
         self.current_round = 0
 
@@ -199,7 +200,7 @@ class InterClusterAggregator:
 
         merged_model, merged_cids = self.merge_with_neighbors(
             intra_cluster_model,
-            max_neighbors=self.merge_config.max_neighbors if hasattr(self.merge_config, "max_neighbors") else None,
+            max_neighbors=self.merge_config.max_neighbors,
         )
         logger.info(
             f"Round {round_num}: merged with {len(merged_cids)} neighbor models, "
