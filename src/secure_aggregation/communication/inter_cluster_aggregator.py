@@ -8,7 +8,7 @@ This module provides:
 """
 
 import logging
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -60,6 +60,7 @@ class InterClusterAggregator:
     def merge_with_neighbors(
         self,
         intra_cluster_model: np.ndarray,
+        max_neighbors: Optional[int] = None,
     ) -> Tuple[np.ndarray, List[str]]:
         """
         Merge intra-cluster model with verified neighbor models.
@@ -79,12 +80,14 @@ class InterClusterAggregator:
             logger.info("No ECMs received, using intra-cluster model only")
             return intra_cluster_model.copy(), []
 
-        logger.info(f"Processing {len(unique_ecms)} unique ECMs from neighbor clusters")
+        selected_ecms = self._select_neighbors(unique_ecms, max_neighbors)
+
+        logger.info(f"Processing {len(selected_ecms)} unique ECMs from neighbor clusters")
 
         verified_models: List[np.ndarray] = []
         merged_cids: List[str] = []
 
-        for cid, expected_hash in unique_ecms.items():
+        for cid, expected_hash in selected_ecms.items():
             model = self.ipfs.get(cid)
             if model is None:
                 logger.warning(f"Failed to fetch model with CID {cid[:8]}...")
@@ -194,7 +197,10 @@ class InterClusterAggregator:
         """
         self.current_round = round_num
 
-        merged_model, merged_cids = self.merge_with_neighbors(intra_cluster_model)
+        merged_model, merged_cids = self.merge_with_neighbors(
+            intra_cluster_model,
+            max_neighbors=self.merge_config.max_neighbors if hasattr(self.merge_config, "max_neighbors") else None,
+        )
         logger.info(
             f"Round {round_num}: merged with {len(merged_cids)} neighbor models, "
             f"clipping threshold={self.merger.get_current_threshold():.4f}"
@@ -209,3 +215,23 @@ class InterClusterAggregator:
         """Reset state for next aggregation round."""
         self.ecm_buffer.clear()
         self.current_round += 1
+    def _select_neighbors(
+        self,
+        ecms: Dict[str, str],
+        max_neighbors: Optional[int],
+    ) -> Dict[str, str]:
+        """Select subset of ECMs for merging based on historical usage."""
+        if not ecms:
+            return ecms
+        if max_neighbors is None or max_neighbors <= 0 or len(ecms) <= max_neighbors:
+            return ecms
+        history: Dict[str, int] = getattr(self.merge_config, "neighbor_history", {})
+        sorted_neighbors = sorted(
+            ecms.keys(),
+            key=lambda cid: (history.get(cid, 0), cid),
+        )
+        selected = sorted_neighbors[:max_neighbors]
+        for cid in selected:
+            history[cid] = history.get(cid, 0) + 1
+        self.merge_config.neighbor_history = history
+        return {cid: ecms[cid] for cid in selected}
