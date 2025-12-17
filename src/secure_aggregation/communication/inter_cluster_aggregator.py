@@ -51,6 +51,7 @@ class InterClusterAggregator:
         self.merger = InterClusterMerger(self.merge_config)
         self.ecm_buffer = ECMBuffer(freshness_window=300.0)
         self.current_round = 0
+        self.last_data_id: Optional[str] = None
 
     def receive_ecms(self, node_id: str, ecms: List[ECM]) -> None:
         """Receive ECMs from a bridge node."""
@@ -135,9 +136,20 @@ class InterClusterAggregator:
 
         logger.info(f"Published model to IPFS: cid={cid[:16]}...")
 
+        data_id: Optional[str] = None
         if self.blockchain is not None:
-            self.blockchain.anchor(self.cluster_id, round_num, cid, model_hash)
-            logger.info(f"Anchored model on blockchain: cluster={self.cluster_id}, round={round_num}")
+            try:
+                data_id = self.blockchain.anchor(self.cluster_id, round_num, cid, model_hash)
+                logger.info(
+                    f"Anchored model on blockchain: cluster={self.cluster_id}, "
+                    f"round={round_num}, data_id={data_id or 'N/A'}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"~ BLOCKCHAIN ~ BLOCKCHAIN ~ BLOCKCHAIN ~ Failed to anchor "
+                    f"cluster={self.cluster_id}, round={round_num}: {exc}"
+                )
+        self.last_data_id = data_id
 
         return cid, model_hash
 

@@ -91,6 +91,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         # Convergence state for global coordination
         self.merged_model_cid: Optional[str] = None
         self.merged_model_hash: Optional[str] = None
+        self.merged_model_data_id: Optional[str] = None
         self.should_stop: bool = False
         self.stop_reason: str = ""
         self.delta_norm: float = 0.0
@@ -104,6 +105,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self,
         model_cid: Optional[str],
         model_hash: Optional[str],
+        model_data_id: Optional[str],
         should_stop: bool,
         stop_reason: str,
         delta_norm: float,
@@ -112,6 +114,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         """Store IPFS reference and convergence info for distribution to all nodes."""
         self.merged_model_cid = model_cid
         self.merged_model_hash = model_hash
+        self.merged_model_data_id = model_data_id
         self.should_stop = should_stop
         self.stop_reason = stop_reason
         self.delta_norm = delta_norm
@@ -303,6 +306,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             cluster_converged=self.cluster_converged,
             model_cid=self.merged_model_cid or "",
             model_hash=self.merged_model_hash or "",
+            model_data_id=self.merged_model_data_id or "",
         )
 
     def SubmitECMs(
@@ -335,6 +339,20 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         logger.info(
             f"Aggregator received {received_count} ECMs from bridge node {request.node_id}"
         )
+        if self.ecm_buffer:
+            unique_ecms = self.ecm_buffer.get_unique_cids()
+            if unique_ecms:
+                formatted = ", ".join(
+                    f"{cid[:8]}...:{hash_val[:8]}..."
+                    for cid, hash_val in unique_ecms.items()
+                )
+                logger.info(
+                    "Aggregator ECM buffer now has %d unique models: %s",
+                    len(unique_ecms),
+                    formatted,
+                )
+            else:
+                logger.info("Aggregator ECM buffer is empty after update")
         return secureagg_pb2.ECMSubmitResponse(
             accepted=True,
             message=f"Received {received_count} ECMs",
@@ -349,6 +367,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.aggregated_result = None
         self.merged_model_cid = None
         self.merged_model_hash = None
+        self.merged_model_data_id = None
         self._adverts.clear()
         self._adverts_committed = False
         self._round3_signatures.clear()

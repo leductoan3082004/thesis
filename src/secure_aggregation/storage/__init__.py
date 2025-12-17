@@ -1,5 +1,6 @@
 from .model_store import (
     BlockchainInterface,
+    GatewayBlockchain,
     IPFSInterface,
     KuboIPFS,
     MockBlockchain,
@@ -10,6 +11,7 @@ from .model_store import (
 
 __all__ = [
     "BlockchainInterface",
+    "GatewayBlockchain",
     "IPFSInterface",
     "KuboIPFS",
     "MockBlockchain",

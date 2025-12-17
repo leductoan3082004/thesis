@@ -11,7 +11,12 @@ from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
 from secure_aggregation.crypto.sign import SigningKeyPair, generate_signing_keypair
 from secure_aggregation.data import dirichlet_partition
 from secure_aggregation.convergence.central_broadcast import CentralMetadata, publish_central_metadata
-from secure_aggregation.storage.model_store import BlockchainInterface, MockBlockchain, RegistryBlockchain
+from secure_aggregation.storage.model_store import (
+    BlockchainInterface,
+    GatewayBlockchain,
+    MockBlockchain,
+    RegistryBlockchain,
+)
 from secure_aggregation.topology import (
     build_full_topology,
     compute_clique_threshold,
@@ -61,6 +66,8 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
         self.topology: TopologyState = TopologyState()
 
         self.metadata_blockchain = self._create_metadata_blockchain()
+        self._central_metadata_data_id: Optional[str] = None
+        self._central_metadata_version: int = 0
 
         if topology_config and labels:
             self._build_topology(topology_config, labels)
@@ -69,6 +76,27 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
     def _create_metadata_blockchain(self) -> Optional[BlockchainInterface]:
         registry_url = os.environ.get("CENTRAL_METADATA_REGISTRY_URL")
         storage_path = os.environ.get("CENTRAL_METADATA_STORAGE_PATH")
+        gateway_url = os.environ.get("CENTRAL_METADATA_GATEWAY_URL")
+        if gateway_url:
+            identity = os.environ.get("CENTRAL_METADATA_IDENTITY")
+            private_key = os.environ.get("CENTRAL_METADATA_PRIVATE_KEY")
+            state_path = os.environ.get("CENTRAL_METADATA_STATE_PATH")
+            jwt_role = os.environ.get("CENTRAL_METADATA_JWT_ROLE", "trainer")
+            jwt_state = os.environ.get("CENTRAL_METADATA_JWT_STATE", "system")
+            if not identity or not private_key:
+                logger.error(
+                    "CENTRAL_METADATA_GATEWAY_URL set but identity/private key not provided; "
+                    "falling back to registry/mock blockchain."
+                )
+            else:
+                return GatewayBlockchain(
+                    base_url=gateway_url,
+                    identity=identity,
+                    private_key_path=private_key,
+                    state_path=state_path,
+                    jwt_role=jwt_role,
+                    jwt_state=jwt_state,
+                )
         if registry_url:
             return RegistryBlockchain(registry_url=registry_url)
         if storage_path:
@@ -86,6 +114,7 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             alpha=config.alpha,
             seed=config.seed,
         )
+        partition = self._map_clients_to_node_ids(partition)
 
         node_labels = compute_node_labels_from_partition(partition, labels)
 
@@ -124,6 +153,17 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             f"inter_edges: {len(inter_edges)}"
         )
 
+    @staticmethod
+    def _map_clients_to_node_ids(partition: Dict[str, List[int]]) -> Dict[str, List[int]]:
+        """Rename generic client IDs to match node_<idx> identifiers."""
+        remapped: Dict[str, List[int]] = {}
+        for client_id, indices in partition.items():
+            parts = client_id.split("_")
+            suffix = parts[-1] if parts else client_id
+            node_id = f"node_{suffix}"
+            remapped[node_id] = indices
+        return remapped
+
     def _publish_central_metadata(self, cliques: List[Set[str]], config: TopologyConfig) -> None:
         """Anchor central node metadata once topology is ready."""
         if not self.metadata_blockchain:
@@ -145,7 +185,10 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             cluster_ids=cluster_ids,
             version=0,
         )
-        publish_central_metadata(self.metadata_blockchain, metadata)
+        data_id = publish_central_metadata(self.metadata_blockchain, metadata)
+        if data_id:
+            self._central_metadata_data_id = data_id
+            self._central_metadata_version = metadata.version
         logger.info(
             f"Published central metadata: clique={central_idx}, nodes={central_nodes}, "
             f"candidates={metadata.checker_candidates}"
@@ -181,6 +224,8 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
                 clique_members=clique_members,
                 clique_threshold=clique_threshold,
                 data_indices=data_indices,
+                central_metadata_data_id=self._central_metadata_data_id or "",
+                central_metadata_version=self._central_metadata_version,
             )
 
         keypair = generate_signing_keypair()
@@ -196,6 +241,8 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             clique_members=clique_members,
             clique_threshold=clique_threshold,
             data_indices=data_indices,
+            central_metadata_data_id=self._central_metadata_data_id or "",
+            central_metadata_version=self._central_metadata_version,
         )
 
     def GetParticipants(self, request: secureagg_pb2.ParticipantsRequest, context) -> secureagg_pb2.ParticipantsResponse:

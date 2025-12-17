@@ -209,10 +209,12 @@ def identify_central_clique(
         return None, []
     degree_list = [clique_degrees.get(idx, 0) for idx in range(len(cliques))]
     max_degree = max(degree_list)
-    if degree_list.count(max_degree) != 1:
+    # Choose the lowest-index clique among those with max_degree to keep selection deterministic.
+    candidate_indices = [idx for idx, degree in enumerate(degree_list) if degree == max_degree]
+    if not candidate_indices:
         return None, []
-    candidate = degree_list.index(max_degree)
-    if len(cliques) > 2 and max_degree >= len(cliques) - 1:
+    candidate = min(candidate_indices)
+    if max_degree >= max(1, len(cliques) - 1):
         central_clique = sorted(cliques[candidate])
         bridge_target = min(_get_central_bridge_target(), len(central_clique))
         return candidate, central_clique[:bridge_target]

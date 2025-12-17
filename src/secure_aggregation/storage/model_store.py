@@ -9,12 +9,14 @@ Real implementations:
 - RegistryBlockchain: Uses a simple HTTP registry service
 """
 
+import base64
 import hashlib
 import io
 import json
 import logging
 import pickle
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,8 +24,13 @@ from typing import Dict, Optional, Tuple
 
 import httpx
 import numpy as np
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 logger = logging.getLogger(__name__)
+
+IPFS_LOG_TAG = "~ IPFS ~"
+BLOCKCHAIN_LOG_TAG = "~ BLOCKCHAIN ~"
 
 
 def compute_model_hash(model: np.ndarray) -> str:
@@ -44,6 +51,8 @@ class ModelAnchor:
     round_num: int
     cid: str
     hash: str
+    data_id: Optional[str] = None
+    submitted_at: Optional[str] = None
 
 
 class IPFSInterface(ABC):
@@ -69,7 +78,7 @@ class BlockchainInterface(ABC):
     """Abstract interface for blockchain-like model registry."""
 
     @abstractmethod
-    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> None:
+    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> Optional[str]:
         """Record model reference on-chain."""
         pass
 
@@ -81,6 +90,18 @@ class BlockchainInterface(ABC):
     @abstractmethod
     def get_latest_anchor(self, cluster_id: str) -> Optional[ModelAnchor]:
         """Get most recent anchor for a cluster."""
+        pass
+
+    @abstractmethod
+    def remember_anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        data_id: str,
+        cid: Optional[str] = None,
+        hash_val: Optional[str] = None,
+    ) -> None:
+        """Persist a reference that was anchored elsewhere."""
         pass
 
 
@@ -119,6 +140,7 @@ class MockIPFS(IPFSInterface):
             with self._store_lock:
                 self._memory_store[cid] = serialized
 
+        logger.info(f"{IPFS_LOG_TAG} Stored model in MockIPFS cid={cid[:16]}...")
         return cid
 
     def get(self, cid: str) -> Optional[np.ndarray]:
@@ -126,23 +148,31 @@ class MockIPFS(IPFSInterface):
         if self._storage_path:
             file_path = self._storage_path / cid
             if not file_path.exists():
+                logger.warning(f"{IPFS_LOG_TAG} MockIPFS miss cid={cid[:16]}...")
                 return None
             with open(file_path, "rb") as f:
-                return pickle.loads(f.read())
+                model = pickle.loads(f.read())
+                logger.info(f"{IPFS_LOG_TAG} Loaded model from MockIPFS cid={cid[:16]}...")
+                return model
         else:
             with self._store_lock:
                 serialized = self._memory_store.get(cid)
                 if serialized is None:
+                    logger.warning(f"{IPFS_LOG_TAG} MockIPFS miss cid={cid[:16]}...")
                     return None
-                return pickle.loads(serialized)
+                model = pickle.loads(serialized)
+                logger.info(f"{IPFS_LOG_TAG} Loaded model from MockIPFS cid={cid[:16]}...")
+                return model
 
     def exists(self, cid: str) -> bool:
         """Check if model exists."""
         if self._storage_path:
-            return (self._storage_path / cid).exists()
+            exists = (self._storage_path / cid).exists()
         else:
             with self._store_lock:
-                return cid in self._memory_store
+                exists = cid in self._memory_store
+        logger.debug(f"{IPFS_LOG_TAG} MockIPFS exists={exists} cid={cid[:16]}...")
+        return exists
 
     def clear(self) -> None:
         """Clear all stored models (for testing)."""
@@ -209,10 +239,12 @@ class MockBlockchain(BlockchainInterface):
                     "round_num": anchor.round_num,
                     "cid": anchor.cid,
                     "hash": anchor.hash,
+                    "data_id": anchor.data_id,
+                    "submitted_at": anchor.submitted_at,
                 }
         self._storage_path.write_text(json.dumps(data, indent=2))
 
-    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> None:
+    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> Optional[str]:
         """Record model reference."""
         anchor = ModelAnchor(cluster_id=cluster_id, round_num=round_num, cid=cid, hash=hash_val)
 
@@ -228,6 +260,10 @@ class MockBlockchain(BlockchainInterface):
                 if cluster_id not in self._memory_registry:
                     self._memory_registry[cluster_id] = {}
                 self._memory_registry[cluster_id][round_num] = anchor
+        logger.info(
+            f"{BLOCKCHAIN_LOG_TAG} MockBlockchain anchor cluster={cluster_id}, round={round_num}, cid={cid[:16]}..."
+        )
+        return None
 
     def get_anchor(self, cluster_id: str, round_num: int) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash)."""
@@ -240,6 +276,9 @@ class MockBlockchain(BlockchainInterface):
             cluster_rounds = registry.get(cluster_id, {})
             anchor = cluster_rounds.get(round_num)
             if anchor:
+                logger.info(
+                    f"{BLOCKCHAIN_LOG_TAG} MockBlockchain get_anchor cluster={cluster_id}, round={round_num}, cid={anchor.cid[:16]}..."
+                )
                 return (anchor.cid, anchor.hash)
             return None
 
@@ -256,7 +295,11 @@ class MockBlockchain(BlockchainInterface):
                 return None
 
             latest_round = max(cluster_rounds.keys())
-            return cluster_rounds[latest_round]
+            anchor = cluster_rounds[latest_round]
+            logger.info(
+                f"{BLOCKCHAIN_LOG_TAG} MockBlockchain latest cluster={cluster_id}, round={anchor.round_num}, cid={anchor.cid[:16]}..."
+            )
+            return anchor
 
     def clear(self) -> None:
         """Clear all anchors (for testing)."""
@@ -265,6 +308,19 @@ class MockBlockchain(BlockchainInterface):
         else:
             with self._registry_lock:
                 self._memory_registry.clear()
+
+    def remember_anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        data_id: str,
+        cid: Optional[str] = None,
+        hash_val: Optional[str] = None,
+    ) -> None:
+        """Mock registry ignores data_id and stores provided fields."""
+        if cid is None or hash_val is None:
+            return
+        self.anchor(cluster_id, round_num, cid, hash_val)
 
 
 class KuboIPFS(IPFSInterface):
@@ -308,10 +364,10 @@ class KuboIPFS(IPFSInterface):
             response.raise_for_status()
             result = response.json()
             cid = result["Hash"]
-            logger.debug(f"Added model to IPFS with CID: {cid}")
+            logger.info(f"{IPFS_LOG_TAG} Uploaded model to IPFS cid={cid[:16]}...")
             return cid
         except httpx.HTTPError as e:
-            logger.error(f"Failed to add model to IPFS: {e}")
+            logger.error(f"{IPFS_LOG_TAG} Failed to add model to IPFS: {e}")
             raise RuntimeError(f"IPFS add failed: {e}") from e
 
     def get(self, cid: str) -> Optional[np.ndarray]:
@@ -323,17 +379,17 @@ class KuboIPFS(IPFSInterface):
             )
             response.raise_for_status()
             model = pickle.loads(response.content)
-            logger.debug(f"Retrieved model from IPFS with CID: {cid}")
+            logger.info(f"{IPFS_LOG_TAG} Retrieved model from IPFS cid={cid[:16]}...")
             return model
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 500:
                 # CID not found or not reachable.
-                logger.warning(f"CID not found in IPFS: {cid}")
+                logger.warning(f"{IPFS_LOG_TAG} CID not found in IPFS: {cid}")
                 return None
-            logger.error(f"Failed to get model from IPFS: {e}")
+            logger.error(f"{IPFS_LOG_TAG} Failed to get model from IPFS: {e}")
             raise RuntimeError(f"IPFS get failed: {e}") from e
         except httpx.HTTPError as e:
-            logger.error(f"Failed to get model from IPFS: {e}")
+            logger.error(f"{IPFS_LOG_TAG} Failed to get model from IPFS: {e}")
             raise RuntimeError(f"IPFS get failed: {e}") from e
 
     def exists(self, cid: str) -> bool:
@@ -344,7 +400,9 @@ class KuboIPFS(IPFSInterface):
                 f"{self._api_url}/api/v0/files/stat",
                 params={"arg": f"/ipfs/{cid}"},
             )
-            return response.status_code == 200
+            exists = response.status_code == 200
+            logger.debug(f"{IPFS_LOG_TAG} Checked CID existence={exists} cid={cid[:16]}...")
+            return exists
         except httpx.HTTPError:
             return False
 
@@ -356,13 +414,24 @@ class KuboIPFS(IPFSInterface):
                 params={"arg": cid},
                 timeout=60.0,
             )
-            logger.debug(f"Provided CID to DHT: {cid}")
+            logger.info(f"{IPFS_LOG_TAG} Provided CID to DHT cid={cid[:16]}...")
         except httpx.HTTPError as e:
-            logger.warning(f"Failed to provide CID to DHT: {e}")
+            logger.warning(f"{IPFS_LOG_TAG} Failed to provide CID to DHT: {e}")
 
     def close(self) -> None:
         """Close the HTTP client."""
         self._client.close()
+
+    def remember_anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        data_id: str,
+        cid: Optional[str] = None,
+        hash_val: Optional[str] = None,
+    ) -> None:
+        """Registry-backed implementation does not support external references."""
+        return
 
 
 class RegistryBlockchain(BlockchainInterface):
@@ -445,4 +514,287 @@ class RegistryBlockchain(BlockchainInterface):
 
     def close(self) -> None:
         """Close the HTTP client."""
+        self._client.close()
+
+
+class LocalAnchorStore:
+    """Persists mapping of cluster anchors to blockchain data IDs."""
+
+    def __init__(self, storage_path: Optional[str]) -> None:
+        self._path = Path(storage_path) if storage_path else None
+        self._lock = threading.Lock()
+        self._data: Dict[str, Dict[str, Dict]] = {}
+
+        if self._path:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            if self._path.exists():
+                try:
+                    raw = json.loads(self._path.read_text())
+                    if isinstance(raw, dict):
+                        self._data = raw
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse anchor state at %s", self._path)
+
+        self._data.setdefault("clusters", {})
+
+    def _persist(self) -> None:
+        if not self._path:
+            return
+        self._path.write_text(json.dumps(self._data, indent=2))
+
+    def remember(
+        self,
+        cluster_id: str,
+        round_num: int,
+        data_id: str,
+        cid: Optional[str],
+        hash_val: Optional[str],
+        submitted_at: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            clusters = self._data.setdefault("clusters", {})
+            cluster_entry = clusters.setdefault(cluster_id, {"rounds": {}, "latest_round": -1})
+            cluster_entry["rounds"][str(round_num)] = {
+                "data_id": data_id,
+                "cid": cid,
+                "hash": hash_val,
+                "submitted_at": submitted_at,
+            }
+            latest = cluster_entry.get("latest_round", -1)
+            if round_num >= latest:
+                cluster_entry["latest_round"] = round_num
+            self._persist()
+
+    def get_round(self, cluster_id: str, round_num: int) -> Optional[Dict]:
+        with self._lock:
+            cluster_entry = self._data.get("clusters", {}).get(cluster_id, {})
+            rounds = cluster_entry.get("rounds", {})
+            entry = rounds.get(str(round_num))
+            if entry is None:
+                return None
+            return dict(entry)
+
+    def get_latest(self, cluster_id: str) -> Optional[Tuple[int, Dict]]:
+        with self._lock:
+            cluster_entry = self._data.get("clusters", {}).get(cluster_id)
+            if not cluster_entry:
+                return None
+            latest_round = cluster_entry.get("latest_round")
+            if latest_round is None or latest_round < 0:
+                return None
+            entry = cluster_entry.get("rounds", {}).get(str(latest_round))
+            if entry is None:
+                return None
+            return latest_round, dict(entry)
+
+
+class EdDSAJWTSigner:
+    """Issues JWT tokens signed with an Ed25519 private key."""
+
+    def __init__(
+        self,
+        private_key_path: str,
+        subject: str,
+        role: str = "trainer",
+        state: str = "system",
+        ttl_seconds: int = 24 * 3600,
+    ) -> None:
+        key_bytes = Path(private_key_path).read_bytes()
+        self._private_key = serialization.load_pem_private_key(key_bytes, password=None)
+        if not isinstance(self._private_key, ed25519.Ed25519PrivateKey):
+            raise ValueError("Private key must be Ed25519")
+        self._subject = subject
+        self._role = role
+        self._state = state
+        self._ttl = ttl_seconds
+
+    @staticmethod
+    def _b64(value: Dict) -> str:
+        raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("utf-8")
+
+    def issue(self) -> str:
+        header = {"alg": "EdDSA", "typ": "JWT"}
+        payload = {
+            "sub": self._subject,
+            "role": self._role,
+            "state": self._state,
+            "exp": int(time.time()) + self._ttl,
+        }
+        unsigned = f"{self._b64(header)}.{self._b64(payload)}"
+        signature = self._private_key.sign(unsigned.encode("utf-8"))
+        sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("utf-8")
+        return f"{unsigned}.{sig_b64}"
+
+
+class GatewayBlockchain(BlockchainInterface):
+    """Blockchain client that talks to the Fabric gateway via REST + JWT."""
+
+    def __init__(
+        self,
+        base_url: str,
+        identity: str,
+        private_key_path: str,
+        *,
+        state_path: Optional[str] = None,
+        jwt_role: str = "trainer",
+        jwt_state: str = "system",
+        jwt_ttl_seconds: int = 24 * 3600,
+        timeout: float = 10.0,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.Client(timeout=timeout)
+        self._signer = EdDSAJWTSigner(
+            private_key_path=private_key_path,
+            subject=identity,
+            role=jwt_role,
+            state=jwt_state,
+            ttl_seconds=jwt_ttl_seconds,
+        )
+        self._store = LocalAnchorStore(state_path or None)
+
+    def _auth_headers(self) -> Dict[str, str]:
+        token = self._signer.issue()
+        return {"Authorization": f"Bearer {token}"}
+
+    def _commit_payload(self, payload: Dict) -> Dict:
+        response = self._client.post(
+            f"{self._base_url}/data/commit",
+            headers=self._auth_headers(),
+            json={"payload": payload},
+        )
+        response.raise_for_status()
+        result = response.json()
+        logger.info(
+            f"{BLOCKCHAIN_LOG_TAG} Submitted payload to gateway cluster={payload.get('cluster_id')} "
+            f"round={payload.get('round')} data_id={result.get('data_id')}"
+        )
+        return result
+
+    def _fetch_data(self, data_id: str) -> Dict:
+        try:
+            response = self._client.get(
+                f"{self._base_url}/data/{data_id}",
+                headers=self._auth_headers(),
+            )
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"{BLOCKCHAIN_LOG_TAG} Retrieved payload from gateway data_id={data_id}")
+            return data
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                f"{BLOCKCHAIN_LOG_TAG} Gateway returned {exc.response.status_code} for data_id={data_id}"
+            )
+            raise
+        except httpx.HTTPError as exc:
+            logger.error(f"{BLOCKCHAIN_LOG_TAG} Failed to fetch data_id={data_id}: {exc}")
+            raise
+
+    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> Optional[str]:
+        payload = {
+            "cluster_id": cluster_id,
+            "round": round_num,
+            "cid": cid,
+            "hash": hash_val,
+        }
+        record = self._commit_payload(payload)
+        data_id = record.get("data_id")
+        submitted_at = record.get("submitted_at")
+        if data_id:
+            self._store.remember(cluster_id, round_num, data_id, cid, hash_val, submitted_at)
+            logger.info(
+                f"{BLOCKCHAIN_LOG_TAG} Anchored model cluster={cluster_id}, round={round_num}, data_id={data_id}"
+            )
+        return data_id
+
+    def remember_anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        data_id: str,
+        cid: Optional[str] = None,
+        hash_val: Optional[str] = None,
+    ) -> None:
+        self._store.remember(cluster_id, round_num, data_id, cid, hash_val)
+
+    @staticmethod
+    def _is_control_cluster(cluster_id: str) -> bool:
+        return cluster_id.startswith("__")
+
+    def _resolve_entry(self, cluster_id: str, round_num: int) -> Optional[ModelAnchor]:
+        entry = self._store.get_round(cluster_id, round_num)
+        if entry is None:
+            return None
+        cid = entry.get("cid")
+        hash_val = entry.get("hash")
+        data_id = entry.get("data_id")
+        submitted_at = entry.get("submitted_at")
+
+        if (cid is None or hash_val is None) and data_id:
+            try:
+                record = self._fetch_data(data_id)
+            except httpx.HTTPError:
+                return None
+            payload = record.get("payload", {})
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    logger.warning(f"{BLOCKCHAIN_LOG_TAG} Failed to parse payload for data_id={data_id}")
+                    payload = {}
+            cid = payload.get("cid")
+            hash_val = payload.get("hash")
+            submitted_at = record.get("submitted_at")
+            if cid and hash_val:
+                self._store.remember(cluster_id, round_num, data_id, cid, hash_val, submitted_at)
+            else:
+                logger.warning(
+                    f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash when fetching data_id={data_id} cluster={cluster_id}"
+                )
+
+        if not cid or not hash_val:
+            return None
+        return ModelAnchor(
+            cluster_id=cluster_id,
+            round_num=round_num,
+            cid=cid,
+            hash=hash_val,
+            data_id=data_id,
+            submitted_at=submitted_at,
+        )
+
+    def get_anchor(self, cluster_id: str, round_num: int) -> Optional[Tuple[str, str]]:
+        anchor = self._resolve_entry(cluster_id, round_num)
+        if anchor is None:
+            if self._is_control_cluster(cluster_id):
+                logger.debug(
+                    f"{BLOCKCHAIN_LOG_TAG} No anchor found for control cluster={cluster_id}, round={round_num}"
+                )
+            else:
+                logger.warning(
+                    f"{BLOCKCHAIN_LOG_TAG} No anchor found for cluster={cluster_id}, round={round_num}"
+                )
+            return None
+        logger.info(
+            f"{BLOCKCHAIN_LOG_TAG} Resolved anchor for cluster={cluster_id}, round={round_num}, cid={anchor.cid[:16]}..."
+        )
+        return (anchor.cid, anchor.hash)
+
+    def get_latest_anchor(self, cluster_id: str) -> Optional[ModelAnchor]:
+        latest = self._store.get_latest(cluster_id)
+        if latest is None:
+            if self._is_control_cluster(cluster_id):
+                logger.debug(f"{BLOCKCHAIN_LOG_TAG} No latest anchor for control cluster={cluster_id}")
+            else:
+                logger.warning(f"{BLOCKCHAIN_LOG_TAG} No latest anchor for cluster={cluster_id}")
+            return None
+        round_num, _ = latest
+        anchor = self._resolve_entry(cluster_id, round_num)
+        if anchor:
+            logger.info(
+                f"{BLOCKCHAIN_LOG_TAG} Latest anchor cluster={cluster_id}, round={anchor.round_num}, cid={anchor.cid[:16]}..."
+            )
+        return anchor
+
+    def close(self) -> None:
         self._client.close()

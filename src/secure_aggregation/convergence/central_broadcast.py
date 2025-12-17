@@ -57,10 +57,10 @@ class CheckerHealth:
         return cls(**json.loads(anchor.cid))
 
 
-def publish_central_metadata(blockchain: BlockchainInterface, metadata: CentralMetadata) -> None:
+def publish_central_metadata(blockchain: BlockchainInterface, metadata: CentralMetadata) -> Optional[str]:
     """Anchor central metadata on the blockchain registry."""
     payload = metadata.to_payload()
-    blockchain.anchor(
+    return blockchain.anchor(
         CENTRAL_METADATA_CLUSTER_ID,
         metadata.version,
         cid=payload,

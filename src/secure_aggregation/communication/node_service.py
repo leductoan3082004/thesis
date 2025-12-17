@@ -3,6 +3,7 @@
 import argparse
 import copy
 import json
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -20,6 +21,7 @@ from secure_aggregation.communication.bridge_service import BridgeClient, serve_
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
 from secure_aggregation.convergence import ConvergenceConfig, ConvergenceSignal, ConvergenceTracker
 from secure_aggregation.convergence.central_broadcast import (
+    CENTRAL_METADATA_CLUSTER_ID,
     fetch_central_metadata,
     fetch_global_convergence_round,
 )
@@ -32,11 +34,12 @@ from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
 from secure_aggregation.storage.model_store import (
     BlockchainInterface,
+    GatewayBlockchain,
     IPFSInterface,
     KuboIPFS,
     MockBlockchain,
     MockIPFS,
-    RegistryBlockchain,
+    verify_model_hash,
 )
 from secure_aggregation.topology import elect_clique_aggregator, get_inter_clique_neighbors, is_bridge_node
 from secure_aggregation.utils import configure_logging, get_logger
@@ -139,6 +142,8 @@ class NodeService:
         self._pending_convergence_signal: Optional[ConvergenceSignal] = None
         self.central_checker: Optional[CentralChecker] = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
+        self._bootstrap_anchors: List[Tuple[str, int, str, Optional[str], Optional[str]]] = []
+        self._logged_central_addresses = False
 
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
 
@@ -146,6 +151,14 @@ class NodeService:
         """Load node configuration from JSON file."""
         with open(path) as f:
             return json.load(f)
+
+    def _hydrate_anchor_bootstrap(self) -> None:
+        """Persist bootstrap anchor references once blockchain client is ready."""
+        if not self.blockchain or not self._bootstrap_anchors:
+            return
+        for cluster_id, round_num, data_id, cid, hash_val in self._bootstrap_anchors:
+            self.blockchain.remember_anchor(cluster_id, round_num, data_id, cid, hash_val)
+        self._bootstrap_anchors.clear()
 
     def register_with_ttp(self) -> None:
         """Register with TTP and receive signing keys and clique assignment."""
@@ -179,13 +192,25 @@ class NodeService:
                     if self.clique_threshold > 0:
                         self.threshold = self.clique_threshold
 
-                    logger.info(
-                        f"Registered with TTP: clique={self.clique_id}, "
-                        f"members={len(self.clique_members)}, threshold={self.threshold}, "
-                        f"data_samples={len(self.assigned_data_indices)}"
+                logger.info(
+                    f"Registered with TTP: clique={self.clique_id}, "
+                    f"members={len(self.clique_members)}, threshold={self.threshold}, "
+                    f"data_samples={len(self.assigned_data_indices)}"
+                )
+                metadata_data_id = getattr(response, "central_metadata_data_id", "")
+                if metadata_data_id:
+                    metadata_version = getattr(response, "central_metadata_version", 0)
+                    self._bootstrap_anchors.append(
+                        (
+                            CENTRAL_METADATA_CLUSTER_ID,
+                            metadata_version or 0,
+                            metadata_data_id,
+                            None,
+                            None,
+                        )
                     )
                 else:
-                    raise RuntimeError(f"TTP registration failed: {response.message}")
+                    logger.info("No central metadata anchor provided by TTP; continuing without bootstrap.")
 
                 # Get list of participants
                 participants_response = stub.GetParticipants(secureagg_pb2.ParticipantsRequest())
@@ -342,10 +367,36 @@ class NodeService:
             logger.info(f"Using mock storage: ipfs={ipfs_path}, blockchain={blockchain_path}")
         else:
             ipfs_url = ipfs_config.get("api_url", "http://ipfs-node-1:5001")
-            registry_url = blockchain_config.get("registry_url", "http://registry:8000")
+            gateway_url = blockchain_config.get(
+                "gateway_url",
+                os.environ.get("BLOCKCHAIN_GATEWAY_URL", "http://localhost:9000"),
+            )
+            identity = blockchain_config.get("identity", self.node_id)
+            private_key_path = blockchain_config.get(
+                "private_key_path",
+                f"config/keys/{identity}_sk.pem",
+            )
+            state_path = blockchain_config.get(
+                "state_path",
+                f"data/blockchain/{identity}.json",
+            )
+            jwt_role = blockchain_config.get("jwt_role", "trainer")
+            jwt_state = blockchain_config.get("jwt_state", "system")
+            jwt_ttl = blockchain_config.get("jwt_ttl_seconds", 24 * 3600)
             self.ipfs = KuboIPFS(api_url=ipfs_url)
-            self.blockchain = RegistryBlockchain(registry_url=registry_url)
-            logger.info(f"Using real storage: ipfs={ipfs_url}, registry={registry_url}")
+            self.blockchain = GatewayBlockchain(
+                base_url=gateway_url,
+                identity=identity,
+                private_key_path=private_key_path,
+                state_path=state_path,
+                jwt_role=jwt_role,
+                jwt_state=jwt_state,
+                jwt_ttl_seconds=jwt_ttl,
+            )
+            logger.info(f"Using real storage: ipfs={ipfs_url}, gateway={gateway_url}")
+
+        if self.blockchain:
+            self._hydrate_anchor_bootstrap()
 
         merge_config = MergeConfig(
             window_size=self.inter_cluster_config.get("window_size", 10),
@@ -376,12 +427,32 @@ class NodeService:
             return
 
         neighbors = get_inter_clique_neighbors(self.node_id, inter_edges)
-        self.neighbor_address_map = {n: f"{n}:{self.port + 2000}" for n in neighbors}
+        self.neighbor_address_map = {}
+        for neighbor in neighbors:
+            base_address = self.participant_map.get(neighbor)
+            attempts = 0
+            while base_address is None and attempts < 5:
+                logger.info(
+                    f"Neighbor {neighbor} not registered yet; refreshing participant map"
+                )
+                time.sleep(2)
+                self.register_with_ttp()
+                base_address = self.participant_map.get(neighbor)
+                attempts += 1
+            if not base_address:
+                logger.warning(
+                    f"Could not resolve bridge address for neighbor {neighbor}; ECM gossip disabled for this edge"
+                )
+                continue
+            host, port_str = base_address.split(":")
+            neighbor_bridge_port = int(port_str) + 2000
+            address = f"{host}:{neighbor_bridge_port}"
+            self.neighbor_address_map[neighbor] = address
         self.neighbor_bridge_addresses = list(self.neighbor_address_map.values())
 
         logger.info(
-            f"Node {self.node_id} is a bridge node with {len(neighbors)} "
-            f"inter-clique neighbors: {neighbors}"
+            f"Node {self.node_id} is a bridge node with {len(self.neighbor_address_map)} "
+            f"resolved inter-clique neighbors: {self.neighbor_address_map}"
         )
 
         if self.inter_cluster_enabled and self.ecm_buffer:
@@ -411,6 +482,10 @@ class NodeService:
         metadata = fetch_central_metadata(self.blockchain)
         if metadata:
             self.central_metadata = metadata
+            logger.info(
+                f"Fetched central metadata: central clique={metadata.central_clique_idx}, "
+                f"central nodes={metadata.central_nodes}, checker candidates={metadata.checker_candidates}"
+            )
             self._update_central_neighbor_addresses()
             if (
                 self.convergence_tracker
@@ -430,6 +505,10 @@ class NodeService:
             address = self.neighbor_address_map.get(node_id)
             if address:
                 self.central_neighbor_addresses[node_id] = address
+        if self.central_neighbor_addresses and not self._logged_central_addresses:
+            details = ", ".join(f"{node}@{addr}" for node, addr in self.central_neighbor_addresses.items())
+            logger.info(f"Central neighbor addresses: {details}")
+            self._logged_central_addresses = True
 
     def _maybe_init_central_checker(self) -> None:
         """Instantiate central checker if this node is a candidate."""
@@ -773,6 +852,7 @@ class NodeService:
 
             cid: Optional[str] = None
             model_hash: Optional[str] = None
+            model_data_id: Optional[str] = None
             try:
                 # Phase 2: Secure aggregation
                 logger.info("Phase 2: Secure aggregation")
@@ -805,9 +885,11 @@ class NodeService:
                                         ecm.source_cluster, ecm.cluster_converged
                                     )
 
-                        merged_model, cid, model_hash = self.inter_cluster_aggregator.process_round(
+                        merged_data = self.inter_cluster_aggregator.process_round(
                             intra_model, round_idx
                         )
+                        merged_model, cid, model_hash = merged_data
+                        model_data_id = getattr(self.inter_cluster_aggregator, "last_data_id", None)
 
                         # Update convergence state with merged model
                         conv_state = self.convergence_tracker.update(merged_model)
@@ -819,6 +901,7 @@ class NodeService:
                             self.aggregator_servicer.set_convergence_state(
                                 model_cid=cid,
                                 model_hash=model_hash,
+                                model_data_id=model_data_id,
                                 should_stop=should_stop,
                                 stop_reason=stop_reason,
                                 delta_norm=conv_state.delta_norm,
@@ -840,6 +923,7 @@ class NodeService:
                             self.aggregator_servicer.set_convergence_state(
                                 model_cid=None,
                                 model_hash=None,
+                                model_data_id=None,
                                 should_stop=should_stop,
                                 stop_reason=stop_reason,
                                 delta_norm=conv_state.delta_norm,
@@ -847,23 +931,70 @@ class NodeService:
                             )
 
                     elif not self.is_aggregator:
-                        # Non-aggregator: fetch convergence decision from aggregator
-                        model_response = self._fetch_convergence_status()
+                        # Non-aggregator: fetch convergence decision from aggregator.
+                        # Bridge nodes wait until the aggregator publishes IPFS/chain metadata
+                        # so we can gossip ECM references reliably.
+                        wait_for_model_ref = self.is_bridge_node and self.inter_cluster_enabled
+                        model_response = self._fetch_convergence_status(wait_for_model_ref=wait_for_model_ref)
                         if model_response:
                             should_stop = model_response.should_stop
                             stop_reason = model_response.stop_reason
 
-                            # If IPFS CID provided, fetch merged model from IPFS
-                            if model_response.model_cid and self.ipfs:
-                                logger.info(f"Fetching merged model from IPFS: {model_response.model_cid[:16]}...")
+                            response_cid = model_response.model_cid or ""
+                            response_hash = model_response.model_hash or ""
+                            if self.is_bridge_node and response_cid and response_hash:
+                                # Remember reference for ECM gossip even if fetch fails locally
+                                cid = response_cid
+                                model_hash = response_hash
+
+                            cluster_anchor_id = f"cluster_{self.clique_id}"
+                            response_data_id = getattr(model_response, "model_data_id", "")
+                            fetched_from_chain = False
+                            if response_data_id and self.blockchain:
+                                self.blockchain.remember_anchor(
+                                    cluster_anchor_id,
+                                    round_idx,
+                                    response_data_id,
+                                    model_response.model_cid or None,
+                                    model_response.model_hash or None,
+                                )
+                                anchor = self.blockchain.get_anchor(cluster_anchor_id, round_idx)
+                                if anchor and self.ipfs:
+                                    cid_from_chain, expected_hash = anchor
+                                    if self.is_bridge_node:
+                                        cid = cid_from_chain
+                                        model_hash = expected_hash
+                                    logger.info(
+                                        "Fetching merged model via blockchain anchor: %s",
+                                        cid_from_chain[:16],
+                                    )
+                                    merged_from_ipfs = self.ipfs.get(cid_from_chain)
+                                    if merged_from_ipfs is not None and verify_model_hash(
+                                        merged_from_ipfs, expected_hash
+                                    ):
+                                        load_params(self.model, merged_from_ipfs.tolist())
+                                        fetched_from_chain = True
+                                    else:
+                                        logger.warning(
+                                            "Failed to verify model fetched from IPFS via blockchain; "
+                                            "will still advertise anchor reference"
+                                        )
+
+                            if not fetched_from_chain and model_response.model_cid and self.ipfs:
+                                logger.info(
+                                    f"Fetching merged model from IPFS fallback: {model_response.model_cid[:16]}..."
+                                )
                                 merged_from_ipfs = self.ipfs.get(model_response.model_cid)
                                 if merged_from_ipfs is not None:
                                     load_params(self.model, merged_from_ipfs.tolist())
-
-                            # Bridge nodes need CID for ECM gossip even when not aggregator
-                            if self.is_bridge_node and model_response.model_cid:
-                                cid = model_response.model_cid
-                                model_hash = model_response.model_hash
+                                    if self.is_bridge_node:
+                                        cid = model_response.model_cid
+                                        model_hash = model_response.model_hash
+                                else:
+                                    logger.warning(
+                                        "Failed to fetch merged model from IPFS fallback; "
+                                        "sharing ECM reference anyway"
+                                    )
 
                 acc_after = self.evaluate()
                 logger.info(f"Accuracy after aggregation: {acc_after:.4f}")
@@ -898,8 +1029,15 @@ class NodeService:
         logger.info(f"Training completed after {self.current_round + 1} rounds (reason: {stop_reason or 'max_rounds'})")
         logger.info("="*60)
 
-    def _fetch_convergence_status(self) -> Optional[secureagg_pb2.ModelResponse]:
-        """Fetch convergence status from aggregator."""
+    def _fetch_convergence_status(self, wait_for_model_ref: bool = False) -> Optional[secureagg_pb2.ModelResponse]:
+        """
+        Fetch convergence status from aggregator.
+
+        Args:
+            wait_for_model_ref: If True, poll until aggregator publishes IPFS metadata.
+                Bridge nodes enable this so they always obtain CID/hash for ECM gossip.
+        """
+        channel = None
         try:
             agg_port = int(self.aggregator_address.split(":")[-1]) + 1000
             agg_host = self.aggregator_address.split(":")[0]
@@ -907,15 +1045,46 @@ class NodeService:
 
             channel = grpc.insecure_channel(agg_addr)
             stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
-            response = stub.GetGlobalModel(
-                secureagg_pb2.ModelRequest(round=self.current_round),
-                timeout=10
-            )
-            channel.close()
+
+            attempts = 0
+            max_attempts = 10 if (wait_for_model_ref and self.inter_cluster_enabled) else 1
+            delay = 2
+            response: Optional[secureagg_pb2.ModelResponse] = None
+
+            while attempts < max_attempts:
+                response = stub.GetGlobalModel(
+                    secureagg_pb2.ModelRequest(round=self.current_round),
+                    timeout=10
+                )
+                if (
+                    not wait_for_model_ref
+                    or not self.inter_cluster_enabled
+                    or (response.model_cid and response.model_hash)
+                ):
+                    return response
+
+                attempts += 1
+                if attempts < max_attempts:
+                    logger.info(
+                        "Aggregator metadata not ready (attempt %d/%d); waiting %ds",
+                        attempts,
+                        max_attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
+
+            if wait_for_model_ref and self.inter_cluster_enabled:
+                logger.warning(
+                    "Aggregator metadata unavailable after %d attempts; proceeding without CID/hash",
+                    max_attempts,
+                )
             return response
         except Exception as e:
             logger.warning(f"Failed to fetch convergence status: {e}")
             return None
+        finally:
+            if channel:
+                channel.close()
 
     def gossip_ecm_with_convergence(
         self, cid: str, model_hash: str, round_num: int,
@@ -1030,9 +1199,6 @@ class NodeService:
             inter_edges_config = self.inter_cluster_config.get("inter_edges", [])
             inter_edges = [(e[0], e[1]) for e in inter_edges_config]
 
-        if inter_edges:
-            self.setup_bridge_node(inter_edges)
-
         # Wait for clique members or all nodes to be ready
         if self.clique_members:
             expected_count = len(self.clique_members)
@@ -1049,6 +1215,9 @@ class NodeService:
                 time.sleep(2)
                 self.register_with_ttp()
             logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
+
+        if inter_edges:
+            self.setup_bridge_node(inter_edges)
 
         time.sleep(2)
 

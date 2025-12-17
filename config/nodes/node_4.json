@@ -26,7 +26,7 @@
       "api_url": "http://ipfs-node-2:5001"
     },
     "blockchain": {
-      "gateway_url": "http://localhost:9000",
+      "gateway_url": "http://host.docker.internal:9000",
       "identity": "trainer-node-005",
       "private_key_path": "config/keys/trainer-node-005_sk.pem",
       "state_path": "data/blockchain/trainer-node-005.json",
@@ -43,6 +43,7 @@
     "enabled": true,
     "tol_abs": 1e-05,
     "tol_rel": 0.001,
-    "patience": 3
+    "patience": 3,
+    "max_rounds": 5
   }
 }

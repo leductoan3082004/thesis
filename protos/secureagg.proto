@@ -23,6 +23,8 @@ message RegisterResponse {
   repeated string clique_members = 6;
   int32 clique_threshold = 7;
   repeated int32 data_indices = 8;  // Assigned data indices for this node
+  string central_metadata_data_id = 9;
+  int32 central_metadata_version = 10;
 }
 
 message ParticipantsRequest {}
@@ -137,6 +139,7 @@ message ModelResponse {
   // IPFS reference for merged model (nodes fetch from IPFS if set)
   string model_cid = 8;
   string model_hash = 9;
+  string model_data_id = 10;
 }
 
 // Inter-cluster ECM (External Cluster Model) messages

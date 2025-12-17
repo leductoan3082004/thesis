@@ -10,6 +10,9 @@ from secure_aggregation.convergence.central_broadcast import (
     publish_global_convergence,
 )
 from secure_aggregation.storage.model_store import BlockchainInterface
+from secure_aggregation.utils import get_logger
+
+logger = get_logger("central_checker")
 
 
 @dataclass
@@ -30,6 +33,9 @@ class CentralChecker:
         if prev is not None and prev == converged:
             return
         signals[cluster_id] = converged
+        logger.info(
+            f"Central checker received signal: cluster={cluster_id}, round={round_idx}, converged={converged}"
+        )
         if self._has_all_signals(signals):
             if all(signals.values()):
                 self._finalize(round_idx)
@@ -45,6 +51,7 @@ class CentralChecker:
     def _finalize(self, round_idx: int) -> None:
         self._finalized_rounds.add(round_idx)
         self._round_signals.pop(round_idx, None)
+        logger.info(f"Central checker declaring global convergence at round {round_idx}")
         if self.blockchain is not None:
             existing = fetch_global_convergence_round(self.blockchain)
             if existing is None or existing != round_idx:
