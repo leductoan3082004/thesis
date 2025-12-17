@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from logging import Logger
 from typing import Optional
@@ -19,10 +20,12 @@ class JsonFormatter(logging.Formatter):
         return str(log)
 
 
-def configure_logging(level: str = "INFO", json_output: bool = False, log_file: Optional[str] = None) -> None:
+def configure_logging(level: Optional[str] = None, json_output: bool = False, log_file: Optional[str] = None) -> None:
     """
     Configure global logging. Uses stdout by default; can additionally tee to a file.
     """
+    env_level = os.getenv("LOG_LEVEL")
+    effective_level = level or env_level or "INFO"
     handlers = [logging.StreamHandler(sys.stdout)]
     if log_file:
         handlers.append(logging.FileHandler(log_file))
@@ -36,7 +39,11 @@ def configure_logging(level: str = "INFO", json_output: bool = False, log_file: 
         )
     for handler in handlers:
         handler.setFormatter(formatter)
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), handlers=handlers, force=True)
+    logging.basicConfig(
+        level=getattr(logging, effective_level.upper(), logging.INFO),
+        handlers=handlers,
+        force=True,
+    )
 
 
 def get_logger(name: str) -> Logger:

@@ -134,6 +134,7 @@ class NodeService:
         self.inter_cluster_aggregator: Optional[InterClusterAggregator] = None
         self.ipfs: Optional[IPFSInterface] = None
         self.blockchain: Optional[BlockchainInterface] = None
+        self.ecm_forward_wait = float(self.inter_cluster_config.get("ecm_forward_wait_seconds", 5.0))
 
         # Convergence state
         self.convergence_config = ConvergenceConfig.from_dict(self.config.get("convergence"))
@@ -351,7 +352,10 @@ class NodeService:
     def setup_inter_cluster(self) -> None:
         """Setup inter-cluster aggregation components."""
         if not self.inter_cluster_enabled:
-            logger.info("Inter-cluster aggregation disabled")
+            logger.info(
+                "Inter-cluster aggregation disabled (inter_cluster.enabled=false); "
+                "bridge forwarding and ECM gossip phases will be skipped"
+            )
             return
 
         ipfs_config = self.inter_cluster_config.get("ipfs", {})
@@ -417,14 +421,14 @@ class NodeService:
         )
         self._refresh_central_metadata()
 
-    def setup_bridge_node(self, inter_edges: List[Tuple[str, str]]) -> None:
+    def setup_bridge_node(self, inter_edges: List[Tuple[str, str]]) -> bool:
         """Setup bridge node if this node has inter-clique connections."""
         self.inter_edges = inter_edges
         self.is_bridge_node = is_bridge_node(self.node_id, inter_edges)
 
         if not self.is_bridge_node:
             logger.info(f"Node {self.node_id} is not a bridge node")
-            return
+            return False
 
         neighbors = get_inter_clique_neighbors(self.node_id, inter_edges)
         self.neighbor_address_map = {}
@@ -455,25 +459,102 @@ class NodeService:
             f"resolved inter-clique neighbors: {self.neighbor_address_map}"
         )
 
-        if self.inter_cluster_enabled and self.ecm_buffer:
-            self.bridge_server = serve_bridge(
+        if not self.inter_cluster_enabled:
+            logger.warning(
+                "Inter-cluster disabled while configuring bridge node %s; skipping bridge server",
                 self.node_id,
-                self.port + 2000,
-                self.ecm_buffer,
             )
-            self.bridge_client = BridgeClient(self.node_id)
-            logger.info(f"Bridge server started on port {self.port + 2000}")
+            return False
+        if self.ecm_buffer is None:
+            logger.warning(
+                "ECM buffer not initialized for %s; creating default buffer for bridge traffic",
+                self.node_id,
+            )
+            freshness = float(self.inter_cluster_config.get("freshness_window", 300.0))
+            self.ecm_buffer = ECMBuffer(freshness_window=freshness)
+        if self.inter_cluster_enabled and self.ecm_buffer is not None:
+            logger.info(f"Starting bridge server for {self.node_id}")
+            try:
+                self.bridge_server = serve_bridge(
+                    self.node_id,
+                    self.port + 2000,
+                    self.ecm_buffer,
+                )
+                self.bridge_client = BridgeClient(self.node_id)
+                logger.info(f"Bridge server started on port {self.port + 2000}")
+            except Exception as exc:  # noqa: BLE001
+                self.bridge_server = None
+                self.bridge_client = None
+                logger.error(
+                    "Failed to start bridge server on port %d: %s",
+                    self.port + 2000,
+                    exc,
+                    exc_info=True,
+                )
+                return False
         self._update_central_neighbor_addresses()
+        return self.bridge_client is not None
 
     def stop_bridge_server(self) -> None:
         """Stop bridge server."""
+        stopped = False
         if self.bridge_server:
-            self.bridge_server.stop(0)
+            stop_future = self.bridge_server.stop(0)
+            if stop_future:
+                stop_future.wait()
             self.bridge_server = None
+            stopped = True
         if self.bridge_client:
             self.bridge_client.close()
             self.bridge_client = None
-        logger.info("Bridge server stopped")
+            stopped = True
+        if stopped:
+            logger.info("Bridge server stopped")
+
+    def _init_bridge_with_retries(
+        self,
+        inter_edges: List[Tuple[str, str]],
+        max_attempts: int = 5,
+        delay: float = 2.0,
+        fatal: bool = False,
+    ) -> bool:
+        """Attempt to initialize bridge stack with retries."""
+        if not inter_edges:
+            return False
+        for attempt in range(max_attempts):
+            try:
+                if self.setup_bridge_node(inter_edges):
+                    return True
+            except OSError as exc:  # port bind/IO issues
+                logger.error(
+                    "Bridge initialization attempt %d/%d failed for %s due to OS error: %s",
+                    attempt + 1,
+                    max_attempts,
+                    self.node_id,
+                    exc,
+                )
+                # Port may still be bound; wait before retry.
+                time.sleep(delay)
+                continue
+            logger.warning(
+                "Bridge initialization attempt %d/%d failed for %s; retrying in %.1fs",
+                attempt + 1,
+                max_attempts,
+                self.node_id,
+                delay,
+            )
+            time.sleep(delay)
+        if fatal and self.is_bridge_node:
+            raise RuntimeError(
+                f"Bridge node {self.node_id} could not initialize bridge client "
+                f"after {max_attempts} attempts"
+            )
+        logger.warning(
+            "Bridge initialization failed for %s after %d attempts; continuing without bridge server",
+            self.node_id,
+            max_attempts,
+        )
+        return False
 
     def _refresh_central_metadata(self) -> None:
         """Fetch central metadata from blockchain and update coordinator."""
@@ -527,7 +608,10 @@ class NodeService:
 
     def gossip_ecm(self, cid: str, model_hash: str, round_num: int) -> None:
         """Gossip ECM to neighbor cluster bridge nodes."""
-        if not self.is_bridge_node or not self.bridge_client:
+        if not self.is_bridge_node:
+            return
+        if not self._ensure_bridge_client():
+            logger.warning("Cannot gossip ECM: bridge client unavailable")
             return
 
         cluster_id = f"cluster_{self.clique_id}"
@@ -554,15 +638,31 @@ class NodeService:
         """
         if not self.is_bridge_node:
             return 0
-        if self.is_aggregator:
-            return 0
         if not self.ecm_buffer:
+            return 0
+        if not self._ensure_bridge_client():
+            logger.warning("Bridge client unavailable; skipping ECM forward")
             return 0
 
         fresh_ecms = self.ecm_buffer.get_fresh_ecms()
         fresh_ecms = [ecm for ecm in fresh_ecms if not ecm.is_signal]
         if not fresh_ecms:
-            logger.debug("No fresh ECMs to forward to aggregator")
+            logger.info(
+                "No fresh ECMs to forward to aggregator (buffer_size=%d)",
+                len(self.ecm_buffer),
+            )
+            return 0
+
+        if self.is_aggregator:
+            # Aggregator already holds these ECMs locally via its bridge server.
+            logger.debug(
+                "Aggregator is also a bridge node; %d ECMs already staged locally",
+                len(fresh_ecms),
+            )
+            return len(fresh_ecms)
+
+        if not self.aggregator_address:
+            logger.warning("Cannot forward ECMs: aggregator address not set")
             return 0
 
         agg_port = int(self.aggregator_address.split(":")[-1]) + 1000
@@ -600,6 +700,63 @@ class NodeService:
             logger.warning(f"Failed to forward ECMs to aggregator: {e}")
             return 0
 
+    def _wait_for_neighbor_ecms(self) -> None:
+        """Poll for incoming ECMs before forwarding to the aggregator."""
+        if (
+            not self.ecm_buffer
+            or self.ecm_forward_wait <= 0
+            or not self.neighbor_bridge_addresses
+        ):
+            return
+        self._ensure_bridge_client()
+
+        deadline = time.time() + self.ecm_forward_wait
+        poll_interval = 1.0
+        while time.time() < deadline:
+            fresh = [ecm for ecm in self.ecm_buffer.get_fresh_ecms() if not ecm.is_signal]
+            if fresh:
+                logger.debug(
+                    "ECM buffer received %d entries from neighbors; proceeding to forward",
+                    len(fresh),
+                )
+                return
+            logger.debug(
+                "Waiting for neighbor ECMs (%d neighbors)...",
+                len(self.neighbor_bridge_addresses),
+            )
+            time.sleep(poll_interval)
+        logger.info(
+            "No ECMs received from %d neighbors after waiting %ds; continuing without them",
+            len(self.neighbor_bridge_addresses),
+            int(self.ecm_forward_wait),
+        )
+
+    def _ensure_bridge_client(self) -> bool:
+        """Ensure bridge infrastructure is running; restart if necessary."""
+        if not self.is_bridge_node or not self.inter_cluster_enabled:
+            return False
+        if self.bridge_client:
+            return True
+        if not self.inter_edges:
+            logger.warning(
+                "Bridge client unavailable for %s and no inter_edges configured",
+                self.node_id,
+            )
+            return False
+        logger.warning(
+            "Bridge client missing for %s; restarting bridge server on port %d",
+            self.node_id,
+            self.port + 2000,
+        )
+        # Tear down any existing server before reconfiguring.
+        self.stop_bridge_server()
+        return self._init_bridge_with_retries(
+            self.inter_edges,
+            max_attempts=3,
+            delay=1.0,
+            fatal=False,
+        )
+
     def run_secure_aggregation_round(self) -> List[float]:
         """Run one round of secure aggregation protocol."""
         logger.info(f"Starting secure aggregation round {self.current_round}")
@@ -623,8 +780,11 @@ class NodeService:
         advert_msg = client.advertise_keys()
 
         # Retry logic for initial aggregator connection.
-        max_retries = 30
         retry_delay = 1
+        max_retries = 30
+        if self.inter_cluster_enabled:
+            retry_delay = 2
+            max_retries = 75
         response = None
         for attempt in range(max_retries):
             try:
@@ -640,7 +800,16 @@ class NodeService:
                 break
             except grpc.RpcError as e:
                 if attempt < max_retries - 1:
-                    logger.warning(f"Aggregator connection attempt {attempt + 1}/{max_retries} failed, retrying in {retry_delay}s...")
+                    if attempt < 5 or (attempt + 1) % 5 == 0:
+                        logger.warning(
+                            "Aggregator %s at %s connection attempt %d/%d failed (%s); retrying in %ds...",
+                            self.aggregator_id,
+                            agg_addr,
+                            attempt + 1,
+                            max_retries,
+                            e.code().name if hasattr(e, "code") else "unknown",
+                            retry_delay,
+                        )
                     time.sleep(retry_delay)
                 else:
                     raise
@@ -842,38 +1011,63 @@ class NodeService:
             self.aggregator_id = self.elect_aggregator(round_idx)
             self.aggregator_address = self.participant_map[self.aggregator_id]
             self.is_aggregator = (self.aggregator_id == self.node_id)
+            aggregator_is_bridge = is_bridge_node(self.aggregator_id, self.inter_edges)
+            wait_for_aggregator = 5
+            if self.inter_cluster_enabled and aggregator_is_bridge:
+                wait_for_aggregator = max(wait_for_aggregator, 8)
 
             if self.is_aggregator:
                 logger.info(f"*** This node is the AGGREGATOR for round {round_idx} ***")
                 self.start_aggregator_server()
 
-            logger.info(f"Waiting for aggregator {self.aggregator_id} to be ready...")
-            time.sleep(5)
+            logger.info(
+                "Waiting for aggregator %s to be ready (sleeping %ds)...",
+                self.aggregator_id,
+                wait_for_aggregator,
+            )
+            time.sleep(wait_for_aggregator)
 
             cid: Optional[str] = None
             model_hash: Optional[str] = None
             model_data_id: Optional[str] = None
             try:
+                round_failed = False
                 # Phase 2: Secure aggregation
                 logger.info("Phase 2: Secure aggregation")
                 aggregated_weights = self.run_secure_aggregation_round()
 
-                # Phase 2.5: Bridge nodes forward ECMs to aggregator
-                if self.inter_cluster_enabled and self.is_bridge_node and not self.is_aggregator:
-                    forwarded = self.forward_ecms_to_aggregator()
-                    if forwarded > 0:
-                        logger.info(f"Phase 2.5: Forwarded {forwarded} ECMs to aggregator")
+                # Phase 3: Bridge nodes forward ECMs (if inter-cluster is enabled)
+                if self.is_bridge_node:
+                    if self.inter_cluster_enabled:
+                        if self.neighbor_bridge_addresses:
+                            self._wait_for_neighbor_ecms()
+                        logger.info("Phase 3: Forwarding ECMs to aggregator")
+                        forwarded = self.forward_ecms_to_aggregator()
+                        if forwarded > 0:
+                            if self.is_aggregator:
+                                logger.info(
+                                    "Phase 3: Aggregator staging %d ECMs from neighbor clusters",
+                                    forwarded,
+                                )
+                            else:
+                                logger.info(f"Phase 3: Forwarded {forwarded} ECMs to aggregator")
+                        else:
+                            logger.info("Phase 3: No fresh ECMs to forward this round")
+                    else:
+                        logger.info(
+                            "Phase 3: Skipped ECM forwarding because inter_cluster.enabled is false"
+                        )
 
                 if aggregated_weights:
-                    logger.info("Phase 3: Updating model with aggregated weights")
+                    logger.info("Phase 4: Updating model with aggregated weights")
                     dequantized = dequantize_vector([int(w) for w in aggregated_weights], self.scale)
                     load_params(self.model, dequantized)
 
-                    # Phase 4: Inter-cluster merge (aggregator only)
+                    # Phase 5: Inter-cluster merge (aggregator only)
                     if self.is_aggregator and self.inter_cluster_enabled and self.inter_cluster_aggregator:
                         # Wait briefly for ECMs from bridge nodes to arrive
                         time.sleep(2)
-                        logger.info("Phase 4: Inter-cluster merge")
+                        logger.info("Phase 5: Inter-cluster merge")
                         intra_model = np.array(dequantized, dtype=np.float32)
 
                         if self.ecm_buffer:
@@ -949,7 +1143,6 @@ class NodeService:
 
                             cluster_anchor_id = f"cluster_{self.clique_id}"
                             response_data_id = getattr(model_response, "model_data_id", "")
-                            fetched_from_chain = False
                             if response_data_id and self.blockchain:
                                 self.blockchain.remember_anchor(
                                     cluster_anchor_id,
@@ -958,29 +1151,8 @@ class NodeService:
                                     model_response.model_cid or None,
                                     model_response.model_hash or None,
                                 )
-                                anchor = self.blockchain.get_anchor(cluster_anchor_id, round_idx)
-                                if anchor and self.ipfs:
-                                    cid_from_chain, expected_hash = anchor
-                                    if self.is_bridge_node:
-                                        cid = cid_from_chain
-                                        model_hash = expected_hash
-                                    logger.info(
-                                        "Fetching merged model via blockchain anchor: %s",
-                                        cid_from_chain[:16],
-                                    )
-                                    merged_from_ipfs = self.ipfs.get(cid_from_chain)
-                                    if merged_from_ipfs is not None and verify_model_hash(
-                                        merged_from_ipfs, expected_hash
-                                    ):
-                                        load_params(self.model, merged_from_ipfs.tolist())
-                                        fetched_from_chain = True
-                                    else:
-                                        logger.warning(
-                                            "Failed to verify model fetched from IPFS via blockchain; "
-                                            "will still advertise anchor reference"
-                                        )
 
-                            if not fetched_from_chain and model_response.model_cid and self.ipfs:
+                            if model_response.model_cid and self.ipfs:
                                 logger.info(
                                     f"Fetching merged model from IPFS fallback: {model_response.model_cid[:16]}..."
                                 )
@@ -1001,6 +1173,7 @@ class NodeService:
                 logger.info(f"Improvement: {acc_after - acc_before:+.4f}")
 
             except Exception as e:
+                round_failed = True
                 logger.error(f"Secure aggregation failed: {e}", exc_info=True)
 
             finally:
@@ -1008,9 +1181,20 @@ class NodeService:
                     time.sleep(2)
                     self.stop_aggregator_server()
 
-            # Phase 5: ECM gossip with convergence status (bridge nodes only)
+            if round_failed:
+                retry_delay = 5
+                logger.warning(
+                    "Round %d failed. Retrying after %ds once aggregator %s is reachable.",
+                    round_idx,
+                    retry_delay,
+                    self.aggregator_id,
+                )
+                time.sleep(retry_delay)
+                continue
+
+            # Phase 6: ECM gossip with convergence status (bridge nodes only)
             if cid and model_hash and self.is_bridge_node:
-                logger.info("Phase 5: ECM gossip to neighbor clusters")
+                logger.info("Phase 6: ECM gossip to neighbor clusters")
                 cluster_converged = self.convergence_tracker.state.cluster_converged if self.convergence_tracker else False
                 delta_norm = self.convergence_tracker.state.delta_norm if self.convergence_tracker else 0.0
                 self.gossip_ecm_with_convergence(cid, model_hash, round_idx, cluster_converged, delta_norm)
@@ -1065,7 +1249,7 @@ class NodeService:
 
                 attempts += 1
                 if attempts < max_attempts:
-                    logger.info(
+                    logger.debug(
                         "Aggregator metadata not ready (attempt %d/%d); waiting %ds",
                         attempts,
                         max_attempts,
@@ -1091,7 +1275,10 @@ class NodeService:
         cluster_converged: bool, delta_norm: float
     ) -> None:
         """Gossip ECM with convergence status to neighbor cluster bridge nodes."""
-        if not self.is_bridge_node or not self.bridge_client:
+        if not self.is_bridge_node:
+            return
+        if not self._ensure_bridge_client():
+            logger.warning("Cannot gossip ECM (node %s): bridge client unavailable", self.node_id)
             return
 
         cluster_id = f"cluster_{self.clique_id}"
@@ -1217,7 +1404,12 @@ class NodeService:
             logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
 
         if inter_edges:
-            self.setup_bridge_node(inter_edges)
+            bridge_ready = self._init_bridge_with_retries(inter_edges, fatal=False)
+            if not bridge_ready and self.is_bridge_node:
+                logger.warning(
+                    "Bridge node %s could not initialize bridge server; continuing without inter-cluster gossip",
+                    self.node_id,
+                )
 
         time.sleep(2)
 

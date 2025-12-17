@@ -132,6 +132,11 @@ class InterClusterAggregator:
             return None, None
 
         cid = self.ipfs.add(model)
+        if hasattr(self.ipfs, "provide"):
+            try:
+                self.ipfs.provide(cid)
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to announce CID %s to DHT", cid[:16])
         model_hash = compute_model_hash(model)
 
         logger.info(f"Published model to IPFS: cid={cid[:16]}...")

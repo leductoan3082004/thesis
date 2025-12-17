@@ -336,6 +336,8 @@ class KuboIPFS(IPFSInterface):
         self,
         api_url: str = "http://localhost:5001",
         timeout: float = 30.0,
+        max_retries: int = 5,
+        retry_delay: float = 1.0,
     ) -> None:
         """
         Initialize Kubo IPFS client.
@@ -343,10 +345,14 @@ class KuboIPFS(IPFSInterface):
         Args:
             api_url: URL of the IPFS HTTP API (e.g., "http://ipfs-node-1:5001").
             timeout: Request timeout in seconds.
+            max_retries: Number of attempts for read operations before failing.
+            retry_delay: Base delay (seconds) between retries (exponential backoff).
         """
         self._api_url = api_url.rstrip("/")
         self._timeout = timeout
         self._client = httpx.Client(timeout=timeout)
+        self._max_retries = max(1, max_retries)
+        self._retry_delay = max(0.1, retry_delay)
 
     def add(self, model: np.ndarray) -> str:
         """Store model in IPFS and return CID."""
@@ -371,26 +377,41 @@ class KuboIPFS(IPFSInterface):
             raise RuntimeError(f"IPFS add failed: {e}") from e
 
     def get(self, cid: str) -> Optional[np.ndarray]:
-        """Retrieve model from IPFS by CID."""
-        try:
-            response = self._client.post(
-                f"{self._api_url}/api/v0/cat",
-                params={"arg": cid},
-            )
-            response.raise_for_status()
-            model = pickle.loads(response.content)
-            logger.info(f"{IPFS_LOG_TAG} Retrieved model from IPFS cid={cid[:16]}...")
-            return model
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 500:
-                # CID not found or not reachable.
-                logger.warning(f"{IPFS_LOG_TAG} CID not found in IPFS: {cid}")
-                return None
-            logger.error(f"{IPFS_LOG_TAG} Failed to get model from IPFS: {e}")
-            raise RuntimeError(f"IPFS get failed: {e}") from e
-        except httpx.HTTPError as e:
-            logger.error(f"{IPFS_LOG_TAG} Failed to get model from IPFS: {e}")
-            raise RuntimeError(f"IPFS get failed: {e}") from e
+        """Retrieve model from IPFS by CID with retry/backoff."""
+        last_error: Optional[Exception] = None
+        for attempt in range(self._max_retries):
+            try:
+                response = self._client.post(
+                    f"{self._api_url}/api/v0/cat",
+                    params={"arg": cid},
+                    timeout=self._timeout,
+                )
+                response.raise_for_status()
+                model = pickle.loads(response.content)
+                logger.info(f"{IPFS_LOG_TAG} Retrieved model from IPFS cid={cid[:16]}...")
+                return model
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 500:
+                    logger.warning(f"{IPFS_LOG_TAG} CID not found in IPFS: {cid}")
+                    return None
+                last_error = e
+            except httpx.TimeoutException as e:
+                last_error = e
+            except httpx.HTTPError as e:
+                last_error = e
+
+            if attempt < self._max_retries - 1:
+                delay = self._retry_delay * (attempt + 1)
+                logger.warning(
+                    f"{IPFS_LOG_TAG} Get CID {cid[:16]} attempt {attempt + 1}/{self._max_retries} failed: "
+                    f"{last_error}. Retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+
+        logger.error(
+            f"{IPFS_LOG_TAG} Failed to get model from IPFS cid={cid[:16]} after {self._max_retries} attempts"
+        )
+        raise RuntimeError(f"IPFS get failed: {last_error}") from last_error
 
     def exists(self, cid: str) -> bool:
         """Check if CID exists in IPFS."""
