@@ -1,6 +1,5 @@
 """Convergence tracking for federated learning with global coordination."""
 
-import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
@@ -9,34 +8,11 @@ import numpy as np
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("convergence")
-CONVERGENCE_WARMUP_ENV_VAR = "CONVERGENCE_WARMUP_ROUNDS"
 DEFAULT_CONVERGENCE_WARMUP_ROUNDS = 5
-_ENV_INVALID_WARNING_EMITTED = False
 
 
-def _resolve_warmup_rounds(candidate: Optional[int]) -> int:
-    """
-    Resolve warmup rounds using the shared environment override if present.
-    """
-    global _ENV_INVALID_WARNING_EMITTED
-    env_value = os.getenv(CONVERGENCE_WARMUP_ENV_VAR)
-    if env_value is not None:
-        try:
-            parsed = int(env_value)
-            if parsed < 0:
-                raise ValueError
-            return parsed
-        except ValueError:
-            if not _ENV_INVALID_WARNING_EMITTED:
-                logger.warning(
-                    "Invalid %s=%s; falling back to default %d",
-                    CONVERGENCE_WARMUP_ENV_VAR,
-                    env_value,
-                    DEFAULT_CONVERGENCE_WARMUP_ROUNDS,
-                )
-                _ENV_INVALID_WARNING_EMITTED = True
-            return DEFAULT_CONVERGENCE_WARMUP_ROUNDS
-
+def _sanitize_warmup_rounds(candidate: Optional[int]) -> int:
+    """Validate warmup value from configuration."""
     if candidate is None:
         return DEFAULT_CONVERGENCE_WARMUP_ROUNDS
 
@@ -73,14 +49,14 @@ class ConvergenceConfig:
     """Configuration for convergence-driven training.
 
     Training continues until convergence is achieved. The warmup duration is
-    controlled at the system level via the CONVERGENCE_WARMUP_ROUNDS
-    environment variable. It indicates how many warmup rounds to run before
-    convergence detection (and signaling to bridge/central checker) begins.
-    Set it to 0 to enable convergence tracking immediately.
+    configured via the convergence `warmup_rounds` field, which determines how
+    many rounds to run before convergence detection (and signaling to
+    bridge/central checker) begins. Set it to 0 to enable convergence tracking
+    immediately.
     """
 
     enabled: bool = True
-    convergence_warmup_rounds: int = DEFAULT_CONVERGENCE_WARMUP_ROUNDS
+    warmup_rounds: int = DEFAULT_CONVERGENCE_WARMUP_ROUNDS
     tol_abs: float = 1e-5
     tol_rel: float = 0.001
     patience: int = 3
@@ -93,10 +69,13 @@ class ConvergenceConfig:
         """Create config from dictionary, using defaults for missing fields."""
         if data is None:
             return cls()
-        warmup_value = data.get("convergence_warmup_rounds", data.get("max_rounds"))
+        warmup_value = data.get(
+            "warmup_rounds",
+            data.get("convergence_warmup_rounds", data.get("max_rounds")),
+        )
         return cls(
             enabled=data.get("enabled", True),
-            convergence_warmup_rounds=warmup_value,
+            warmup_rounds=warmup_value,
             tol_abs=data.get("tol_abs", 1e-5),
             tol_rel=data.get("tol_rel", 0.001),
             patience=data.get("patience", 3),
@@ -106,12 +85,17 @@ class ConvergenceConfig:
         )
 
     def __post_init__(self) -> None:
-        self.convergence_warmup_rounds = _resolve_warmup_rounds(self.convergence_warmup_rounds)
+        self.warmup_rounds = _sanitize_warmup_rounds(self.warmup_rounds)
 
     @property
     def max_rounds(self) -> int:
         """Backwards-compatible alias for the warmup value."""
-        return self.convergence_warmup_rounds
+        return self.warmup_rounds
+
+    @property
+    def convergence_warmup_rounds(self) -> int:
+        """Deprecated alias for warmup rounds."""
+        return self.warmup_rounds
 
 
 @dataclass
@@ -162,7 +146,7 @@ class ConvergenceTracker:
         Returns:
             Updated convergence state with stop decision.
         """
-        warmup_rounds = max(0, self.config.convergence_warmup_rounds)
+        warmup_rounds = max(0, self.config.warmup_rounds)
         tracking_enabled = self.state.round_idx >= warmup_rounds
 
         if not self.config.enabled:

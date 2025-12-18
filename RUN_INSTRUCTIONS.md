@@ -123,9 +123,13 @@ For each round:
 - `threshold`: 3 (minimum nodes for secure aggregation)
 
 ### Convergence Warmup (system-wide)
-- `CONVERGENCE_WARMUP_ROUNDS` controls how many rounds each node waits before emitting convergence signals (default `5` if unset).
-- Specify it in the repository root `.env` file (automatically loaded by Docker Compose) to apply the same warmup across all nodes, e.g. `CONVERGENCE_WARMUP_ROUNDS=3`.
+- `warmup_rounds` inside `config/system-config.json` controls how many rounds each node waits before emitting convergence signals (default `5` in the sample file).
+- Lower it to `0` to start convergence checks immediately or raise it to defer signals; this replaces the deprecated `CONVERGENCE_WARMUP_ROUNDS` environment override.
 - This is distinct from `MAX_TRAINING_ROUNDS`, which caps the total number of federated rounds.
+
+### Global Convergence Settings
+- Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to change `enabled`, `tol_abs`, `tol_rel`, or `patience` without touching every node file. The resolved file is gitignored so you can keep environment-specific thresholds private.
+- Nodes automatically consume this file; override the location with `SYSTEM_CONFIG_PATH=/path/to/system-config.json` when launching services if you need a custom mount.
 
 ### Aggregator Rotation
 Automatic round-robin election:

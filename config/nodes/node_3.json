@@ -38,11 +38,5 @@
     "base_gamma": 0.2,
     "freshness_window": 300.0,
     "max_neighbors": 4
-  },
-  "convergence": {
-    "enabled": true,
-    "tol_abs": 1e-05,
-    "tol_rel": 0.001,
-    "patience": 3
   }
 }

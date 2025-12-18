@@ -38,11 +38,5 @@
     "freshness_window": 300.0,
     "max_neighbors": 4,
     "use_mock": false
-  },
-  "convergence": {
-    "enabled": true,
-    "tol_abs": 1e-05,
-    "tol_rel": 0.001,
-    "patience": 3
   }
 }

@@ -53,3 +53,4 @@ Thumbs.db
 
 # Config
 config/keys/
+config/system-config.json

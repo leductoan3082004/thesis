@@ -27,6 +27,7 @@ from secure_aggregation.convergence.central_broadcast import (
 )
 from secure_aggregation.convergence.central_checker import CentralChecker
 from secure_aggregation.config.models import NodeRole
+from secure_aggregation.config.system import load_system_config
 from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition
 from secure_aggregation.node import ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
@@ -91,6 +92,7 @@ class NodeService:
 
     def __init__(self, config_path: str) -> None:
         self.config = self._load_config(config_path)
+        self.system_config, self.system_config_path = load_system_config(Path(config_path))
         self.node_id = self.config["node_id"]
         self.role = NodeRole(self.config["role"])
         self.ttp_address = self.config["ttp_address"]
@@ -151,7 +153,7 @@ class NodeService:
         self.ecm_forward_wait = float(self.inter_cluster_config.get("ecm_forward_wait_seconds", 5.0))
 
         # Convergence state
-        self.convergence_config = ConvergenceConfig.from_dict(self.config.get("convergence"))
+        self.convergence_config = self._load_convergence_config()
         self.convergence_tracker: Optional[ConvergenceTracker] = None
         self._latest_cluster_converged: bool = False
         self._latest_delta_norm: float = 0.0
@@ -167,6 +169,21 @@ class NodeService:
         """Load node configuration from JSON file."""
         with open(path) as f:
             return json.load(f)
+
+    def _load_convergence_config(self) -> ConvergenceConfig:
+        """Load convergence configuration preferring the shared system config."""
+        system_convergence = (self.system_config or {}).get("convergence")
+        if system_convergence is not None:
+            return ConvergenceConfig.from_dict(system_convergence)
+        node_convergence = self.config.get("convergence")
+        if node_convergence is not None:
+            logger.warning(
+                "Using per-node convergence config for %s; please move it to %s",
+                self.node_id,
+                self.system_config_path,
+            )
+            return ConvergenceConfig.from_dict(node_convergence)
+        return ConvergenceConfig()
 
     def _hydrate_anchor_bootstrap(self) -> None:
         """Persist bootstrap anchor references once blockchain client is ready."""
@@ -1005,7 +1022,7 @@ class NodeService:
         """
         local_epochs = self.training_config["local_epochs"]
         max_rounds = self.max_training_rounds
-        convergence_warmup = max(0, self.convergence_config.convergence_warmup_rounds)
+        convergence_warmup = max(0, self.convergence_config.warmup_rounds)
 
         # Initialize convergence tracker
         self.convergence_tracker = ConvergenceTracker(
@@ -1015,7 +1032,7 @@ class NodeService:
 
         logger.info(
             f"Starting convergence-driven training (max_rounds={max_rounds}, "
-            f"convergence_warmup_rounds={convergence_warmup}, "
+            f"warmup_rounds={convergence_warmup}, "
             f"tol_abs={self.convergence_config.tol_abs}, patience={self.convergence_config.patience})"
         )
 
