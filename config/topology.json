@@ -25,9 +25,9 @@
     ]
   ],
   "edge_counts": {
-    "node_4": 4,
     "node_2": 4,
     "node_6": 3,
+    "node_4": 4,
     "node_5": 3,
     "node_3": 3,
     "node_7": 3,

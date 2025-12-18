@@ -473,7 +473,6 @@ class NodeService:
             freshness = float(self.inter_cluster_config.get("freshness_window", 300.0))
             self.ecm_buffer = ECMBuffer(freshness_window=freshness)
         if self.inter_cluster_enabled and self.ecm_buffer is not None:
-            logger.info(f"Starting bridge server for {self.node_id}")
             try:
                 self.bridge_server = serve_bridge(
                     self.node_id,
@@ -519,7 +518,7 @@ class NodeService:
         fatal: bool = False,
     ) -> bool:
         """Attempt to initialize bridge stack with retries."""
-        if not inter_edges:
+        if not inter_edges or not is_bridge_node(self.node_id, inter_edges):
             return False
         for attempt in range(max_attempts):
             try:
@@ -692,6 +691,9 @@ class NodeService:
                 logger.info(
                     f"Forwarded {len(fresh_ecms)} ECMs to aggregator {self.aggregator_id}"
                 )
+                if self.ecm_buffer:
+                    removed = self.ecm_buffer.remove_cids([ecm.cid for ecm in fresh_ecms])
+                    logger.debug("Removed %d ECMs from buffer after forwarding", removed)
                 return len(fresh_ecms)
             else:
                 logger.warning(f"Aggregator rejected ECMs: {response.message}")
@@ -775,8 +777,8 @@ class NodeService:
         channel = grpc.insecure_channel(agg_addr)
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
-        # Round 0: Advertise keys
-        logger.info("Round 0: Advertising keys")
+        # SAP Round 0: Advertise keys
+        logger.info("SAP-Round 0: Advertising keys")
         advert_msg = client.advertise_keys()
 
         # Retry logic for initial aggregator connection.
@@ -834,7 +836,7 @@ class NodeService:
                 timeout=30
             )
 
-        logger.info(f"Round 0 complete: received {len(response.all_keys)} participants")
+            logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
 
         # Pass received advertisements to client
         ordered_participants = [p.node_id for p in response.all_keys]
@@ -850,8 +852,8 @@ class NodeService:
         ]
         client.receive_advertisements(adverts)
 
-        # Round 1: Share keys (simplified - just send empty shares)
-        logger.info("Round 1: Sharing keys")
+        # SAP Round 1: Share keys (simplified - just send empty shares)
+        logger.info("SAP-Round 1: Sharing keys")
         ct_list = client.create_round1_ciphertexts(ordered_participants, self.threshold)
         response1 = stub.Round1ShareKeys(
             secureagg_pb2.ShareKeysMessage(
@@ -899,8 +901,8 @@ class NodeService:
             ]
         client.receive_round1_ciphertexts(mailbox)
 
-        # Round 2: Send masked input
-        logger.info("Round 2: Sending masked model")
+        # SAP Round 2: Send masked input
+        logger.info("SAP-Round 2: Sending masked model")
         model_vec = flatten_params(self.model)
         quantized = quantize_vector(model_vec, self.scale)
 
@@ -919,18 +921,18 @@ class NodeService:
                 timeout=30,
             )
 
-        logger.info(f"Round 2 complete: {len(response2.survivors)} survivors")
+        logger.info(f"SAP-Round 2 complete: {len(response2.survivors)} survivors")
 
-        # Round 3: Consistency check
-        logger.info("Round 3: Consistency check")
+        # SAP Round 3: Consistency check
+        logger.info("SAP-Round 3: Consistency check")
         survivor_sig = client.sign_survivor_list(response2.survivors)
         response3 = stub.Round3ConsistencyCheck(
             secureagg_pb2.ConsistencySignature(node_id=self.node_id, signature=survivor_sig.signature),
             timeout=30,
         )
 
-        # Round 4: Unmask (simplified - send empty shares)
-        logger.info("Round 4: Unmasking")
+        # SAP Round 4: Unmask (simplified - send empty shares)
+        logger.info("SAP-Round 4: Unmasking")
         dropouts = set(ordered_participants) - set(response2.survivors)
         unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
         response4 = stub.Round4Unmask(
@@ -954,7 +956,7 @@ class NodeService:
                 timeout=30,
             )
 
-        logger.info("Round 4 complete: aggregation done")
+        logger.info("SAP-Round 4 complete: aggregation done")
 
         # Get global model
         logger.info("Fetching global model")
@@ -1071,13 +1073,17 @@ class NodeService:
                         intra_model = np.array(dequantized, dtype=np.float32)
 
                         if self.ecm_buffer:
-                            for ecm in self.ecm_buffer.get_fresh_ecms():
+                            consumed_ecms = self.ecm_buffer.get_fresh_ecms()
+                            for ecm in consumed_ecms:
                                 self.inter_cluster_aggregator.receive_ecms(self.node_id, [ecm])
                                 # Update neighbor convergence status from ECM
                                 if hasattr(ecm, "cluster_converged"):
                                     self.convergence_tracker.receive_neighbor_convergence(
                                         ecm.source_cluster, ecm.cluster_converged
                                     )
+                            if consumed_ecms:
+                                removed = self.ecm_buffer.remove_cids([ecm.cid for ecm in consumed_ecms])
+                                logger.debug("Aggregator consumed and removed %d ECMs from buffer", removed)
 
                         merged_data = self.inter_cluster_aggregator.process_round(
                             intra_model, round_idx

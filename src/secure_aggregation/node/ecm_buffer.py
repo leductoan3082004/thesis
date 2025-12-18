@@ -8,7 +8,7 @@ aggregation round when they are sent to the aggregator.
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 
 @dataclass
@@ -139,6 +139,16 @@ class ECMBuffer:
             for cid in stale_cids:
                 del self._buffer[cid]
             return len(stale_cids)
+
+    def remove_cids(self, cids: Iterable[str]) -> int:
+        """Remove ECMs by CID and return count removed."""
+        removed = 0
+        with self._lock:
+            for cid in cids:
+                if cid in self._buffer:
+                    del self._buffer[cid]
+                    removed += 1
+        return removed
 
     def __len__(self) -> int:
         with self._lock:

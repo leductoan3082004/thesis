@@ -124,7 +124,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         return node_id in self.participant_ids
 
     def Round0AdvertiseKeys(self, request: secureagg_pb2.KeyAdvertisement, context) -> secureagg_pb2.KeyAdvertisementAck:
-        """Collect DH public keys from participants (Round 0)."""
+        """Collect DH public keys from participants (SAP-Round 0)."""
         node_id = request.node_id
 
         if not self._validate_participant(node_id):
@@ -149,7 +149,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 # Add late adverts after initial commit.
                 self.aggregator.receive_advertisements([advert])
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round0 advert rejected from {node_id}: {exc}")
+            logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
             return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
 
         # Once we have threshold, return full list.
@@ -165,12 +165,12 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         ]
         return secureagg_pb2.KeyAdvertisementAck(
             accepted=True,
-            message="Round 0 OK" if len(all_keys) >= self.threshold else "Waiting for more participants",
+            message="SAP-Round 0 OK" if len(all_keys) >= self.threshold else "Waiting for more participants",
             all_keys=ack_keys if len(all_keys) >= self.threshold else [],
         )
 
     def Round1ShareKeys(self, request: secureagg_pb2.ShareKeysMessage, context) -> secureagg_pb2.ShareKeysAck:
-        """Collect encrypted secret shares (Round 1) and deliver mailbox."""
+        """Collect encrypted secret shares (SAP-Round 1) and deliver mailbox."""
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected shares from {node_id}: not a clique member")
@@ -182,11 +182,11 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             mailbox = self.aggregator.deliver_round1_ciphertexts(node_id)
             return secureagg_pb2.ShareKeysAck(
                 accepted=True,
-                message="Round 1 OK",
+                message="SAP-Round 1 OK",
                 mailbox=_encode_round1_ciphertexts(mailbox),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round1 processing failed for {node_id}: {exc}")
+            logger.warning(f"SAP-Round1 processing failed for {node_id}: {exc}")
             mailbox = self.aggregator.deliver_round1_ciphertexts(node_id)
             return secureagg_pb2.ShareKeysAck(
                 accepted=False,
@@ -195,7 +195,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             )
 
     def Round2MaskedInput(self, request: secureagg_pb2.MaskedInputMessage, context) -> secureagg_pb2.MaskedInputAck:
-        """Collect masked model updates (Round 2)."""
+        """Collect masked model updates (SAP-Round 2)."""
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected masked input from {node_id}: not a clique member")
@@ -211,15 +211,15 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             # Wait for ALL participants before returning survivors (not just threshold).
             if len(self.aggregator.masked_inputs) >= len(self.participant_ids):
                 survivors = self.aggregator.broadcast_survivors()
-                return secureagg_pb2.MaskedInputAck(accepted=True, message="Round 2 OK", survivors=survivors)
+                return secureagg_pb2.MaskedInputAck(accepted=True, message="SAP-Round 2 OK", survivors=survivors)
             return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for all participants", survivors=[])
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round2 processing failed for {node_id}: {exc}")
+            logger.warning(f"SAP-Round2 processing failed for {node_id}: {exc}")
             survivors = self.aggregator.survivors or []
             return secureagg_pb2.MaskedInputAck(accepted=False, message=str(exc), survivors=survivors)
 
     def Round3ConsistencyCheck(self, request: secureagg_pb2.ConsistencySignature, context) -> secureagg_pb2.ConsistencyAck:
-        """Collect consistency signatures (Round 3)."""
+        """Collect consistency signatures (SAP-Round 3)."""
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected signature from {node_id}: not a clique member")
@@ -230,14 +230,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             if len(self._round3_signatures) >= len(self.aggregator.survivors):
                 sigs = [SurvivorSignature(node_id=n, signature=s) for n, s in self._round3_signatures.items()]
                 self.aggregator.verify_survivor_signatures(sigs)
-                return secureagg_pb2.ConsistencyAck(accepted=True, message="Round 3 OK")
+                return secureagg_pb2.ConsistencyAck(accepted=True, message="SAP-Round 3 OK")
             return secureagg_pb2.ConsistencyAck(accepted=True, message="Waiting for more signatures")
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round3 processing failed for {node_id}: {exc}")
+            logger.warning(f"SAP-Round3 processing failed for {node_id}: {exc}")
             return secureagg_pb2.ConsistencyAck(accepted=False, message=str(exc))
 
     def Round4Unmask(self, request: secureagg_pb2.UnmaskShares, context) -> secureagg_pb2.UnmaskAck:
-        """Collect unmasking shares and compute aggregate (Round 4)."""
+        """Collect unmasking shares and compute aggregate (SAP-Round 4)."""
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected unmask shares from {node_id}: not a clique member")
@@ -268,7 +268,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 aggregation_complete=False,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round4 processing failed for {node_id}: {exc}")
+            logger.warning(f"SAP-Round4 processing failed for {node_id}: {exc}")
             return secureagg_pb2.UnmaskAck(accepted=False, message=str(exc), aggregation_complete=False)
 
     def GetGlobalModel(self, request: secureagg_pb2.ModelRequest, context) -> secureagg_pb2.ModelResponse:
