@@ -42,7 +42,6 @@
     "enabled": true,
     "tol_abs": 1e-05,
     "tol_rel": 0.001,
-    "patience": 3,
-    "max_rounds": 5
+    "patience": 3
   }
 }

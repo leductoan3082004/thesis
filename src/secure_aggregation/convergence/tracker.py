@@ -1,5 +1,6 @@
 """Convergence tracking for federated learning with global coordination."""
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
@@ -8,6 +9,53 @@ import numpy as np
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("convergence")
+CONVERGENCE_WARMUP_ENV_VAR = "CONVERGENCE_WARMUP_ROUNDS"
+DEFAULT_CONVERGENCE_WARMUP_ROUNDS = 5
+_ENV_INVALID_WARNING_EMITTED = False
+
+
+def _resolve_warmup_rounds(candidate: Optional[int]) -> int:
+    """
+    Resolve warmup rounds using the shared environment override if present.
+    """
+    global _ENV_INVALID_WARNING_EMITTED
+    env_value = os.getenv(CONVERGENCE_WARMUP_ENV_VAR)
+    if env_value is not None:
+        try:
+            parsed = int(env_value)
+            if parsed < 0:
+                raise ValueError
+            return parsed
+        except ValueError:
+            if not _ENV_INVALID_WARNING_EMITTED:
+                logger.warning(
+                    "Invalid %s=%s; falling back to default %d",
+                    CONVERGENCE_WARMUP_ENV_VAR,
+                    env_value,
+                    DEFAULT_CONVERGENCE_WARMUP_ROUNDS,
+                )
+                _ENV_INVALID_WARNING_EMITTED = True
+            return DEFAULT_CONVERGENCE_WARMUP_ROUNDS
+
+    if candidate is None:
+        return DEFAULT_CONVERGENCE_WARMUP_ROUNDS
+
+    try:
+        parsed = int(candidate)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid convergence warmup value=%s; falling back to %d",
+            candidate,
+            DEFAULT_CONVERGENCE_WARMUP_ROUNDS,
+        )
+        return DEFAULT_CONVERGENCE_WARMUP_ROUNDS
+    if parsed < 0:
+        logger.warning(
+            "Convergence warmup rounds must be non-negative; received %s",
+            candidate,
+        )
+        return 0
+    return parsed
 
 
 @dataclass
@@ -24,14 +72,15 @@ class ConvergenceSignal:
 class ConvergenceConfig:
     """Configuration for convergence-driven training.
 
-    Training continues until convergence is achieved. The `max_rounds` field now
-    represents the number of warmup rounds to run before convergence detection
-    (and signaling to bridge/central checker) begins. Set it to 0 to enable
-    convergence tracking immediately.
+    Training continues until convergence is achieved. The warmup duration is
+    controlled at the system level via the CONVERGENCE_WARMUP_ROUNDS
+    environment variable. It indicates how many warmup rounds to run before
+    convergence detection (and signaling to bridge/central checker) begins.
+    Set it to 0 to enable convergence tracking immediately.
     """
 
     enabled: bool = True
-    max_rounds: int = 0
+    convergence_warmup_rounds: int = DEFAULT_CONVERGENCE_WARMUP_ROUNDS
     tol_abs: float = 1e-5
     tol_rel: float = 0.001
     patience: int = 3
@@ -44,9 +93,10 @@ class ConvergenceConfig:
         """Create config from dictionary, using defaults for missing fields."""
         if data is None:
             return cls()
+        warmup_value = data.get("convergence_warmup_rounds", data.get("max_rounds"))
         return cls(
             enabled=data.get("enabled", True),
-            max_rounds=data.get("max_rounds", 0),
+            convergence_warmup_rounds=warmup_value,
             tol_abs=data.get("tol_abs", 1e-5),
             tol_rel=data.get("tol_rel", 0.001),
             patience=data.get("patience", 3),
@@ -54,6 +104,14 @@ class ConvergenceConfig:
             central_checker_id=data.get("central_checker_id"),
             signal_timeout=data.get("signal_timeout", 30.0),
         )
+
+    def __post_init__(self) -> None:
+        self.convergence_warmup_rounds = _resolve_warmup_rounds(self.convergence_warmup_rounds)
+
+    @property
+    def max_rounds(self) -> int:
+        """Backwards-compatible alias for the warmup value."""
+        return self.convergence_warmup_rounds
 
 
 @dataclass
@@ -104,7 +162,7 @@ class ConvergenceTracker:
         Returns:
             Updated convergence state with stop decision.
         """
-        warmup_rounds = max(0, self.config.max_rounds)
+        warmup_rounds = max(0, self.config.convergence_warmup_rounds)
         tracking_enabled = self.state.round_idx >= warmup_rounds
 
         if not self.config.enabled:

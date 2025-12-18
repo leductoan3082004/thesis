@@ -233,8 +233,8 @@ secure_aggregation/
 ## 🧪 Testing
 
 ```bash
-# Run all tests
-pytest tests/
+# Run all tests (ensure src/ is on PYTHONPATH)
+PYTHONPATH=src /usr/local/bin/python3 -m pytest tests/
 
 # Specific test suite
 pytest tests/test_protocol.py

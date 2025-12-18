@@ -122,6 +122,11 @@ For each round:
 - `batch_size`: 64
 - `threshold`: 3 (minimum nodes for secure aggregation)
 
+### Convergence Warmup (system-wide)
+- `CONVERGENCE_WARMUP_ROUNDS` controls how many rounds each node waits before emitting convergence signals (default `5` if unset).
+- Specify it in the repository root `.env` file (automatically loaded by Docker Compose) to apply the same warmup across all nodes, e.g. `CONVERGENCE_WARMUP_ROUNDS=3`.
+- This is distinct from `MAX_TRAINING_ROUNDS`, which caps the total number of federated rounds.
+
 ### Aggregator Rotation
 Automatic round-robin election:
 - Round 0 → node_0

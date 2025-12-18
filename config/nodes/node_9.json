@@ -41,7 +41,6 @@
   },
   "convergence": {
     "enabled": true,
-    "max_rounds": 5,
     "tol_abs": 1e-05,
     "tol_rel": 0.001,
     "patience": 3

@@ -1,17 +1,31 @@
 """Tests for convergence tracking logic."""
 
-import numpy as np
+import os
+
+import pytest
+
+np = pytest.importorskip("numpy")
 
 from secure_aggregation.convergence import ConvergenceConfig, ConvergenceState, ConvergenceTracker
+
+WARMUP_ENV = "CONVERGENCE_WARMUP_ROUNDS"
+
+
+def clear_warmup_env() -> None:
+    """Ensure environment override does not leak between tests."""
+    os.environ.pop(WARMUP_ENV, None)
 
 
 class TestConvergenceConfig:
     """Tests for ConvergenceConfig dataclass."""
 
+    def setup_method(self) -> None:
+        clear_warmup_env()
+
     def test_default_values(self) -> None:
         config = ConvergenceConfig()
         assert config.enabled is True
-        assert config.max_rounds == 999999999
+        assert config.convergence_warmup_rounds == 5
         assert config.tol_abs == 1e-5
         assert config.tol_rel == 0.001
         assert config.patience == 3
@@ -22,7 +36,7 @@ class TestConvergenceConfig:
     def test_from_dict_with_values(self) -> None:
         data = {
             "enabled": False,
-            "max_rounds": 50,
+            "convergence_warmup_rounds": 50,
             "tol_abs": 1e-6,
             "tol_rel": 0.01,
             "patience": 5,
@@ -32,7 +46,7 @@ class TestConvergenceConfig:
         }
         config = ConvergenceConfig.from_dict(data)
         assert config.enabled is False
-        assert config.max_rounds == 50
+        assert config.convergence_warmup_rounds == 50
         assert config.tol_abs == 1e-6
         assert config.tol_rel == 0.01
         assert config.patience == 5
@@ -43,17 +57,28 @@ class TestConvergenceConfig:
     def test_from_dict_with_none(self) -> None:
         config = ConvergenceConfig.from_dict(None)
         assert config.enabled is True
-        assert config.max_rounds == 999999999
+        assert config.convergence_warmup_rounds == 5
 
     def test_from_dict_with_partial_values(self) -> None:
-        data = {"max_rounds": 200}
+        data = {"convergence_warmup_rounds": 200}
         config = ConvergenceConfig.from_dict(data)
-        assert config.max_rounds == 200
+        assert config.convergence_warmup_rounds == 200
         assert config.tol_abs == 1e-5  # default
+
+    def test_env_override_takes_precedence(self) -> None:
+        os.environ[WARMUP_ENV] = "7"
+        config = ConvergenceConfig.from_dict({"max_rounds": 2})
+        assert config.max_rounds == 7
 
 
 class TestConvergenceTracker:
     """Tests for ConvergenceTracker class."""
+
+    def setup_method(self) -> None:
+        os.environ[WARMUP_ENV] = "0"
+
+    def teardown_method(self) -> None:
+        clear_warmup_env()
 
     def test_initial_state(self) -> None:
         config = ConvergenceConfig()
@@ -119,16 +144,16 @@ class TestConvergenceTracker:
         assert state.cluster_converged is False
 
     def test_max_rounds_stop(self) -> None:
-        config = ConvergenceConfig(max_rounds=3, tol_abs=1e-10)
+        config = ConvergenceConfig(convergence_warmup_rounds=3, tol_abs=1e-10)
         tracker = ConvergenceTracker(config, "cluster_0")
 
-        # Run until max rounds
+        # Run until warmup rounds have elapsed; tracker should not force-stop just
+        # because the warmup cap was reached.
         for i in range(4):
             model = np.array([float(i), float(i + 1), float(i + 2)])
             state = tracker.update(model)
 
-        assert state.should_stop is True
-        assert state.stop_reason == "max_rounds_reached"
+        assert state.should_stop is False
 
     def test_neighbor_convergence_required(self) -> None:
         config = ConvergenceConfig(

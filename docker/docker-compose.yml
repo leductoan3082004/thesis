@@ -1,5 +1,9 @@
 version: "3.9"
 
+x-node-env: &node-env
+  - PYTHONUNBUFFERED=1
+  - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
 services:
   node:
     build:
@@ -9,6 +13,8 @@ services:
     command: ["sleep", "infinity"]
     networks:
       - secureagg
+    env_file:
+      - ../.env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -138,9 +144,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -163,9 +169,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -188,9 +194,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -213,9 +219,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -238,9 +244,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -263,9 +269,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -288,9 +294,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -313,9 +319,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
