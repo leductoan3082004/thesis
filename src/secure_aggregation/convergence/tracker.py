@@ -136,12 +136,13 @@ class ConvergenceTracker:
         self.state = ConvergenceState()
         self._signal_sender = signal_sender
 
-    def update(self, current_model: np.ndarray) -> ConvergenceState:
+    def update(self, current_model: np.ndarray, *, track_diff: bool = True) -> ConvergenceState:
         """
         Update convergence state after receiving new global model.
 
         Args:
             current_model: The current round's global model (post-merge).
+            track_diff: When False, only prime the tracker state without computing deltas.
 
         Returns:
             Updated convergence state with stop decision.
@@ -151,9 +152,16 @@ class ConvergenceTracker:
 
         if not self.config.enabled:
             self.state.round_idx += 1
+            self.state.prev_model = current_model.copy()
             return self.state
 
-        if tracking_enabled and self.state.prev_model is not None:
+        if not track_diff:
+            self.state.prev_model = current_model.copy()
+            self.state.round_idx += 1
+            return self.state
+
+        local_converged = False
+        if self.state.prev_model is not None:
             delta = current_model - self.state.prev_model
             self.state.delta_norm = float(np.linalg.norm(delta))
             prev_norm = float(np.linalg.norm(self.state.prev_model))
@@ -164,39 +172,46 @@ class ConvergenceTracker:
                 or rel_delta <= self.config.tol_rel
             )
 
-            if local_converged:
-                self.state.convergence_streak += 1
-                logger.info(
-                    f"Round {self.state.round_idx}: delta={self.state.delta_norm:.2e}, "
-                    f"streak={self.state.convergence_streak}/{self.config.patience}"
-                )
-            else:
-                self.state.convergence_streak = 0
-                logger.info(
-                    f"Round {self.state.round_idx}: delta={self.state.delta_norm:.2e}, "
-                    f"streak reset (above tolerance)"
-                )
-
-            self.state.cluster_converged = (
-                self.state.convergence_streak >= self.config.patience
-            )
-
-            if self._central_mode_enabled():
-                self._report_convergence_status_to_central_checker(local_converged)
-            elif self.state.cluster_converged:
-                neighbors_converged = self._check_neighbors_converged()
-
-                if neighbors_converged:
-                    self.state.should_stop = True
-                    self.state.stop_reason = "global_convergence"
+            if tracking_enabled:
+                if local_converged:
+                    self.state.convergence_streak += 1
                     logger.info(
-                        f"Global convergence achieved at round {self.state.round_idx}"
+                        f"Round {self.state.round_idx}: delta={self.state.delta_norm:.2e}, "
+                        f"streak={self.state.convergence_streak}/{self.config.patience}"
                     )
                 else:
+                    self.state.convergence_streak = 0
                     logger.info(
-                        f"Cluster converged but waiting for neighbors: "
-                        f"{self.state.neighbor_convergence}"
+                        f"Round {self.state.round_idx}: delta={self.state.delta_norm:.2e}, "
+                        f"streak reset (above tolerance)"
                     )
+
+                self.state.cluster_converged = (
+                    self.state.convergence_streak >= self.config.patience
+                )
+
+                if self._central_mode_enabled():
+                    self._report_convergence_status_to_central_checker(local_converged)
+                elif self.state.cluster_converged:
+                    neighbors_converged = self._check_neighbors_converged()
+
+                    if neighbors_converged:
+                        self.state.should_stop = True
+                        self.state.stop_reason = "global_convergence"
+                        logger.info(
+                            f"Global convergence achieved at round {self.state.round_idx}"
+                        )
+                    else:
+                        logger.info(
+                            f"Cluster converged but waiting for neighbors: "
+                            f"{self.state.neighbor_convergence}"
+                        )
+            else:
+                rounds_remaining = max(0, warmup_rounds - self.state.round_idx)
+                logger.info(
+                    f"Round {self.state.round_idx}: delta={self.state.delta_norm:.2e}, "
+                    f"warmup in progress ({rounds_remaining} rounds remaining)"
+                )
         elif tracking_enabled:
             if self._central_mode_enabled():
                 self._report_convergence_status_to_central_checker(False)

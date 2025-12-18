@@ -90,6 +90,10 @@ class GlobalStopRequested(Exception):
     """Raised when global convergence has been confirmed and execution should halt."""
 
 
+class AggregatorUnavailable(Exception):
+    """Raised when the elected aggregator cannot be reached after repeated attempts."""
+
+
 class NodeService:
     """Node service that coordinates training and secure aggregation."""
 
@@ -194,6 +198,74 @@ class NodeService:
             )
             return ConvergenceConfig.from_dict(node_convergence)
         return ConvergenceConfig()
+
+    def _prime_convergence_tracker_state(self) -> None:
+        """Advance convergence tracker state without computing deltas."""
+        if not self.convergence_tracker or not self.convergence_config.enabled:
+            return
+        if self.model is None:
+            return
+        flat_params = np.array(flatten_params(self.model), dtype=np.float32)
+        self.convergence_tracker.update(flat_params, track_diff=False)
+
+    def _maybe_check_convergence_during_retry(
+        self,
+        attempt_idx: int,
+        max_attempts: int,
+        stage: str,
+        first_check: int = 40,
+        interval: int = 5,
+    ) -> None:
+        """
+        Periodically poll for convergence while retrying aggregator RPCs.
+
+        Args:
+            attempt_idx: Current attempt number (1-based).
+            max_attempts: Total attempts allowed.
+            stage: Human-readable stage description.
+            first_check: Attempt number to trigger the first convergence check.
+            interval: Attempt interval for subsequent checks.
+        """
+        if attempt_idx < first_check:
+            return
+        if attempt_idx == first_check or ((attempt_idx - first_check) % interval == 0):
+            logger.info(
+                "Aggregator %s unavailable at stage %s (attempt %d/%d); re-checking convergence state",
+                self.aggregator_id,
+                stage,
+                attempt_idx,
+                max_attempts,
+            )
+            should_stop, stop_reason = self._refresh_convergence_state(False, "")
+            if should_stop:
+                logger.info(
+                    "Halting retries because convergence was confirmed while waiting "
+                    "(reason=%s)",
+                    stop_reason,
+                )
+                raise GlobalStopRequested()
+
+    def _raise_aggregator_unavailable(
+        self,
+        stage: str,
+        attempts: int,
+        last_error: Optional[Exception],
+    ) -> None:
+        """
+        Raise AggregatorUnavailable with a detailed message.
+        """
+        reason = ""
+        if isinstance(last_error, grpc.RpcError):
+            code = last_error.code().name if hasattr(last_error, "code") else "UNKNOWN"
+            details = last_error.details() if hasattr(last_error, "details") else ""
+            reason = f" (last_error={code} {details})"
+        elif last_error:
+            reason = f" (last_error={last_error})"
+        message = (
+            f"Aggregator {self.aggregator_id} unreachable during {stage} after "
+            f"{attempts} attempts{reason}"
+        )
+        raise AggregatorUnavailable(message)
 
     def _hydrate_anchor_bootstrap(self) -> None:
         """Persist bootstrap anchor references once blockchain client is ready."""
@@ -860,6 +932,7 @@ class NodeService:
             retry_delay = 2
             max_retries = 75
         response = None
+        last_rpc_error: Optional[grpc.RpcError] = None
         for attempt in range(max_retries):
             self._abort_if_global_stop()
             try:
@@ -874,6 +947,7 @@ class NodeService:
                 )
                 break
             except grpc.RpcError as e:
+                last_rpc_error = e
                 if attempt < max_retries - 1:
                     if attempt < 5 or (attempt + 1) % 5 == 0:
                         logger.warning(
@@ -885,13 +959,19 @@ class NodeService:
                             e.code().name if hasattr(e, "code") else "unknown",
                             retry_delay,
                         )
+                    attempt_idx = attempt + 1
+                    self._maybe_check_convergence_during_retry(
+                        attempt_idx, max_retries, "Round0AdvertiseKeys"
+                    )
                     time.sleep(retry_delay)
                     self._abort_if_global_stop()
                 else:
-                    raise
+                    break
 
         if response is None:
-            raise RuntimeError("Failed to connect to aggregator")
+            self._raise_aggregator_unavailable(
+                "Round0AdvertiseKeys", max_retries, last_rpc_error
+            )
 
         if not response.accepted:
             raise RuntimeError(f"Round 0 failed: {response.message}")
@@ -1298,10 +1378,20 @@ class NodeService:
                                         "sharing ECM reference anyway"
                                     )
 
+                    # Prime tracker state so future aggregator rounds have accurate baseline.
+                    if not self.is_aggregator:
+                        self._prime_convergence_tracker_state()
+
                 acc_after = self.evaluate()
                 logger.info(f"Accuracy after aggregation: {acc_after:.4f}")
                 logger.info(f"Improvement: {acc_after - acc_before:+.4f}")
 
+            except AggregatorUnavailable as exc:
+                round_failed = True
+                logger.warning(
+                    "%s. Will retry after backoff unless convergence is confirmed.",
+                    exc,
+                )
             except Exception as e:
                 round_failed = True
                 logger.error("Secure aggregation failed: %s", e, exc_info=True)

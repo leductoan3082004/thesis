@@ -93,6 +93,36 @@ class TestConvergenceTracker:
         assert state.should_stop is False
         assert state.round_idx == 1
 
+    def test_delta_tracked_during_warmup(self) -> None:
+        config = self._config(warmup_rounds=3)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        model1 = np.array([0.0, 1.0])
+        tracker.update(model1)
+
+        model2 = np.array([1.0, 1.0])
+        state = tracker.update(model2)
+
+        assert state.round_idx == 2
+        assert state.delta_norm == pytest.approx(1.0)
+        assert state.convergence_streak == 0
+        assert state.cluster_converged is False
+
+    def test_prime_state_without_tracking(self) -> None:
+        config = self._config(tol_abs=0.1, patience=1)
+        tracker = ConvergenceTracker(config, "cluster_0")
+
+        model1 = np.array([1.0, 1.0])
+        state = tracker.update(model1, track_diff=False)
+        assert state.round_idx == 1
+        assert state.convergence_streak == 0
+
+        model2 = np.array([1.0, 1.00001])
+        state = tracker.update(model2)
+        assert state.round_idx == 2
+        assert state.delta_norm == pytest.approx(1e-5, rel=0.01)
+        assert state.convergence_streak == 1
+
     def test_convergence_detection_with_stable_model(self) -> None:
         config = self._config(tol_abs=0.1, patience=2)
         tracker = ConvergenceTracker(config, "cluster_0")
