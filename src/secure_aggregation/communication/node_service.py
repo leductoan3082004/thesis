@@ -1211,7 +1211,7 @@ class NodeService:
                 self._check_global_convergence_signal()
                 break
 
-            logger.info(f"Round {round_idx} complete. Waiting before next round...")
+            logger.info(f"Training Round {round_idx} complete. Waiting before next round...")
             time.sleep(5)
             self.current_round += 1
 

@@ -335,9 +335,9 @@ class KuboIPFS(IPFSInterface):
     def __init__(
         self,
         api_url: str = "http://localhost:5001",
-        timeout: float = 30.0,
+        timeout: float = 5.0,
         max_retries: int = 5,
-        retry_delay: float = 1.0,
+        retry_delay: float = 2.0,
     ) -> None:
         """
         Initialize Kubo IPFS client.
