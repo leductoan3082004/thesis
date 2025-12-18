@@ -90,7 +90,15 @@ class InterClusterAggregator:
         merged_cids: List[str] = []
 
         for cid, expected_hash in selected_ecms.items():
-            model = self.ipfs.get(cid)
+            model = None
+            try:
+                model = self.ipfs.get(cid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to fetch model with CID %s: %s",
+                    cid[:8],
+                    exc,
+                )
             if model is None:
                 logger.warning(f"Failed to fetch model with CID {cid[:8]}...")
                 continue

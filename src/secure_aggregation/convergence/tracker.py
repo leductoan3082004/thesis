@@ -24,12 +24,14 @@ class ConvergenceSignal:
 class ConvergenceConfig:
     """Configuration for convergence-driven training.
 
-    Training continues until convergence is achieved. The max_rounds field
-    serves only as a safety cap and should not be used to control training duration.
+    Training continues until convergence is achieved. The `max_rounds` field now
+    represents the number of warmup rounds to run before convergence detection
+    (and signaling to bridge/central checker) begins. Set it to 0 to enable
+    convergence tracking immediately.
     """
 
     enabled: bool = True
-    max_rounds: int = 999999999
+    max_rounds: int = 0
     tol_abs: float = 1e-5
     tol_rel: float = 0.001
     patience: int = 3
@@ -44,7 +46,7 @@ class ConvergenceConfig:
             return cls()
         return cls(
             enabled=data.get("enabled", True),
-            max_rounds=data.get("max_rounds", 999999999),
+            max_rounds=data.get("max_rounds", 0),
             tol_abs=data.get("tol_abs", 1e-5),
             tol_rel=data.get("tol_rel", 0.001),
             patience=data.get("patience", 3),
@@ -102,11 +104,14 @@ class ConvergenceTracker:
         Returns:
             Updated convergence state with stop decision.
         """
+        warmup_rounds = max(0, self.config.max_rounds)
+        tracking_enabled = self.state.round_idx >= warmup_rounds
+
         if not self.config.enabled:
             self.state.round_idx += 1
             return self.state
 
-        if self.state.prev_model is not None:
+        if tracking_enabled and self.state.prev_model is not None:
             delta = current_model - self.state.prev_model
             self.state.delta_norm = float(np.linalg.norm(delta))
             prev_norm = float(np.linalg.norm(self.state.prev_model))
@@ -150,7 +155,7 @@ class ConvergenceTracker:
                         f"Cluster converged but waiting for neighbors: "
                         f"{self.state.neighbor_convergence}"
                     )
-        else:
+        elif tracking_enabled:
             if self._central_mode_enabled():
                 self._report_convergence_status_to_central_checker(False)
 
@@ -164,11 +169,6 @@ class ConvergenceTracker:
         ):
             self.state.should_stop = True
             self.state.stop_reason = "global_convergence"
-
-        if self.state.round_idx >= self.config.max_rounds:
-            self.state.should_stop = True
-            self.state.stop_reason = "max_rounds_reached"
-            logger.info(f"Max rounds ({self.config.max_rounds}) reached, stopping")
 
         return self.state
 

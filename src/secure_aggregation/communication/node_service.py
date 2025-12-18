@@ -100,6 +100,20 @@ class NodeService:
         self.secagg_config = self.config["secure_agg"]
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
+        env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
+        default_round_cap = 50
+        if env_rounds:
+            try:
+                self.max_training_rounds = max(1, int(env_rounds))
+            except ValueError:
+                logger.warning(
+                    "Invalid MAX_TRAINING_ROUNDS=%s; falling back to default %d",
+                    env_rounds,
+                    default_round_cap,
+                )
+                self.max_training_rounds = default_round_cap
+        else:
+            self.max_training_rounds = default_round_cap
 
         # State
         self.signing_keypair: Optional[SigningKeyPair] = None
@@ -977,7 +991,8 @@ class NodeService:
         2. Maximum rounds limit is reached (safety cap)
         """
         local_epochs = self.training_config["local_epochs"]
-        max_rounds = self.convergence_config.max_rounds
+        max_rounds = self.max_training_rounds
+        convergence_warmup = max(0, self.convergence_config.max_rounds)
 
         # Initialize convergence tracker
         self.convergence_tracker = ConvergenceTracker(
@@ -988,6 +1003,7 @@ class NodeService:
 
         logger.info(
             f"Starting convergence-driven training (max_rounds={max_rounds}, "
+            f"convergence_warmup={convergence_warmup}, "
             f"tol_abs={self.convergence_config.tol_abs}, patience={self.convergence_config.patience})"
         )
 
@@ -1162,7 +1178,15 @@ class NodeService:
                                 logger.info(
                                     f"Fetching merged model from IPFS fallback: {model_response.model_cid[:16]}..."
                                 )
-                                merged_from_ipfs = self.ipfs.get(model_response.model_cid)
+                                try:
+                                    merged_from_ipfs = self.ipfs.get(model_response.model_cid)
+                                except Exception as ipfs_err:  # noqa: BLE001
+                                    merged_from_ipfs = None
+                                    logger.warning(
+                                        "IPFS fallback fetch failed for cid=%s: %s",
+                                        model_response.model_cid[:16],
+                                        ipfs_err,
+                                    )
                                 if merged_from_ipfs is not None:
                                     load_params(self.model, merged_from_ipfs.tolist())
                                     if self.is_bridge_node:
@@ -1180,7 +1204,7 @@ class NodeService:
 
             except Exception as e:
                 round_failed = True
-                logger.error(f"Secure aggregation failed: {e}", exc_info=True)
+                logger.error("Secure aggregation failed: %s", e, exc_info=True)
 
             finally:
                 if self.is_aggregator:
