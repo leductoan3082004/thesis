@@ -2,28 +2,36 @@
   "num_cliques": 2,
   "cliques": [
     [
-      "node_0",
-      "node_1",
-      "node_3"
-    ],
-    [
       "node_2",
       "node_4",
-      "node_5"
+      "node_5",
+      "node_6"
+    ],
+    [
+      "node_0",
+      "node_1",
+      "node_3",
+      "node_7"
     ]
   ],
   "inter_edges": [
     [
-      "node_0",
-      "node_2"
+      "node_2",
+      "node_0"
+    ],
+    [
+      "node_4",
+      "node_1"
     ]
   ],
   "edge_counts": {
-    "node_0": 3,
-    "node_3": 2,
-    "node_1": 2,
-    "node_5": 2,
-    "node_2": 3,
-    "node_4": 2
+    "node_6": 3,
+    "node_5": 3,
+    "node_4": 4,
+    "node_2": 4,
+    "node_0": 4,
+    "node_1": 4,
+    "node_3": 3,
+    "node_7": 3
   }
 }

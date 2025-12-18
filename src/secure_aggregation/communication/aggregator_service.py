@@ -2,7 +2,7 @@
 
 import logging
 from concurrent import futures
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import grpc
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
@@ -72,6 +72,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         participant_ids: List[str],
         signing_public_keys: Optional[Mapping[str, bytes]] = None,
         ecm_buffer: Optional[ECMBuffer] = None,
+        convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         self.node_id = node_id
         self.threshold = threshold
@@ -91,19 +92,26 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         # Convergence state for global coordination
         self.merged_model_cid: Optional[str] = None
         self.merged_model_hash: Optional[str] = None
+        self.merged_model_data_id: Optional[str] = None
         self.should_stop: bool = False
         self.stop_reason: str = ""
         self.delta_norm: float = 0.0
         self.cluster_converged: bool = False
+        self._convergence_signal_handler = convergence_signal_handler
 
         logger.info(
             f"Aggregator {node_id} initialized with threshold={threshold}, participants={len(participant_ids)}"
         )
 
+    def set_convergence_signal_handler(self, handler: Callable[[str, int], None]) -> None:
+        """Register callback that receives convergence data_id notifications."""
+        self._convergence_signal_handler = handler
+
     def set_convergence_state(
         self,
         model_cid: Optional[str],
         model_hash: Optional[str],
+        model_data_id: Optional[str],
         should_stop: bool,
         stop_reason: str,
         delta_norm: float,
@@ -112,6 +120,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         """Store IPFS reference and convergence info for distribution to all nodes."""
         self.merged_model_cid = model_cid
         self.merged_model_hash = model_hash
+        self.merged_model_data_id = model_data_id
         self.should_stop = should_stop
         self.stop_reason = stop_reason
         self.delta_norm = delta_norm
@@ -121,7 +130,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         return node_id in self.participant_ids
 
     def Round0AdvertiseKeys(self, request: secureagg_pb2.KeyAdvertisement, context) -> secureagg_pb2.KeyAdvertisementAck:
-        """Collect DH public keys from participants (Round 0)."""
+        """Collect DH public keys from participants (SAP-Round 0)."""
         node_id = request.node_id
 
         if not self._validate_participant(node_id):
@@ -146,7 +155,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 # Add late adverts after initial commit.
                 self.aggregator.receive_advertisements([advert])
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round0 advert rejected from {node_id}: {exc}")
+            logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
             return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
 
         # Once we have threshold, return full list.
@@ -162,12 +171,12 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         ]
         return secureagg_pb2.KeyAdvertisementAck(
             accepted=True,
-            message="Round 0 OK" if len(all_keys) >= self.threshold else "Waiting for more participants",
+            message="SAP-Round 0 OK" if len(all_keys) >= self.threshold else "Waiting for more participants",
             all_keys=ack_keys if len(all_keys) >= self.threshold else [],
         )
 
     def Round1ShareKeys(self, request: secureagg_pb2.ShareKeysMessage, context) -> secureagg_pb2.ShareKeysAck:
-        """Collect encrypted secret shares (Round 1) and deliver mailbox."""
+        """Collect encrypted secret shares (SAP-Round 1) and deliver mailbox."""
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected shares from {node_id}: not a clique member")
@@ -179,11 +188,11 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             mailbox = self.aggregator.deliver_round1_ciphertexts(node_id)
             return secureagg_pb2.ShareKeysAck(
                 accepted=True,
-                message="Round 1 OK",
+                message="SAP-Round 1 OK",
                 mailbox=_encode_round1_ciphertexts(mailbox),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round1 processing failed for {node_id}: {exc}")
+            logger.warning(f"SAP-Round1 processing failed for {node_id}: {exc}")
             mailbox = self.aggregator.deliver_round1_ciphertexts(node_id)
             return secureagg_pb2.ShareKeysAck(
                 accepted=False,
@@ -192,7 +201,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             )
 
     def Round2MaskedInput(self, request: secureagg_pb2.MaskedInputMessage, context) -> secureagg_pb2.MaskedInputAck:
-        """Collect masked model updates (Round 2)."""
+        """Collect masked model updates (SAP-Round 2)."""
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected masked input from {node_id}: not a clique member")
@@ -208,15 +217,15 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             # Wait for ALL participants before returning survivors (not just threshold).
             if len(self.aggregator.masked_inputs) >= len(self.participant_ids):
                 survivors = self.aggregator.broadcast_survivors()
-                return secureagg_pb2.MaskedInputAck(accepted=True, message="Round 2 OK", survivors=survivors)
+                return secureagg_pb2.MaskedInputAck(accepted=True, message="SAP-Round 2 OK", survivors=survivors)
             return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for all participants", survivors=[])
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round2 processing failed for {node_id}: {exc}")
+            logger.warning(f"SAP-Round2 processing failed for {node_id}: {exc}")
             survivors = self.aggregator.survivors or []
             return secureagg_pb2.MaskedInputAck(accepted=False, message=str(exc), survivors=survivors)
 
     def Round3ConsistencyCheck(self, request: secureagg_pb2.ConsistencySignature, context) -> secureagg_pb2.ConsistencyAck:
-        """Collect consistency signatures (Round 3)."""
+        """Collect consistency signatures (SAP-Round 3)."""
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected signature from {node_id}: not a clique member")
@@ -227,14 +236,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             if len(self._round3_signatures) >= len(self.aggregator.survivors):
                 sigs = [SurvivorSignature(node_id=n, signature=s) for n, s in self._round3_signatures.items()]
                 self.aggregator.verify_survivor_signatures(sigs)
-                return secureagg_pb2.ConsistencyAck(accepted=True, message="Round 3 OK")
+                return secureagg_pb2.ConsistencyAck(accepted=True, message="SAP-Round 3 OK")
             return secureagg_pb2.ConsistencyAck(accepted=True, message="Waiting for more signatures")
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round3 processing failed for {node_id}: {exc}")
+            logger.warning(f"SAP-Round3 processing failed for {node_id}: {exc}")
             return secureagg_pb2.ConsistencyAck(accepted=False, message=str(exc))
 
     def Round4Unmask(self, request: secureagg_pb2.UnmaskShares, context) -> secureagg_pb2.UnmaskAck:
-        """Collect unmasking shares and compute aggregate (Round 4)."""
+        """Collect unmasking shares and compute aggregate (SAP-Round 4)."""
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected unmask shares from {node_id}: not a clique member")
@@ -265,7 +274,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 aggregation_complete=False,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Round4 processing failed for {node_id}: {exc}")
+            logger.warning(f"SAP-Round4 processing failed for {node_id}: {exc}")
             return secureagg_pb2.UnmaskAck(accepted=False, message=str(exc), aggregation_complete=False)
 
     def GetGlobalModel(self, request: secureagg_pb2.ModelRequest, context) -> secureagg_pb2.ModelResponse:
@@ -303,6 +312,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             cluster_converged=self.cluster_converged,
             model_cid=self.merged_model_cid or "",
             model_hash=self.merged_model_hash or "",
+            model_data_id=self.merged_model_data_id or "",
         )
 
     def SubmitECMs(
@@ -335,10 +345,46 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         logger.info(
             f"Aggregator received {received_count} ECMs from bridge node {request.node_id}"
         )
+        if self.ecm_buffer:
+            unique_ecms = self.ecm_buffer.get_unique_cids()
+            if unique_ecms:
+                formatted = ", ".join(
+                    f"{cid[:8]}...:{hash_val[:8]}..."
+                    for cid, hash_val in unique_ecms.items()
+                )
+                logger.info(
+                    "Aggregator ECM buffer now has %d unique models: %s",
+                    len(unique_ecms),
+                    formatted,
+                )
+            else:
+                logger.info("Aggregator ECM buffer is empty after update")
         return secureagg_pb2.ECMSubmitResponse(
             accepted=True,
             message=f"Received {received_count} ECMs",
         )
+
+    def NotifyConvergenceSignal(
+        self,
+        request: secureagg_pb2.ConvergenceSignal,
+        context,
+    ) -> secureagg_pb2.ConvergenceAck:
+        """Allow clique members to push convergence confirmations to the aggregator."""
+        if not request.data_id:
+            return secureagg_pb2.ConvergenceAck(accepted=False, message="Missing data_id")
+        if self._convergence_signal_handler is None:
+            logger.debug(
+                "Aggregator %s received convergence data_id=%s but no handler configured",
+                self.node_id,
+                request.data_id,
+            )
+            return secureagg_pb2.ConvergenceAck(accepted=False, message="No handler configured")
+        try:
+            self._convergence_signal_handler(request.data_id, request.round)
+            return secureagg_pb2.ConvergenceAck(accepted=True, message="Convergence acknowledged")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Convergence signal handler failed for data_id=%s: %s", request.data_id, exc)
+            return secureagg_pb2.ConvergenceAck(accepted=False, message=str(exc))
 
     def reset_for_next_round(self) -> None:
         """Reset state for next aggregation round."""
@@ -349,6 +395,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.aggregated_result = None
         self.merged_model_cid = None
         self.merged_model_hash = None
+        self.merged_model_data_id = None
         self._adverts.clear()
         self._adverts_committed = False
         self._round3_signatures.clear()
@@ -364,6 +411,7 @@ def serve(
     participant_ids: List[str],
     signing_public_keys: Optional[Mapping[str, bytes]] = None,
     ecm_buffer: Optional[ECMBuffer] = None,
+    convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
 ) -> Tuple[grpc.Server, AggregatorServicer]:
     """Start the aggregator gRPC server.
 
@@ -376,6 +424,7 @@ def serve(
         participant_ids,
         signing_public_keys=signing_public_keys,
         ecm_buffer=ecm_buffer,
+        convergence_signal_handler=convergence_signal_handler,
     )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     secureagg_pb2_grpc.add_AggregatorServiceServicer_to_server(servicer, server)

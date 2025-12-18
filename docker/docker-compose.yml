@@ -1,6 +1,26 @@
 version: "3.9"
 
+x-node-env: &node-env
+  - PYTHONUNBUFFERED=1
+  - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
 services:
+  node:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node
+    command: ["sleep", "infinity"]
+    networks:
+      - secureagg
+    env_file:
+      - ../.env
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+
   ipfs-node-1:
     image: ipfs/kubo:v0.29.0
     container_name: ipfs-node-1
@@ -8,9 +28,11 @@ services:
     hostname: ipfs-node-1
     environment:
       NODE_NAME: "ipfs-node-1"
-      BOOTSTRAP_PEERS: "/dns4/ipfs-node-2/tcp/4001/p2p/12D3KooWFU4goqVKyhYVCZRkqkddD4CbtnN2r93r6JzHKj3iuX6r,/dns4/ipfs-node-3/tcp/4001/p2p/12D3KooWGENvSuyVENrUwZudh2eTWz2Ca6g47BrtTkhC8hG6CE1A"
+      IPFS_CLUSTER_NODES: "ipfs-node-1,ipfs-node-2,ipfs-node-3"
+      PEER_REGISTRY: "/peers"
     volumes:
       - ../data/ipfs/node-1:/data/ipfs
+      - ../data/ipfs/peers:/peers
       - ./ipfs-bootstrap.sh:/container-bootstrap.sh
     networks:
       - secureagg
@@ -28,9 +50,11 @@ services:
     hostname: ipfs-node-2
     environment:
       NODE_NAME: "ipfs-node-2"
-      BOOTSTRAP_PEERS: "/dns4/ipfs-node-1/tcp/4001/p2p/12D3KooWEAqEVyD1KCpUA5g64sobt36bSECKmYk6hfTG7xcMQ4dt,/dns4/ipfs-node-3/tcp/4001/p2p/12D3KooWGENvSuyVENrUwZudh2eTWz2Ca6g47BrtTkhC8hG6CE1A"
+      IPFS_CLUSTER_NODES: "ipfs-node-1,ipfs-node-2,ipfs-node-3"
+      PEER_REGISTRY: "/peers"
     volumes:
       - ../data/ipfs/node-2:/data/ipfs
+      - ../data/ipfs/peers:/peers
       - ./ipfs-bootstrap.sh:/container-bootstrap.sh
     networks:
       - secureagg
@@ -43,9 +67,11 @@ services:
     hostname: ipfs-node-3
     environment:
       NODE_NAME: "ipfs-node-3"
-      BOOTSTRAP_PEERS: "/dns4/ipfs-node-1/tcp/4001/p2p/12D3KooWEAqEVyD1KCpUA5g64sobt36bSECKmYk6hfTG7xcMQ4dt,/dns4/ipfs-node-2/tcp/4001/p2p/12D3KooWFU4goqVKyhYVCZRkqkddD4CbtnN2r93r6JzHKj3iuX6r"
+      IPFS_CLUSTER_NODES: "ipfs-node-1,ipfs-node-2,ipfs-node-3"
+      PEER_REGISTRY: "/peers"
     volumes:
       - ../data/ipfs/node-3:/data/ipfs
+      - ../data/ipfs/peers:/peers
       - ./ipfs-bootstrap.sh:/container-bootstrap.sh
     networks:
       - secureagg
@@ -86,6 +112,12 @@ services:
       - CLIQUE_SIZE=4
       - ALPHA=0.5
       - SEED=42
+      - CENTRAL_METADATA_GATEWAY_URL=http://host.docker.internal:9000
+      - CENTRAL_METADATA_IDENTITY=trainer-node-001
+      - CENTRAL_METADATA_PRIVATE_KEY=config/keys/trainer-node-001_sk.pem
+      - CENTRAL_METADATA_STATE_PATH=/app/data/central_metadata_state.json
+      - CENTRAL_METADATA_JWT_ROLE=trainer
+      - CENTRAL_METADATA_JWT_STATE=system
     volumes:
       - ../data:/app/data
       - ../logs:/app/logs
@@ -108,13 +140,13 @@ services:
     depends_on:
       ttp:
         condition: service_healthy
-      ipfs-node-1:
+      ipfs-node-3:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -137,9 +169,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -162,9 +194,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -187,9 +219,9 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -208,13 +240,13 @@ services:
     depends_on:
       ttp:
         condition: service_healthy
-      ipfs-node-1:
+      ipfs-node-2:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -233,13 +265,13 @@ services:
     depends_on:
       ttp:
         condition: service_healthy
-      ipfs-node-1:
+      ipfs-node-2:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -258,13 +290,13 @@ services:
     depends_on:
       ttp:
         condition: service_healthy
-      ipfs-node-1:
+      ipfs-node-2:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -283,13 +315,13 @@ services:
     depends_on:
       ttp:
         condition: service_healthy
-      ipfs-node-1:
+      ipfs-node-3:
         condition: service_healthy
       registry:
         condition: service_healthy
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    env_file:
+      - ../.env
+    environment: *node-env
     volumes:
       - ../config:/app/config
       - ../data:/app/data

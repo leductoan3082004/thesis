@@ -23,6 +23,8 @@ message RegisterResponse {
   repeated string clique_members = 6;
   int32 clique_threshold = 7;
   repeated int32 data_indices = 8;  // Assigned data indices for this node
+  string central_metadata_data_id = 9;
+  int32 central_metadata_version = 10;
 }
 
 message ParticipantsRequest {}
@@ -47,6 +49,8 @@ service AggregatorService {
   rpc GetGlobalModel(ModelRequest) returns (ModelResponse);
   // Bridge nodes forward ECMs to aggregator for inter-cluster merge
   rpc SubmitECMs(ECMSubmitRequest) returns (ECMSubmitResponse);
+  // Clique members can notify the aggregator when convergence is confirmed.
+  rpc NotifyConvergenceSignal(ConvergenceSignal) returns (ConvergenceAck);
 }
 
 // Round 0: Advertise DH public keys
@@ -137,6 +141,7 @@ message ModelResponse {
   // IPFS reference for merged model (nodes fetch from IPFS if set)
   string model_cid = 8;
   string model_hash = 9;
+  string model_data_id = 10;
 }
 
 // Inter-cluster ECM (External Cluster Model) messages
@@ -164,6 +169,17 @@ message ECMBroadcast {
   // Convergence status for cross-cluster coordination
   bool cluster_converged = 5;
   float cluster_delta_norm = 6;
+  string convergence_data_id = 7;
+}
+
+message ConvergenceSignal {
+  string data_id = 1;
+  int32 round = 2;
+}
+
+message ConvergenceAck {
+  bool accepted = 1;
+  string message = 2;
 }
 
 // Bridge node service for inter-cluster ECM gossip

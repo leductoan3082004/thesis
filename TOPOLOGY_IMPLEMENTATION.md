@@ -56,9 +56,11 @@ This document is the **single source of truth** for the D-Cliques topology syste
   "clique_size": 10,
   "alpha": 0.5,
   "seed": 42,
-  "inter_clique_edges": "small_world",
+  "inter_clique_edges": "ring_star",
   "topology_iterations": 1000,
-  "small_world_c": 2
+  "small_world_c": 2,
+  "max_neighbors": null,
+  "ring_star_extra": 0
 }
 ```
 
@@ -68,9 +70,11 @@ This document is the **single source of truth** for the D-Cliques topology syste
 | `clique_size` | int | Maximum nodes per clique |
 | `alpha` | float | Dirichlet parameter (lower = more non-IID) |
 | `seed` | int | Random seed for reproducibility |
-| `inter_clique_edges` | string | Edge mode: "ring", "small_world", "fractal", "fully_connected" |
+| `inter_clique_edges` | string | Edge mode: "ring", "ring_star" (default), "small_world", "fractal", "fully_connected" |
 | `topology_iterations` | int | Greedy swap iterations for clique optimization |
 | `small_world_c` | int | Number of power-of-2 offsets for small-world mode |
+| `max_neighbors` | int/null | Optional cap on neighbor models merged per round (per aggregator) |
+| `ring_star_extra` | int | Additional random edges per clique when using ring_star |
 
 ### Derived Values
 
@@ -130,6 +134,7 @@ cliques, intra_edges, inter_edges, edge_counts = build_full_topology(
     iterations=1000,
     edge_mode="small_world",
     small_world_c=2,
+    ring_star_extra=0,
     seed=42
 )
 ```
@@ -182,13 +187,13 @@ Output: List of cliques with minimized label skew
 
 ### Phase 3: Inter-Clique Edge Assignment
 
-**Clique-level edges** (small-world):
-```
-For k = 0, 1, 2, ..., small_world_c-1:
-    offset = 2^k
-    For each clique i:
-        Connect clique i to clique (i + offset) mod L
-```
+**Clique-level edges**:
+
+- `ring_star` (default): ensure ring connectivity, then select the largest clique (ties → lowest index) as the central hub and connect it to every other clique, forming a star overlay on the ring. Each designated hub node is wired directly to every outer clique so all data paths are one hop.
+- `ring_star_extra`: optional integer (`ring_star_extra`) adds that many additional pseudo-random edges per clique (beyond the ring + star). This densifies the overlay so the hub nodes can maintain high degree without starving other cliques of redundancy.
+- `RING_STAR_NUMBER_OF_CENTRAL_NODES` (env var, default `2`): controls how many hub members become “central” bridge nodes. These nodes handle inter-clique edges for the ring-star hub.
+- `small_world`: after the base ring, add offsets `2^k` for `k = 0..small_world_c-1`, connecting clique `i` to `(i + offset) mod L`.
+- Other modes keep the existing behavior: `ring` (ring only), `fractal` (ring + stride jump), `fully_connected` (clique-complete graph).
 
 **Node-level edges** (load-balanced):
 ```
@@ -198,6 +203,8 @@ For each clique-edge (C_a, C_b):
     Create edge (best_a, best_b)
     Increment edge counts
 ```
+
+For `ring_star`, the node-level assignment guarantees at least **RING_STAR_NUMBER_OF_CENTRAL_NODES** high-connectivity bridge nodes inside the central clique (or all members if the clique is smaller). Edges touching the hub always pick from that set, and the algorithm adds direct edges so each hub node connects to every outer clique, keeping paths to the central checker to a single hop. Extra random edges reuse the same nodes but never require multi-hop routing.
 
 ### Key Formulas
 

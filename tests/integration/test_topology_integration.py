@@ -156,6 +156,8 @@ class TestThresholdCalculation:
     """Test threshold calculation for various clique sizes."""
 
     @pytest.mark.parametrize("clique_size,expected_threshold", [
+        (1, 1),   # ceil(0.6667 * 1) = ceil(0.6667) = 1
+        (2, 2),   # ceil(0.6667 * 2) = ceil(1.3334) = 2
         (3, 3),   # ceil(0.6667 * 3) = ceil(2.0001) = 3
         (4, 3),   # ceil(0.6667 * 4) = ceil(2.6668) = 3
         (5, 4),   # ceil(0.6667 * 5) = ceil(3.3335) = 4

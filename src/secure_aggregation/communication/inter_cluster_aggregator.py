@@ -47,9 +47,11 @@ class InterClusterAggregator:
         self.cluster_id = cluster_id
         self.ipfs = ipfs
         self.blockchain = blockchain
-        self.merger = InterClusterMerger(merge_config)
+        self.merge_config = merge_config or MergeConfig()
+        self.merger = InterClusterMerger(self.merge_config)
         self.ecm_buffer = ECMBuffer(freshness_window=300.0)
         self.current_round = 0
+        self.last_data_id: Optional[str] = None
 
     def receive_ecms(self, node_id: str, ecms: List[ECM]) -> None:
         """Receive ECMs from a bridge node."""
@@ -60,6 +62,7 @@ class InterClusterAggregator:
     def merge_with_neighbors(
         self,
         intra_cluster_model: np.ndarray,
+        max_neighbors: Optional[int] = None,
     ) -> Tuple[np.ndarray, List[str]]:
         """
         Merge intra-cluster model with verified neighbor models.
@@ -79,13 +82,23 @@ class InterClusterAggregator:
             logger.info("No ECMs received, using intra-cluster model only")
             return intra_cluster_model.copy(), []
 
-        logger.info(f"Processing {len(unique_ecms)} unique ECMs from neighbor clusters")
+        selected_ecms = self._select_neighbors(unique_ecms, max_neighbors)
+
+        logger.info(f"Processing {len(selected_ecms)} unique ECMs from neighbor clusters")
 
         verified_models: List[np.ndarray] = []
         merged_cids: List[str] = []
 
-        for cid, expected_hash in unique_ecms.items():
-            model = self.ipfs.get(cid)
+        for cid, expected_hash in selected_ecms.items():
+            model = None
+            try:
+                model = self.ipfs.get(cid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to fetch model with CID %s: %s",
+                    cid[:8],
+                    exc,
+                )
             if model is None:
                 logger.warning(f"Failed to fetch model with CID {cid[:8]}...")
                 continue
@@ -127,13 +140,29 @@ class InterClusterAggregator:
             return None, None
 
         cid = self.ipfs.add(model)
+        if hasattr(self.ipfs, "provide"):
+            try:
+                self.ipfs.provide(cid)
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to announce CID %s to DHT", cid[:16])
         model_hash = compute_model_hash(model)
 
         logger.info(f"Published model to IPFS: cid={cid[:16]}...")
 
+        data_id: Optional[str] = None
         if self.blockchain is not None:
-            self.blockchain.anchor(self.cluster_id, round_num, cid, model_hash)
-            logger.info(f"Anchored model on blockchain: cluster={self.cluster_id}, round={round_num}")
+            try:
+                data_id = self.blockchain.anchor(self.cluster_id, round_num, cid, model_hash)
+                logger.info(
+                    f"Anchored model on blockchain: cluster={self.cluster_id}, "
+                    f"round={round_num}, data_id={data_id or 'N/A'}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"~ BLOCKCHAIN ~ BLOCKCHAIN ~ BLOCKCHAIN ~ Failed to anchor "
+                    f"cluster={self.cluster_id}, round={round_num}: {exc}"
+                )
+        self.last_data_id = data_id
 
         return cid, model_hash
 
@@ -194,7 +223,10 @@ class InterClusterAggregator:
         """
         self.current_round = round_num
 
-        merged_model, merged_cids = self.merge_with_neighbors(intra_cluster_model)
+        merged_model, merged_cids = self.merge_with_neighbors(
+            intra_cluster_model,
+            max_neighbors=self.merge_config.max_neighbors,
+        )
         logger.info(
             f"Round {round_num}: merged with {len(merged_cids)} neighbor models, "
             f"clipping threshold={self.merger.get_current_threshold():.4f}"
@@ -209,3 +241,23 @@ class InterClusterAggregator:
         """Reset state for next aggregation round."""
         self.ecm_buffer.clear()
         self.current_round += 1
+    def _select_neighbors(
+        self,
+        ecms: Dict[str, str],
+        max_neighbors: Optional[int],
+    ) -> Dict[str, str]:
+        """Select subset of ECMs for merging based on historical usage."""
+        if not ecms:
+            return ecms
+        if max_neighbors is None or max_neighbors <= 0 or len(ecms) <= max_neighbors:
+            return ecms
+        history: Dict[str, int] = getattr(self.merge_config, "neighbor_history", {})
+        sorted_neighbors = sorted(
+            ecms.keys(),
+            key=lambda cid: (history.get(cid, 0), cid),
+        )
+        selected = sorted_neighbors[:max_neighbors]
+        for cid in selected:
+            history[cid] = history.get(cid, 0) + 1
+        self.merge_config.neighbor_history = history
+        return {cid: ecms[cid] for cid in selected}

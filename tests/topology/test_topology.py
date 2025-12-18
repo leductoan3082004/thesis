@@ -10,6 +10,7 @@ from secure_aggregation.topology import (
     compute_skew,
     metropolis_hastings_weights,
 )
+from secure_aggregation.topology.graph import identify_central_clique
 
 
 def _global_distribution(node_distributions: Dict[str, Dict[str, float]]) -> Dict[str, float]:
@@ -79,11 +80,21 @@ def test_assign_node_edges_produces_correct_count() -> None:
     interclique_edges = [(0, 1), (1, 2), (0, 2)]
     node_edges, edge_counts = assign_node_edges(cliques, interclique_edges)
 
-    assert len(node_edges) == 3
+    assert len(node_edges) >= len(interclique_edges)
 
+    node_to_clique = {}
+    for idx, clique in enumerate(cliques):
+        for node in clique:
+            node_to_clique[node] = idx
+
+    realized_pairs = {(min(node_to_clique[a], node_to_clique[b]), max(node_to_clique[a], node_to_clique[b])) for a, b in node_edges}
+    for expected_pair in interclique_edges:
+        assert tuple(sorted(expected_pair)) in realized_pairs
+
+    # All inter-clique edges should still connect different cliques.
     for node_a, node_b in node_edges:
-        clique_a_idx = next(i for i, c in enumerate(cliques) if node_a in c)
-        clique_b_idx = next(i for i, c in enumerate(cliques) if node_b in c)
+        clique_a_idx = node_to_clique[node_a]
+        clique_b_idx = node_to_clique[node_b]
         assert clique_a_idx != clique_b_idx
 
 
@@ -91,9 +102,12 @@ def test_assign_node_edges_load_balances() -> None:
     cliques = [{"n0", "n1", "n2"}, {"n3", "n4", "n5"}, {"n6", "n7", "n8"}, {"n9", "n10", "n11"}]
     interclique_edges = build_interclique_edges(cliques, mode="fully_connected")
     _, edge_counts = assign_node_edges(cliques, interclique_edges)
+    central_idx, _ = identify_central_clique(cliques, interclique_edges)
 
-    for clique in cliques:
+    for idx, clique in enumerate(cliques):
         counts_in_clique = [edge_counts[n] for n in clique]
+        if central_idx is not None and idx == central_idx:
+            continue
         max_diff = max(counts_in_clique) - min(counts_in_clique)
         assert max_diff <= 1, f"Load imbalance in clique: {counts_in_clique}"
 

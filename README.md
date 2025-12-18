@@ -177,6 +177,12 @@ Edit [config/nodes/node_X.json](config/nodes/) to customize:
 }
 ```
 
+### System Config (Convergence)
+- Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to define convergence tolerances (the file is gitignored so environment-specific tweaks stay local).
+- Fields mirror the previous per-node `convergence` block: `enabled`, `warmup_rounds`, `tol_abs`, `tol_rel`, and `patience`.
+- `warmup_rounds` replaces the old `CONVERGENCE_WARMUP_ROUNDS` environment variable; set it to `0` to enable convergence tracking immediately or raise it to delay detection.
+- Override the lookup path via the `SYSTEM_CONFIG_PATH` environment variable if the nodes should share a different config location.
+
 ## 📈 Performance
 
 - **Training Time**: ~3-5 minutes for 10 rounds on CPU
@@ -233,8 +239,8 @@ secure_aggregation/
 ## 🧪 Testing
 
 ```bash
-# Run all tests
-pytest tests/
+# Run all tests (ensure src/ is on PYTHONPATH)
+PYTHONPATH=src /usr/local/bin/python3 -m pytest tests/
 
 # Specific test suite
 pytest tests/test_protocol.py

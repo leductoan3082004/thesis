@@ -26,18 +26,17 @@
       "api_url": "http://ipfs-node-1:5001"
     },
     "blockchain": {
-      "registry_url": "http://registry:8000"
+      "gateway_url": "http://host.docker.internal:9000",
+      "identity": "trainer-node-004",
+      "private_key_path": "config/keys/trainer-node-004_sk.pem",
+      "state_path": "data/blockchain/trainer-node-004.json",
+      "jwt_role": "trainer",
+      "jwt_state": "system"
     },
     "window_size": 10,
     "alpha": 0.5,
     "base_gamma": 0.2,
-    "freshness_window": 300.0
-  },
-  "convergence": {
-    "enabled": true,
-    "tol_abs": 1e-5,
-    "tol_rel": 0.001,
-    "patience": 3,
-    "require_neighbor_convergence": true
+    "freshness_window": 300.0,
+    "max_neighbors": 4
   }
 }

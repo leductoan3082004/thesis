@@ -13,6 +13,7 @@ from .graph import (
     get_clique_bridge_nodes,
     get_inter_clique_neighbors,
     get_neighbor_clique_indices,
+    identify_central_clique,
     is_bridge_node,
     metropolis_hastings_weights,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "get_clique_bridge_nodes",
     "get_inter_clique_neighbors",
     "get_neighbor_clique_indices",
+    "identify_central_clique",
     "is_bridge_node",
     "metropolis_hastings_weights",
 ]

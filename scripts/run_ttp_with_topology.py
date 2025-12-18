@@ -46,7 +46,7 @@ def write_topology_file(
         alpha=alpha,
         seed=seed,
     )
-
+    partition = {f"node_{key.split('_')[-1]}": value for key, value in partition.items()}
     node_labels = compute_node_labels_from_partition(partition, labels)
 
     cliques, intra_edges, inter_edges, edge_counts = build_full_topology(
