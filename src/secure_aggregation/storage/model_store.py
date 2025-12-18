@@ -83,6 +83,11 @@ class BlockchainInterface(ABC):
         pass
 
     @abstractmethod
+    def commit_metadata(self, cluster_id: str, round_num: int, metadata: Dict) -> Optional[str]:
+        """Commit arbitrary metadata payload and return data identifier."""
+        pass
+
+    @abstractmethod
     def get_anchor(self, cluster_id: str, round_num: int) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash) for cluster/round."""
         pass
@@ -102,6 +107,11 @@ class BlockchainInterface(ABC):
         hash_val: Optional[str] = None,
     ) -> None:
         """Persist a reference that was anchored elsewhere."""
+        pass
+
+    @abstractmethod
+    def fetch_data(self, data_id: str) -> Optional[Dict]:
+        """Fetch raw data payload by ID."""
         pass
 
 
@@ -202,6 +212,7 @@ class MockBlockchain(BlockchainInterface):
         self._storage_path = Path(storage_path) if storage_path else None
         self._memory_registry: Dict[str, Dict[int, ModelAnchor]] = {}
         self._registry_lock = threading.Lock()
+        self._metadata_store: Dict[str, Dict] = {}
 
         if self._storage_path:
             self._storage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,6 +332,31 @@ class MockBlockchain(BlockchainInterface):
         if cid is None or hash_val is None:
             return
         self.anchor(cluster_id, round_num, cid, hash_val)
+
+    def commit_metadata(self, cluster_id: str, round_num: int, metadata: Dict) -> Optional[str]:
+        """Store metadata payload locally and return synthetic data_id."""
+        data_id = f"{cluster_id}-{round_num}-{int(time.time() * 1000)}"
+        record = {
+            "data_id": data_id,
+            "payload": {
+                "cluster_id": cluster_id,
+                "round": round_num,
+                "metadata": metadata,
+            },
+            "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        self._metadata_store[data_id] = record
+        logger.info(
+            f"{BLOCKCHAIN_LOG_TAG} MockBlockchain stored metadata cluster={cluster_id}, round={round_num}, data_id={data_id}"
+        )
+        return data_id
+
+    def fetch_data(self, data_id: str) -> Optional[Dict]:
+        """Fetch metadata payload by data_id."""
+        record = self._metadata_store.get(data_id)
+        if record is None:
+            logger.warning(f"{BLOCKCHAIN_LOG_TAG} MockBlockchain missing data_id={data_id}")
+        return record
 
 
 class KuboIPFS(IPFSInterface):
@@ -819,3 +855,23 @@ class GatewayBlockchain(BlockchainInterface):
 
     def close(self) -> None:
         self._client.close()
+
+    def commit_metadata(self, cluster_id: str, round_num: int, metadata: Dict) -> Optional[str]:
+        payload = {
+            "cluster_id": cluster_id,
+            "round": round_num,
+            "metadata": metadata,
+        }
+        record = self._commit_payload(payload)
+        data_id = record.get("data_id")
+        if data_id:
+            logger.info(
+                f"{BLOCKCHAIN_LOG_TAG} Anchored metadata cluster={cluster_id}, round={round_num}, data_id={data_id}"
+            )
+        return data_id
+
+    def fetch_data(self, data_id: str) -> Optional[Dict]:
+        try:
+            return self._fetch_data(data_id)
+        except httpx.HTTPError:
+            return None

@@ -23,6 +23,7 @@ class ECM:
     cluster_delta_norm: float = 0.0
     round_idx: int = -1
     is_signal: bool = False
+    convergence_data_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.received_at == 0.0:

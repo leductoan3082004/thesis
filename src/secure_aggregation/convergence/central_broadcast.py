@@ -99,24 +99,10 @@ def fetch_checker_health(blockchain: Optional[BlockchainInterface]) -> list[Chec
     return [CheckerHealth.from_anchor(latest)]
 
 
-def publish_global_convergence(blockchain: BlockchainInterface, round_idx: int) -> None:
-    """Anchor global convergence announcement."""
-    blockchain.anchor(
-        GLOBAL_CONVERGENCE_CLUSTER_ID,
-        round_idx,
-        cid=str(round_idx),
-        hash_val="converged",
-    )
-
-
-def fetch_global_convergence_round(blockchain: Optional[BlockchainInterface]) -> Optional[int]:
-    """Retrieve the round at which global convergence was declared."""
-    if blockchain is None:
-        return None
-    anchor = blockchain.get_latest_anchor(GLOBAL_CONVERGENCE_CLUSTER_ID)
-    if anchor is None:
-        return None
-    try:
-        return int(anchor.cid)
-    except ValueError:
-        return anchor.round_num
+def publish_global_convergence(
+    blockchain: BlockchainInterface,
+    round_idx: int,
+    metadata: dict,
+) -> Optional[str]:
+    """Commit global convergence metadata and return data identifier."""
+    return blockchain.commit_metadata(GLOBAL_CONVERGENCE_CLUSTER_ID, round_idx, metadata)

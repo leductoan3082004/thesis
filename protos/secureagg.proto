@@ -49,6 +49,8 @@ service AggregatorService {
   rpc GetGlobalModel(ModelRequest) returns (ModelResponse);
   // Bridge nodes forward ECMs to aggregator for inter-cluster merge
   rpc SubmitECMs(ECMSubmitRequest) returns (ECMSubmitResponse);
+  // Clique members can notify the aggregator when convergence is confirmed.
+  rpc NotifyConvergenceSignal(ConvergenceSignal) returns (ConvergenceAck);
 }
 
 // Round 0: Advertise DH public keys
@@ -167,6 +169,17 @@ message ECMBroadcast {
   // Convergence status for cross-cluster coordination
   bool cluster_converged = 5;
   float cluster_delta_norm = 6;
+  string convergence_data_id = 7;
+}
+
+message ConvergenceSignal {
+  string data_id = 1;
+  int32 round = 2;
+}
+
+message ConvergenceAck {
+  bool accepted = 1;
+  string message = 2;
 }
 
 // Bridge node service for inter-cluster ECM gossip

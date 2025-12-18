@@ -2,7 +2,7 @@
 
 import logging
 from concurrent import futures
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import grpc
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
@@ -72,6 +72,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         participant_ids: List[str],
         signing_public_keys: Optional[Mapping[str, bytes]] = None,
         ecm_buffer: Optional[ECMBuffer] = None,
+        convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         self.node_id = node_id
         self.threshold = threshold
@@ -96,10 +97,15 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.stop_reason: str = ""
         self.delta_norm: float = 0.0
         self.cluster_converged: bool = False
+        self._convergence_signal_handler = convergence_signal_handler
 
         logger.info(
             f"Aggregator {node_id} initialized with threshold={threshold}, participants={len(participant_ids)}"
         )
+
+    def set_convergence_signal_handler(self, handler: Callable[[str, int], None]) -> None:
+        """Register callback that receives convergence data_id notifications."""
+        self._convergence_signal_handler = handler
 
     def set_convergence_state(
         self,
@@ -358,6 +364,28 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             message=f"Received {received_count} ECMs",
         )
 
+    def NotifyConvergenceSignal(
+        self,
+        request: secureagg_pb2.ConvergenceSignal,
+        context,
+    ) -> secureagg_pb2.ConvergenceAck:
+        """Allow clique members to push convergence confirmations to the aggregator."""
+        if not request.data_id:
+            return secureagg_pb2.ConvergenceAck(accepted=False, message="Missing data_id")
+        if self._convergence_signal_handler is None:
+            logger.debug(
+                "Aggregator %s received convergence data_id=%s but no handler configured",
+                self.node_id,
+                request.data_id,
+            )
+            return secureagg_pb2.ConvergenceAck(accepted=False, message="No handler configured")
+        try:
+            self._convergence_signal_handler(request.data_id, request.round)
+            return secureagg_pb2.ConvergenceAck(accepted=True, message="Convergence acknowledged")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Convergence signal handler failed for data_id=%s: %s", request.data_id, exc)
+            return secureagg_pb2.ConvergenceAck(accepted=False, message=str(exc))
+
     def reset_for_next_round(self) -> None:
         """Reset state for next aggregation round."""
         self.aggregator = SecureAggregationAggregator(
@@ -383,6 +411,7 @@ def serve(
     participant_ids: List[str],
     signing_public_keys: Optional[Mapping[str, bytes]] = None,
     ecm_buffer: Optional[ECMBuffer] = None,
+    convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
 ) -> Tuple[grpc.Server, AggregatorServicer]:
     """Start the aggregator gRPC server.
 
@@ -395,6 +424,7 @@ def serve(
         participant_ids,
         signing_public_keys=signing_public_keys,
         ecm_buffer=ecm_buffer,
+        convergence_signal_handler=convergence_signal_handler,
     )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     secureagg_pb2_grpc.add_AggregatorServiceServicer_to_server(servicer, server)

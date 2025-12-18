@@ -53,6 +53,8 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
     ) -> secureagg_pb2.ECMSubmitResponse:
         """Receive ECM broadcast from neighbor cluster with convergence status."""
         cid = request.cid or f"signal::{request.cluster_id}::{request.round}"
+        if request.convergence_data_id and not request.cid:
+            cid = f"signal::convergence::{request.convergence_data_id}"
         is_signal = cid.startswith("signal::")
         ecm = ECM(
             cid=cid,
@@ -62,12 +64,13 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
             cluster_delta_norm=request.cluster_delta_norm,
             round_idx=request.round,
             is_signal=is_signal,
+            convergence_data_id=request.convergence_data_id or None,
         )
         self.ecm_buffer.add(ecm)
         logger.info(
             f"Received ECM from cluster {request.cluster_id} "
             f"round {request.round}: cid={request.cid[:8]}... "
-            f"(converged={request.cluster_converged})"
+            f"(converged={request.cluster_converged}, data_id={request.convergence_data_id or 'N/A'})"
         )
 
         return secureagg_pb2.ECMSubmitResponse(
@@ -163,6 +166,7 @@ class BridgeClient:
         model_hash: str,
         cluster_converged: bool,
         cluster_delta_norm: float,
+        convergence_data_id: Optional[str] = None,
     ) -> bool:
         """Send ECM with convergence status to a neighbor cluster bridge node."""
         try:
@@ -174,6 +178,7 @@ class BridgeClient:
                 hash=model_hash,
                 cluster_converged=cluster_converged,
                 cluster_delta_norm=cluster_delta_norm,
+                convergence_data_id=convergence_data_id or "",
             )
             response = stub.ReceiveECM(request, timeout=10)
             if response.accepted:
@@ -192,6 +197,7 @@ class BridgeClient:
         model_hash: str,
         cluster_converged: bool,
         cluster_delta_norm: float,
+        convergence_data_id: Optional[str] = None,
     ) -> int:
         """
         Broadcast ECM with convergence status to all neighbor cluster bridge nodes.
@@ -202,8 +208,14 @@ class BridgeClient:
         accepted = 0
         for addr in neighbor_addresses:
             if self.send_ecm_with_convergence(
-                addr, cluster_id, round_num, cid, model_hash,
-                cluster_converged, cluster_delta_norm
+                addr,
+                cluster_id,
+                round_num,
+                cid,
+                model_hash,
+                cluster_converged,
+                cluster_delta_norm,
+                convergence_data_id=convergence_data_id,
             ):
                 accepted += 1
 
