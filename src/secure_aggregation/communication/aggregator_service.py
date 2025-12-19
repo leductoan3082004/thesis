@@ -98,7 +98,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.delta_norm: float = 0.0
         self.cluster_converged: bool = False
         self.convergence_streak: int = 0
-        self.convergence_ready: bool = False
+        self.metadata_ready: bool = False
         self._convergence_signal_handler = convergence_signal_handler
 
         logger.info(
@@ -129,7 +129,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.delta_norm = delta_norm
         self.cluster_converged = cluster_converged
         self.convergence_streak = convergence_streak
-        self.convergence_ready = True
+        self.metadata_ready = True
 
     def _validate_participant(self, node_id: str) -> bool:
         return node_id in self.participant_ids
@@ -299,7 +299,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 delta_norm=0.0,
                 cluster_converged=False,
                 convergence_streak=0,
-                convergence_ready=self.convergence_ready,
+                metadata_ready=self.metadata_ready,
                 model_cid="",
                 model_hash="",
                 model_data_id="",
@@ -319,7 +319,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             delta_norm=self.delta_norm,
             cluster_converged=self.cluster_converged,
             convergence_streak=self.convergence_streak,
-            convergence_ready=self.convergence_ready,
+            metadata_ready=self.metadata_ready,
             model_cid=self.merged_model_cid or "",
             model_hash=self.merged_model_hash or "",
             model_data_id=self.merged_model_data_id or "",
@@ -407,7 +407,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.merged_model_hash = None
         self.merged_model_data_id = None
         self.convergence_streak = 0
-        self.convergence_ready = False
+        self.metadata_ready = False
         self._adverts.clear()
         self._adverts_committed = False
         self._round3_signatures.clear()
