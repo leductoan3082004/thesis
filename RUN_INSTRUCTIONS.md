@@ -12,7 +12,29 @@ Complete guide to running end-to-end federated learning with secure aggregation 
 
 ## Quick Start (Recommended)
 
+Before running any scripts, clone the blockchain helper repo so automation can locate shared assets. The expected layout keeps this repo under `full-system/system` with the blockchain repo alongside it as `full-system/thesis-blockchain`:
+
+```bash
+# From the full-system directory that already contains the system/ folder
+git clone https://github.com/letienthanh364/thesis-blockchain.git
+```
+
+As a result, your tree should look like:
+```
+full-system/
+├── system/            # this repo
+└── thesis-blockchain/ # cloned helper repo
+```
+Keep both directories next to each other under `full-system/` so automation in `system/` can reference blockchain artifacts without extra configuration.
+
 ### Step 1: Install Dependencies
+
+Using a Python virtual environment keeps Homebrew’s Python clean and avoids the “externally-managed-environment” error:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
 ```bash
 # Install Python dependencies
@@ -35,11 +57,13 @@ This downloads MNIST to the `data/` directory which is mounted in Docker contain
 ### Step 3: Run with Docker Compose
 
 ```bash
-# Generate configs + docker-compose.auto.yml and start 6 nodes
-# (omit --nodes to read config/system-config.json:number_of_nodes)
-python scripts/run_docker_with_nodes.py --nodes 6
+# End-to-end automation: regenerates Fabric crypto, creates node configs,
+# generates blockchain identities, starts the Fabric stack, bulk-registers
+# trainers, and launches federated nodes. Omit --nodes to read
+# config/system-config.json:number_of_nodes.
+AUTH_JWT_SECRET="super-secret" python scripts/run_docker_with_nodes.py --nodes 10
 
-# View logs from all containers
+# View logs from all federated containers
 cd docker
 docker compose -f docker-compose.auto.yml logs -f
 
