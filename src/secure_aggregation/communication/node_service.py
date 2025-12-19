@@ -165,6 +165,8 @@ class NodeService:
         self._latest_cluster_converged: bool = False
         self._latest_delta_norm: float = 0.0
         self._latest_convergence_streak: int = 0
+        self._last_model_cid: Optional[str] = None
+        self._last_model_data_id: Optional[str] = None
         self.central_metadata = None
         self.central_checker: Optional[CentralChecker] = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
@@ -239,6 +241,18 @@ class NodeService:
                 convergence_streak=conv_state.convergence_streak,
             )
         return conv_state
+
+    def _log_final_model_status(self) -> None:
+        """Log the final model accuracy and identifiers before stopping."""
+        accuracy = self.evaluate()
+        cid = self._last_model_cid or "N/A"
+        data_id = self._last_model_data_id or "N/A"
+        logger.info(
+            "Final model checkpoint: accuracy=%.4f, cid=%s, data_id=%s",
+            accuracy,
+            cid,
+            data_id,
+        )
 
     def _maybe_check_convergence_during_retry(
         self,
@@ -1348,6 +1362,10 @@ class NodeService:
                             should_stop = conv_state.should_stop
                             stop_reason = conv_state.stop_reason
 
+                    if self.is_aggregator:
+                        self._last_model_cid = final_cid
+                        self._last_model_data_id = final_data_id
+
                     if not self.is_aggregator:
                         # Non-aggregator: fetch convergence decision from aggregator.
                         # Bridge nodes wait until the aggregator publishes IPFS/chain metadata
@@ -1367,6 +1385,8 @@ class NodeService:
                                 "convergence_streak",
                                 self._latest_convergence_streak,
                             )
+                            self._last_model_cid = model_response.model_cid or None
+                            self._last_model_data_id = getattr(model_response, "model_data_id", "") or None
 
                             response_cid = model_response.model_cid or ""
                             response_hash = model_response.model_hash or ""
@@ -1462,6 +1482,7 @@ class NodeService:
             time.sleep(5)
             self.current_round += 1
 
+        self._log_final_model_status()
         logger.info("\n" + "="*60)
         logger.info(f"Training completed after {self.current_round + 1} rounds (reason: {stop_reason or 'max_rounds'})")
         logger.info("="*60)
