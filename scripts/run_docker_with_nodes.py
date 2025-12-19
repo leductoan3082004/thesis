@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from copy import deepcopy
+from http import client as http_client
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib import error as urllib_error
@@ -67,6 +68,7 @@ BLOCKCHAIN_SYSTEM_GENESIS_DIR = BLOCKCHAIN_API_GATEWAY_DIR / "system-genesis-blo
 BLOCKCHAIN_CHANNEL_ARTIFACTS_DIR = BLOCKCHAIN_API_GATEWAY_DIR / "channel-artifacts"
 BLOCKCHAIN_CRYPTO_CONFIG = BLOCKCHAIN_API_GATEWAY_DIR / "crypto-config.yaml"
 BLOCKCHAIN_CONFIGTX_DIR = BLOCKCHAIN_API_GATEWAY_DIR / "configtx"
+BLOCKCHAIN_TRAINER_DB = BLOCKCHAIN_API_GATEWAY_DIR / "data" / "trainers.json"
 CA_CONTAINER_NAME = "ca-org1.nebula.com"
 CA_IMAGE = "hyperledger/fabric-ca:1.5"
 CA_PORT = "7054"
@@ -190,10 +192,27 @@ def _ensure_blockchain_dir() -> None:
     blockchain_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_ipfs_dir() -> None:
+    ipfs_dir = ROOT_DIR / "data" / "ipfs"
+    ipfs_dir.mkdir(parents=True, exist_ok=True)
+
+
 def _reset_nodes_dir() -> None:
     if NODES_DIR.exists():
         shutil.rmtree(NODES_DIR)
     NODES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _clear_runtime_state(paths: Dict[str, Path]) -> None:
+    for subdir in ("blockchain", "ipfs"):
+        target = ROOT_DIR / "data" / subdir
+        if target.exists():
+            shutil.rmtree(target)
+        target.mkdir(parents=True, exist_ok=True)
+    trainer_db = paths.get("trainer_db")
+    if trainer_db:
+        trainer_db.parent.mkdir(parents=True, exist_ok=True)
+        trainer_db.write_text("[\n]\n")
 
 
 def _copy_directory(source: Path, destination: Path) -> None:
@@ -304,6 +323,7 @@ def _require_blockchain_repo_paths() -> Dict[str, Path]:
         "channel_artifacts_dir": BLOCKCHAIN_CHANNEL_ARTIFACTS_DIR,
         "crypto_config": BLOCKCHAIN_CRYPTO_CONFIG,
         "configtx_dir": BLOCKCHAIN_CONFIGTX_DIR,
+        "trainer_db": BLOCKCHAIN_TRAINER_DB,
     }
 
 
@@ -417,6 +437,18 @@ def _teardown_blockchain_stack(paths: Dict[str, Path]) -> None:
     subprocess.run(
         ["docker", "compose", "down", "-v"],
         cwd=paths["api_gateway"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def _teardown_system_stack(compose_path: Path) -> None:
+    if not compose_path.exists():
+        return
+    subprocess.run(
+        ["docker", "compose", "-f", compose_path.name, "down", "-v"],
+        cwd=compose_path.parent,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -833,28 +865,55 @@ def _bulk_register_trainers(paths: Dict[str, Path], base_url: str) -> None:
     token = paths["admin_jwt_path"].read_text().strip()
     if not token:
         raise SystemExit(f"Admin JWT file {paths['admin_jwt_path']} is empty.")
-    payload = paths["bulk_output"].read_bytes()
+    entries = json.loads(paths["bulk_output"].read_text())
     url = f"{base_url.rstrip('/')}{GATEWAY_BULK_PATH}"
+    batch_size = 5
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    request = urllib_request.Request(url, data=payload, headers=headers, method="POST")
-    print(f"Submitting bulk trainer registration to {url}")
-    try:
-        with urllib_request.urlopen(request, timeout=60) as response:
-            body = response.read().decode("utf-8", errors="ignore")
-            print(f"Bulk registration succeeded (HTTP {response.status}).")
-            if body.strip():
-                print(f"Response: {body.strip()[:300]}")
-    except urllib_error.HTTPError as exc:
-        if exc.code == 409:
-            print("Bulk registration already applied (HTTP 409). Continuing.")
-            return
-        body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
-        raise SystemExit(f"Bulk registration failed (HTTP {exc.code}): {body.strip()}")
-    except urllib_error.URLError as err:
-        raise SystemExit(f"Bulk registration failed: {err}") from err
+    for offset in range(0, len(entries), batch_size):
+        batch = entries[offset : offset + batch_size]
+        trainer_ids = [
+            entry.get("nodeId") or entry.get("trainerId") or entry.get("did") or "unknown"
+            for entry in batch
+        ]
+        payload = json.dumps(batch).encode()
+        request = urllib_request.Request(url, data=payload, headers=headers, method="POST")
+        print(
+            f"Registering trainers {', '.join(trainer_ids)} (batch "
+            f"{offset // batch_size + 1}/{(len(entries) + batch_size - 1) // batch_size})",
+        )
+        for attempt in range(1, 4):
+            try:
+                with urllib_request.urlopen(request, timeout=60) as response:
+                    response.read()  # body unused
+                    print(f"Registered trainers {', '.join(trainer_ids)} successfully.")
+                    break
+            except urllib_error.HTTPError as exc:
+                if exc.code == 409:
+                    print(
+                        f"Trainers {', '.join(trainer_ids)} were already registered (HTTP 409).",
+                    )
+                    break
+                body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+                if attempt >= 3:
+                    raise SystemExit(
+                        f"Bulk registration batch {offset // batch_size + 1} failed "
+                        f"(HTTP {exc.code}): {body.strip()}",
+                    )
+                print(
+                    f"Batch {offset // batch_size + 1} attempt {attempt} failed with HTTP {exc.code}; retrying...",
+                )
+            except (urllib_error.URLError, http_client.RemoteDisconnected) as err:
+                if attempt >= 3:
+                    raise SystemExit(
+                        f"Batch {offset // batch_size + 1} failed: {err}",
+                    ) from err
+                print(
+                    f"Batch {offset // batch_size + 1} attempt {attempt} failed: {err}. Retrying...",
+                )
+            time.sleep(5)
 
 
 def _start_blockchain_stack(paths: Dict[str, Path], auth_secret: str) -> str:
@@ -1053,7 +1112,8 @@ def main() -> None:
     compose_template = load_compose_template(compose_template_path)
     ipfs_services = _extract_ipfs_services(compose_template)
 
-    _ensure_blockchain_dir()
+    blockchain_paths, auth_secret = _prepare_blockchain_artifacts()
+    _clear_runtime_state(blockchain_paths)
     _reset_nodes_dir()
     # Generate configs with the correct IPFS/blockchain layout.
     for idx in range(node_count):
@@ -1066,8 +1126,6 @@ def main() -> None:
         config_path = NODES_DIR / f"{node_id}.json"
         config_path.write_text(json.dumps(config, indent=2) + "\n")
 
-    blockchain_paths, auth_secret = _prepare_blockchain_artifacts()
-
     updated_compose = update_compose_file(compose_template, node_count, ipfs_services)
     compose_output_path.parent.mkdir(parents=True, exist_ok=True)
     write_compose_file(updated_compose, compose_output_path)
@@ -1079,6 +1137,7 @@ def main() -> None:
         print(f"Run: (cd docker && docker compose -f {compose_output_path.name} up --build)")
         return
 
+    _teardown_system_stack(compose_output_path)
     gateway_base_url = _start_blockchain_stack(blockchain_paths, auth_secret)
     _wait_for_gateway_health(gateway_base_url)
     _bulk_register_trainers(blockchain_paths, gateway_base_url)
