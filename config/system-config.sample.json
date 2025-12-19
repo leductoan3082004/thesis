@@ -1,4 +1,5 @@
 {
+  "number_of_nodes": 20,
   "convergence": {
     "warmup_rounds": 3,
     "enabled": true,

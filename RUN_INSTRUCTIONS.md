@@ -35,18 +35,19 @@ This downloads MNIST to the `data/` directory which is mounted in Docker contain
 ### Step 3: Run with Docker Compose
 
 ```bash
-# Build and start all services
-cd docker
-docker compose up --build
+# Generate configs + docker-compose.auto.yml and start 6 nodes
+# (omit --nodes to read config/system-config.json:number_of_nodes)
+python scripts/run_docker_with_nodes.py --nodes 6
 
 # View logs from all containers
-docker compose logs -f
+cd docker
+docker compose -f docker-compose.auto.yml logs -f
 
 # View logs from specific node
-docker compose logs -f node_0
+docker compose -f docker-compose.auto.yml logs -f node_0
 
 # Stop services
-docker compose down -v
+docker compose -f docker-compose.auto.yml down -v
 ```
 
 ## What You'll See
@@ -111,6 +112,8 @@ For each round:
 
 ## Configuration
 
+Node configs live under `config/nodes/` and are generated automatically from `config/node.config.template.json` every time you run `scripts/run_docker_with_nodes.py`. Update the template to change defaults before launching, or tweak individual node files after generation if specific overrides are needed. The helper rotates IPFS endpoints and blockchain identities (`trainer-node-XXX`) automatically so you only need to supply the template once, and it reads the target fleet size from `number_of_nodes` in `config/system-config.json` whenever `--nodes` is omitted.
+
 ### Dataset Partitioning (Dirichlet)
 - `alpha=0.5`: Moderate non-IID (realistic federated setting)
 - Lower alpha = more non-IID, higher alpha = more IID
@@ -126,6 +129,7 @@ For each round:
 - `warmup_rounds` inside `config/system-config.json` controls how many rounds each node waits before emitting convergence signals (default `5` in the sample file).
 - Lower it to `0` to start convergence checks immediately or raise it to defer signals; this replaces the deprecated `CONVERGENCE_WARMUP_ROUNDS` environment override.
 - This is distinct from `MAX_TRAINING_ROUNDS`, which caps the total number of federated rounds.
+- Set `number_of_nodes` in the same file once so Docker launches know how many node configs/services to generate when you omit `--nodes`.
 
 ### Global Convergence Settings
 - Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to change `enabled`, `tol_abs`, `tol_rel`, or `patience` without touching every node file. The resolved file is gitignored so you can keep environment-specific thresholds private.
