@@ -138,6 +138,8 @@ message ModelResponse {
   string stop_reason = 5;
   float delta_norm = 6;
   bool cluster_converged = 7;
+  int32 convergence_streak = 11;
+  bool convergence_ready = 12;
   // IPFS reference for merged model (nodes fetch from IPFS if set)
   string model_cid = 8;
   string model_hash = 9;
