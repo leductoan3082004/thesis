@@ -72,6 +72,12 @@ docker compose -f docker-compose.auto.yml logs -f node_0
 
 # Stop services
 docker compose -f docker-compose.auto.yml down -v
+
+# Manual maintenance commands (if you need to manage stacks yourself):
+# Blockchain
+(cd ../thesis-blockchain/api-gateway && docker compose down -v && docker compose up --build -d)
+# Federated nodes
+(cd docker && docker compose -f docker-compose.auto.yml down -v && docker compose -f docker-compose.auto.yml up --build -d)
 ```
 
 ## What You'll See

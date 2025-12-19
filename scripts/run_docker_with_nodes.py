@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import shlex
 from copy import deepcopy
 from http import client as http_client
 from pathlib import Path
@@ -443,16 +444,23 @@ def _teardown_blockchain_stack(paths: Dict[str, Path]) -> None:
     )
 
 
-def _teardown_system_stack(compose_path: Path) -> None:
+def _teardown_system_stack(compose_dir: Path, compose_filename: str) -> None:
+    compose_path = compose_dir / compose_filename
     if not compose_path.exists():
         return
     subprocess.run(
-        ["docker", "compose", "-f", compose_path.name, "down", "-v"],
-        cwd=compose_path.parent,
+        ["docker", "compose", "-f", compose_filename, "down", "-v"],
+        cwd=compose_dir,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
     )
+    # subprocess.run(
+    #     ["docker", "rm", "-f", "docker"],
+    #     stdout=subprocess.DEVNULL,
+    #     stderr=subprocess.DEVNULL,
+    #     check=False,
+    # )
 
 
 def _ensure_fabric_artifacts(paths: Dict[str, Path]) -> None:
@@ -938,9 +946,7 @@ def _start_blockchain_stack(paths: Dict[str, Path], auth_secret: str) -> str:
     return env.get("BLOCKCHAIN_GATEWAY_URL", DEFAULT_GATEWAY_URL)
 
 
-def _prepare_blockchain_artifacts() -> Tuple[Dict[str, Path], str]:
-    paths = _require_blockchain_repo_paths()
-    auth_secret = _resolve_auth_secret(paths)
+def _prepare_blockchain_artifacts(paths: Dict[str, Path], auth_secret: str) -> None:
     admin_public_key = _ensure_admin_keypair(paths)
     _ensure_env_file(paths, auth_secret, admin_public_key)
     _teardown_blockchain_stack(paths)
@@ -961,7 +967,6 @@ def _prepare_blockchain_artifacts() -> Tuple[Dict[str, Path], str]:
     _sign_trainer_vcs(paths, admin_key)
     _build_bulk_registration_payload(paths)
     _generate_admin_jwt(paths, auth_secret)
-    return paths, auth_secret
 
 
 def resolve_system_config_path(cli_path: Optional[Path]) -> Path:
@@ -1068,6 +1073,63 @@ def _merge_node_service(
     return service
 
 
+def _ensure_num_clients_argument(args: List[str], num_nodes: int) -> List[str]:
+    """Ensure --num-clients reflects the generated node count."""
+    value = str(num_nodes)
+    for idx, token in enumerate(args):
+        if token == "--num-clients":
+            if idx + 1 < len(args):
+                args[idx + 1] = value
+            else:
+                args.append(value)
+            break
+        if token.startswith("--num-clients="):
+            args[idx] = f"--num-clients={value}"
+            break
+    else:
+        args.extend(["--num-clients", value])
+    return args
+
+
+def _update_ttp_command(command: Any, num_nodes: int) -> Any:
+    """Update the TTP command definition (list or string) with the node count."""
+    if isinstance(command, list):
+        return _ensure_num_clients_argument(list(command), num_nodes)
+    if isinstance(command, str):
+        tokens = shlex.split(command)
+        updated = _ensure_num_clients_argument(tokens, num_nodes)
+        return shlex.join(updated)
+    return command
+
+
+def _update_environment_section(section: Any, key: str, value: int) -> Any:
+    str_value = str(value)
+    if isinstance(section, dict):
+        section[key] = str_value
+        return section
+    if isinstance(section, list):
+        prefix = f"{key}="
+        for idx, entry in enumerate(section):
+            if isinstance(entry, str) and entry.startswith(prefix):
+                section[idx] = f"{prefix}{str_value}"
+                break
+        else:
+            section.append(f"{prefix}{str_value}")
+        return section
+    return section
+
+
+def _update_ttp_service(services: Dict[str, Any], num_nodes: int) -> None:
+    """Propagate the generated node count to the TTP service config."""
+    service = services.get("ttp")
+    if not service:
+        return
+    if "command" in service:
+        service["command"] = _update_ttp_command(service["command"], num_nodes)
+    if "environment" in service:
+        service["environment"] = _update_environment_section(service["environment"], "NUM_CLIENTS", num_nodes)
+
+
 def update_compose_file(
     compose_data: Dict[str, Any],
     num_nodes: int,
@@ -1083,6 +1145,7 @@ def update_compose_file(
         node_name = f"node_{idx}"
         ipfs_service = _select_ipfs_service(idx, ipfs_services)
         services[node_name] = _merge_node_service(node_name, base_node_service, ipfs_service)
+    _update_ttp_service(services, num_nodes)
     return compose_data
 
 
@@ -1112,7 +1175,10 @@ def main() -> None:
     compose_template = load_compose_template(compose_template_path)
     ipfs_services = _extract_ipfs_services(compose_template)
 
-    blockchain_paths, auth_secret = _prepare_blockchain_artifacts()
+    blockchain_paths = _require_blockchain_repo_paths()
+    auth_secret = _resolve_auth_secret(blockchain_paths)
+    _teardown_blockchain_stack(blockchain_paths)
+    _teardown_system_stack(compose_output_path.parent, compose_output_path.name)
     _clear_runtime_state(blockchain_paths)
     _reset_nodes_dir()
     # Generate configs with the correct IPFS/blockchain layout.
@@ -1132,12 +1198,13 @@ def main() -> None:
     print(f"Generated docker compose file with {node_count} nodes -> {compose_output_path}")
     print(f"(node count source: {'--nodes CLI' if args.nodes is not None else system_config_path})")
 
+    _prepare_blockchain_artifacts(blockchain_paths, auth_secret)
+
     if args.generate_only:
         print("Skipped docker compose up (generate-only mode).")
         print(f"Run: (cd docker && docker compose -f {compose_output_path.name} up --build)")
         return
 
-    _teardown_system_stack(compose_output_path)
     gateway_base_url = _start_blockchain_stack(blockchain_paths, auth_secret)
     _wait_for_gateway_health(gateway_base_url)
     _bulk_register_trainers(blockchain_paths, gateway_base_url)

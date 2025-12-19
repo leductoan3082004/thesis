@@ -179,6 +179,15 @@ class NodeService:
         self._convergence_payload_cache: Dict[str, Dict[str, Any]] = {}
         self._confirmed_global_convergence_round: Optional[int] = None
         self._confirmed_global_convergence_reason: str = ""
+        max_failures = self.secagg_config.get("max_aggregator_failure_rounds", 2)
+        try:
+            self._max_aggregator_failure_rounds = max(1, int(max_failures))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid max_aggregator_failure_rounds=%s; defaulting to 2", max_failures
+            )
+            self._max_aggregator_failure_rounds = 2
+        self._consecutive_aggregator_failures = 0
 
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
 
@@ -1264,6 +1273,7 @@ class NodeService:
             cid: Optional[str] = None
             model_hash: Optional[str] = None
             model_data_id: Optional[str] = None
+            aggregator_unreachable_this_round = False
             try:
                 round_failed = False
                 # Phase 2: Secure aggregation
@@ -1440,6 +1450,7 @@ class NodeService:
 
             except AggregatorUnavailable as exc:
                 round_failed = True
+                aggregator_unreachable_this_round = True
                 logger.warning(
                     "%s. Will retry after backoff unless convergence is confirmed.",
                     exc,
@@ -1454,6 +1465,19 @@ class NodeService:
                     self.stop_aggregator_server()
 
             if round_failed:
+                if aggregator_unreachable_this_round:
+                    self._consecutive_aggregator_failures += 1
+                    if self._consecutive_aggregator_failures >= self._max_aggregator_failure_rounds:
+                        should_stop = True
+                        stop_reason = "aggregator_unreachable"
+                        logger.error(
+                            "Stopping training: failed to reach aggregator %s for %d consecutive rounds",
+                            self.aggregator_id,
+                            self._consecutive_aggregator_failures,
+                        )
+                        break
+                else:
+                    self._consecutive_aggregator_failures = 0
                 retry_delay = 5
                 logger.warning(
                     "Round %d failed. Retrying after %ds once aggregator %s is reachable.",
@@ -1463,6 +1487,8 @@ class NodeService:
                 )
                 time.sleep(retry_delay)
                 continue
+            else:
+                self._consecutive_aggregator_failures = 0
 
             # Phase 6: ECM gossip with convergence status (bridge nodes only)
             if cid and model_hash and self.is_bridge_node:
@@ -1678,8 +1704,6 @@ class NodeService:
         targets: List[str] = []
         for member, address in self._clique_signal_addresses.items():
             if member == self.node_id:
-                continue
-            if self.inter_edges and is_bridge_node(member, self.inter_edges):
                 continue
             targets.append(address)
         if not targets:
