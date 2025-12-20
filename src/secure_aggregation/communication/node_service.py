@@ -19,7 +19,7 @@ from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
 from secure_aggregation.communication.aggregator_service import AggregatorServicer, serve as serve_aggregator
 from secure_aggregation.communication.bridge_service import BridgeClient, serve_bridge
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
-from secure_aggregation.convergence import ConvergenceConfig, ConvergenceTracker
+from secure_aggregation.convergence import ConvergenceConfig, ConvergenceState, ConvergenceTracker
 from secure_aggregation.convergence.central_broadcast import (
     CENTRAL_METADATA_CLUSTER_ID,
     fetch_central_metadata,
@@ -164,6 +164,9 @@ class NodeService:
         self.convergence_tracker: Optional[ConvergenceTracker] = None
         self._latest_cluster_converged: bool = False
         self._latest_delta_norm: float = 0.0
+        self._latest_convergence_streak: int = 0
+        self._last_model_cid: Optional[str] = None
+        self._last_model_data_id: Optional[str] = None
         self.central_metadata = None
         self.central_checker: Optional[CentralChecker] = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
@@ -176,6 +179,15 @@ class NodeService:
         self._convergence_payload_cache: Dict[str, Dict[str, Any]] = {}
         self._confirmed_global_convergence_round: Optional[int] = None
         self._confirmed_global_convergence_reason: str = ""
+        max_failures = self.secagg_config.get("max_aggregator_failure_rounds", 2)
+        try:
+            self._max_aggregator_failure_rounds = max(1, int(max_failures))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid max_aggregator_failure_rounds=%s; defaulting to 2", max_failures
+            )
+            self._max_aggregator_failure_rounds = 2
+        self._consecutive_aggregator_failures = 0
 
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
 
@@ -207,6 +219,56 @@ class NodeService:
             return
         flat_params = np.array(flatten_params(self.model), dtype=np.float32)
         self.convergence_tracker.update(flat_params, track_diff=False)
+        self.convergence_tracker.state.convergence_streak = self._latest_convergence_streak
+
+    def _update_convergence_state_from_model(
+        self,
+        model_array: np.ndarray,
+        *,
+        model_cid: Optional[str] = None,
+        model_hash: Optional[str] = None,
+        model_data_id: Optional[str] = None,
+    ) -> Optional[ConvergenceState]:
+        """Run tracker update and propagate state to the local aggregator server."""
+        if self.convergence_tracker and self.convergence_config.enabled:
+            conv_state = self.convergence_tracker.update(model_array)
+            self._latest_cluster_converged = conv_state.cluster_converged
+            self._latest_delta_norm = conv_state.delta_norm
+            self._latest_convergence_streak = conv_state.convergence_streak
+        else:
+            conv_state = ConvergenceState()
+            conv_state.delta_norm = 0.0
+            conv_state.cluster_converged = False
+            conv_state.convergence_streak = self._latest_convergence_streak
+            conv_state.should_stop = False
+            conv_state.stop_reason = ""
+            self._latest_cluster_converged = False
+            self._latest_delta_norm = 0.0
+
+        if self.aggregator_servicer:
+            self.aggregator_servicer.set_convergence_state(
+                model_cid=model_cid,
+                model_hash=model_hash,
+                model_data_id=model_data_id,
+                should_stop=conv_state.should_stop,
+                stop_reason=conv_state.stop_reason,
+                delta_norm=conv_state.delta_norm,
+                cluster_converged=conv_state.cluster_converged,
+                convergence_streak=conv_state.convergence_streak,
+            )
+        return conv_state
+
+    def _log_final_model_status(self) -> None:
+        """Log the final model accuracy and identifiers before stopping."""
+        accuracy = self.evaluate()
+        cid = self._last_model_cid or "N/A"
+        data_id = self._last_model_data_id or "N/A"
+        logger.info(
+            "Final model checkpoint: accuracy=%.4f, cid=%s, data_id=%s",
+            accuracy,
+            cid,
+            data_id,
+        )
 
     def _maybe_check_convergence_during_retry(
         self,
@@ -427,11 +489,14 @@ class NodeService:
         # Use clique members if available, otherwise fall back to all participants
         if self.clique_members:
             aggregator_id = elect_clique_aggregator(self.clique_members, round_idx)
-            logger.info(f"Elected clique aggregator for round {round_idx}: {aggregator_id} (clique {self.clique_id})")
+            logger.info(
+                f"Elected clique aggregator for round {round_idx + 1}: {aggregator_id} "
+                f"(clique {self.clique_id})"
+            )
         else:
             sorted_participants = sorted(self.participant_map.keys())
             aggregator_id = sorted_participants[round_idx % len(sorted_participants)]
-            logger.info(f"Elected global aggregator for round {round_idx}: {aggregator_id}")
+            logger.info(f"Elected global aggregator for round {round_idx + 1}: {aggregator_id}")
         return aggregator_id
 
     def start_aggregator_server(self) -> None:
@@ -1121,13 +1186,15 @@ class NodeService:
         logger.info("SAP-Round 4 complete: aggregation done")
 
         # Get global model
-        logger.info("Fetching global model")
-        model_response = stub.GetGlobalModel(secureagg_pb2.ModelRequest(round=self.current_round), timeout=30)
+        aggregated: List[float] = []
+        if self.is_aggregator:
+            logger.info("Fetching global model")
+            model_response = stub.GetGlobalModel(secureagg_pb2.ModelRequest(round=self.current_round), timeout=30)
+            aggregated = list(model_response.model_weights)
+            logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
 
         channel.close()
 
-        aggregated = list(model_response.model_weights)
-        logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
         return aggregated
 
     def run_training_loop(self) -> None:
@@ -1189,7 +1256,7 @@ class NodeService:
                 wait_for_aggregator = max(wait_for_aggregator, 8)
 
             if self.is_aggregator:
-                logger.info(f"*** This node is the AGGREGATOR for round {round_idx} ***")
+                logger.info(f"*** This node is the AGGREGATOR for round {round_idx + 1} ***")
                 self.start_aggregator_server()
 
             logger.info(
@@ -1215,6 +1282,7 @@ class NodeService:
             cid: Optional[str] = None
             model_hash: Optional[str] = None
             model_data_id: Optional[str] = None
+            aggregator_unreachable_this_round = False
             try:
                 round_failed = False
                 # Phase 2: Secure aggregation
@@ -1250,13 +1318,20 @@ class NodeService:
                             "Phase 3: Skipped ECM forwarding because inter_cluster.enabled is false"
                         )
 
-                if aggregated_weights:
+                final_model_array: Optional[np.ndarray] = None
+                final_cid: Optional[str] = None
+                final_hash: Optional[str] = None
+                final_data_id: Optional[str] = None
+
+                if self.is_aggregator and aggregated_weights:
                     logger.info("Phase 4: Updating model with aggregated weights")
                     dequantized = dequantize_vector([int(w) for w in aggregated_weights], self.scale)
                     load_params(self.model, dequantized)
+                    model_array = np.array(dequantized, dtype=np.float32)
+                    final_model_array = model_array
 
                     # Phase 5: Inter-cluster merge (aggregator only)
-                    if self.is_aggregator and self.inter_cluster_enabled and self.inter_cluster_aggregator:
+                    if self.inter_cluster_enabled and self.inter_cluster_aggregator:
                         # Wait briefly for ECMs from bridge nodes to arrive
                         time.sleep(2)
                         logger.info("Phase 5: Inter-cluster merge")
@@ -1281,106 +1356,77 @@ class NodeService:
                         merged_model, cid, model_hash = merged_data
                         model_data_id = getattr(self.inter_cluster_aggregator, "last_data_id", None)
 
-                        # Update convergence state with merged model
-                        conv_state = self.convergence_tracker.update(merged_model)
-                        should_stop = conv_state.should_stop
-                        stop_reason = conv_state.stop_reason
-                        self._latest_cluster_converged = conv_state.cluster_converged
-                        self._latest_delta_norm = conv_state.delta_norm
+                        final_model_array = merged_model
+                        final_cid = cid
+                        final_hash = model_hash
+                        final_data_id = model_data_id
 
-                        # Store convergence state in aggregator servicer for distribution
-                        if self.aggregator_servicer:
-                            self.aggregator_servicer.set_convergence_state(
-                                model_cid=cid,
-                                model_hash=model_hash,
-                                model_data_id=model_data_id,
-                                should_stop=should_stop,
-                                stop_reason=stop_reason,
-                                delta_norm=conv_state.delta_norm,
-                                cluster_converged=conv_state.cluster_converged,
-                            )
-
-                        dequantized = merged_model.tolist()
-                        load_params(self.model, dequantized)
+                        load_params(self.model, merged_model.tolist())
                         logger.info(f"Inter-cluster merge complete: cid={cid[:16] if cid else 'N/A'}...")
 
-                    elif self.is_aggregator and self.convergence_config.enabled:
-                        # Aggregator without inter-cluster: still track convergence
-                        model_array = np.array(dequantized, dtype=np.float32)
-                        conv_state = self.convergence_tracker.update(model_array)
-                        should_stop = conv_state.should_stop
-                        stop_reason = conv_state.stop_reason
-                        self._latest_cluster_converged = conv_state.cluster_converged
-                        self._latest_delta_norm = conv_state.delta_norm
+                    if final_model_array is not None and self.aggregator_servicer:
+                        quantized_final = quantize_vector(final_model_array.tolist(), self.scale)
+                        self.aggregator_servicer.aggregated_result = [float(v) for v in quantized_final]
 
-                        if self.aggregator_servicer:
-                            self.aggregator_servicer.set_convergence_state(
-                                model_cid=None,
-                                model_hash=None,
-                                model_data_id=None,
-                                should_stop=should_stop,
-                                stop_reason=stop_reason,
-                                delta_norm=conv_state.delta_norm,
-                                cluster_converged=conv_state.cluster_converged,
-                            )
+                    if final_model_array is not None:
+                        conv_state = self._update_convergence_state_from_model(
+                            final_model_array,
+                            model_cid=final_cid,
+                            model_hash=final_hash,
+                            model_data_id=final_data_id,
+                        )
+                        if conv_state:
+                            should_stop = conv_state.should_stop
+                            stop_reason = conv_state.stop_reason
 
-                    elif not self.is_aggregator:
-                        # Non-aggregator: fetch convergence decision from aggregator.
-                        # Bridge nodes wait until the aggregator publishes IPFS/chain metadata
-                        # so we can gossip ECM references reliably.
-                        wait_for_model_ref = self.is_bridge_node and self.inter_cluster_enabled
-                        model_response = self._fetch_convergence_status(wait_for_model_ref=wait_for_model_ref)
-                        if model_response:
-                            should_stop = model_response.should_stop
-                            stop_reason = model_response.stop_reason
-                            self._latest_cluster_converged = model_response.cluster_converged
-                            self._latest_delta_norm = model_response.delta_norm
+                    self._last_model_cid = final_cid
+                    self._last_model_data_id = final_data_id
 
-                            response_cid = model_response.model_cid or ""
-                            response_hash = model_response.model_hash or ""
-                            if self.is_bridge_node and response_cid and response_hash:
-                                # Remember reference for ECM gossip even if fetch fails locally
-                                cid = response_cid
-                                model_hash = response_hash
+                if not self.is_aggregator:
+                    wait_for_model_ref = self.is_bridge_node and self.inter_cluster_enabled
+                    model_response = self._await_aggregated_model(
+                        wait_for_model_ref=wait_for_model_ref,
+                        require_ready=True,
+                    )
+                    if not model_response or not model_response.model_weights:
+                        raise AggregatorUnavailable(
+                            f"Aggregator {self.aggregator_id} did not publish merged model"
+                        )
+                    should_stop = model_response.should_stop
+                    stop_reason = model_response.stop_reason
+                    self._latest_cluster_converged = model_response.cluster_converged
+                    self._latest_delta_norm = model_response.delta_norm
+                    self._latest_convergence_streak = getattr(
+                        model_response,
+                        "convergence_streak",
+                        self._latest_convergence_streak,
+                    )
+                    response_cid = model_response.model_cid or ""
+                    response_hash = model_response.model_hash or ""
+                    response_data_id = getattr(model_response, "model_data_id", "") or ""
+                    self._last_model_cid = response_cid or None
+                    self._last_model_data_id = response_data_id or None
 
-                            cluster_anchor_id = f"cluster_{self.clique_id}"
-                            response_data_id = getattr(model_response, "model_data_id", "")
-                            if response_data_id and self.blockchain:
-                                self.blockchain.remember_anchor(
-                                    cluster_anchor_id,
-                                    round_idx,
-                                    response_data_id,
-                                    model_response.model_cid or None,
-                                    model_response.model_hash or None,
-                                )
+                    quantized_final = [int(w) for w in model_response.model_weights]
+                    dequantized = dequantize_vector(quantized_final, self.scale)
+                    load_params(self.model, dequantized)
 
-                            if model_response.model_cid and self.ipfs:
-                                logger.info(
-                                    f"Fetching merged model from IPFS fallback: {model_response.model_cid[:16]}..."
-                                )
-                                try:
-                                    merged_from_ipfs = self.ipfs.get(model_response.model_cid)
-                                except Exception as ipfs_err:  # noqa: BLE001
-                                    merged_from_ipfs = None
-                                    logger.warning(
-                                        "IPFS fallback fetch failed for cid=%s: %s",
-                                        model_response.model_cid[:16],
-                                        ipfs_err,
-                                    )
-                                if merged_from_ipfs is not None:
-                                    load_params(self.model, merged_from_ipfs.tolist())
-                                    if self.is_bridge_node:
-                                        cid = model_response.model_cid
-                                        model_hash = model_response.model_hash
-                                else:
-                                    logger.warning(
-                                        "Failed to fetch merged model from IPFS fallback; "
-                                        "sharing ECM reference anyway"
-                                    )
+                    if self.is_bridge_node and response_cid and response_hash:
+                        cid = response_cid
+                        model_hash = response_hash
+
+                    cluster_anchor_id = f"cluster_{self.clique_id}"
+                    if response_data_id and self.blockchain:
+                        self.blockchain.remember_anchor(
+                            cluster_id=cluster_anchor_id,
+                            round_num=round_idx,
+                            data_id=response_data_id,
+                            cid=response_cid or None,
+                            hash_val=response_hash or None,
+                        )
 
                     # Prime tracker state so future aggregator rounds have accurate baseline.
-                    if not self.is_aggregator:
-                        self._prime_convergence_tracker_state()
+                    self._prime_convergence_tracker_state()
 
                 acc_after = self.evaluate()
                 logger.info(f"Accuracy after aggregation: {acc_after:.4f}")
@@ -1388,6 +1434,7 @@ class NodeService:
 
             except AggregatorUnavailable as exc:
                 round_failed = True
+                aggregator_unreachable_this_round = True
                 logger.warning(
                     "%s. Will retry after backoff unless convergence is confirmed.",
                     exc,
@@ -1402,15 +1449,30 @@ class NodeService:
                     self.stop_aggregator_server()
 
             if round_failed:
+                if aggregator_unreachable_this_round:
+                    self._consecutive_aggregator_failures += 1
+                    if self._consecutive_aggregator_failures >= self._max_aggregator_failure_rounds:
+                        should_stop = True
+                        stop_reason = "aggregator_unreachable"
+                        logger.error(
+                            "Stopping training: failed to reach aggregator %s for %d consecutive rounds",
+                            self.aggregator_id,
+                            self._consecutive_aggregator_failures,
+                        )
+                        break
+                else:
+                    self._consecutive_aggregator_failures = 0
                 retry_delay = 5
                 logger.warning(
                     "Round %d failed. Retrying after %ds once aggregator %s is reachable.",
-                    round_idx,
+                    round_idx + 1,
                     retry_delay,
                     self.aggregator_id,
                 )
                 time.sleep(retry_delay)
                 continue
+            else:
+                self._consecutive_aggregator_failures = 0
 
             # Phase 6: ECM gossip with convergence status (bridge nodes only)
             if cid and model_hash and self.is_bridge_node:
@@ -1426,15 +1488,20 @@ class NodeService:
                 self._check_cached_convergence_data()
                 break
 
-            logger.info(f"Training Round {round_idx} complete. Waiting before next round...")
+            logger.info(f"Training Round {round_idx + 1} complete. Waiting before next round...")
             time.sleep(5)
             self.current_round += 1
 
+        self._log_final_model_status()
         logger.info("\n" + "="*60)
         logger.info(f"Training completed after {self.current_round + 1} rounds (reason: {stop_reason or 'max_rounds'})")
         logger.info("="*60)
 
-    def _fetch_convergence_status(self, wait_for_model_ref: bool = False) -> Optional[secureagg_pb2.ModelResponse]:
+    def _await_aggregated_model(
+        self,
+        wait_for_model_ref: bool = False,
+        require_ready: bool = False,
+    ) -> Optional[secureagg_pb2.ModelResponse]:
         """
         Fetch convergence status from aggregator.
 
@@ -1451,42 +1518,45 @@ class NodeService:
             channel = grpc.insecure_channel(agg_addr)
             stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
-            attempts = 0
-            max_attempts = 10 if (wait_for_model_ref and self.inter_cluster_enabled) else 1
             delay = 2
-            response: Optional[secureagg_pb2.ModelResponse] = None
+            attempts = 0
 
-            while attempts < max_attempts:
-                response = stub.GetGlobalModel(
-                    secureagg_pb2.ModelRequest(round=self.current_round),
-                    timeout=10
-                )
-                if (
-                    not wait_for_model_ref
+            while True:
+                attempts += 1
+                try:
+                    response = stub.GetGlobalModel(
+                        secureagg_pb2.ModelRequest(round=self.current_round),
+                        timeout=10,
+                    )
+                except grpc.RpcError as exc:
+                    code = exc.code().name if hasattr(exc, "code") else "UNKNOWN"
+                    raise AggregatorUnavailable(
+                        f"Aggregator {self.aggregator_id} unreachable during GetGlobalModel "
+                        f"(attempt {attempts}, error={code})"
+                    ) from exc
+
+                has_metadata = (
+                    (not wait_for_model_ref)
                     or not self.inter_cluster_enabled
                     or (response.model_cid and response.model_hash)
-                ):
+                )
+                ready_flag = bool(getattr(response, "metadata_ready", getattr(response, "convergence_ready", False)))
+                weights_ready = bool(response.model_weights)
+                if has_metadata and (not require_ready or ready_flag) and weights_ready:
                     return response
 
-                attempts += 1
-                if attempts < max_attempts:
-                    logger.debug(
-                        "Aggregator metadata not ready (attempt %d/%d); waiting %ds",
+                if attempts % 5 == 0:
+                    logger.info(
+                        "Aggregator %s still finalizing merged model (attempt %d); waiting %ds",
+                        self.aggregator_id,
                         attempts,
-                        max_attempts,
                         delay,
                     )
-                    time.sleep(delay)
-
-            if wait_for_model_ref and self.inter_cluster_enabled:
-                logger.warning(
-                    "Aggregator metadata unavailable after %d attempts; proceeding without CID/hash",
-                    max_attempts,
-                )
-            return response
+                time.sleep(delay)
+        except AggregatorUnavailable:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to fetch convergence status: {e}")
-            return None
+            raise AggregatorUnavailable(f"Failed to fetch convergence status: {e}") from e
         finally:
             if channel:
                 channel.close()
@@ -1612,8 +1682,6 @@ class NodeService:
         targets: List[str] = []
         for member, address in self._clique_signal_addresses.items():
             if member == self.node_id:
-                continue
-            if self.inter_edges and is_bridge_node(member, self.inter_edges):
                 continue
             targets.append(address)
         if not targets:

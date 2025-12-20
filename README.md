@@ -24,12 +24,12 @@ A complete implementation of privacy-preserving federated learning using the sec
 
 ```bash
 # 1. Create virtual environment and install dependencies
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -e ".[mnist]"
+python3 -m pip install -e ".[mnist]"
 
 # 2. Generate gRPC protobuf code
-.venv/bin/python -m grpc_tools.protoc -I=protos \
+.venv/bin/python3 -m grpc_tools.protoc -I=protos \
     --python_out=src/secure_aggregation/communication \
     --grpc_python_out=src/secure_aggregation/communication \
     protos/secureagg.proto
@@ -39,10 +39,11 @@ sed -i '' 's/^import secureagg_pb2/from . import secureagg_pb2/' \
     src/secure_aggregation/communication/secureagg_pb2_grpc.py
 
 # 3. Download MNIST dataset
-python scripts/prepare_data.py
+python3 scripts/prepare_data.py
 
-# 4. Run with Docker Compose
-docker compose -f docker/docker-compose.yml up --build
+# 4. Run with Docker Compose (auto-generate configs + Compose file)
+#    (omit --nodes to use config/system-config.json:number_of_nodes)
+python3 scripts/run_docker_with_nodes.py --nodes 6
 ```
 
 **Quick restart (without rebuilding):**
@@ -157,7 +158,7 @@ The system will automatically:
 
 ## 🛠️ Configuration
 
-Edit [config/nodes/node_X.json](config/nodes/) to customize:
+Node configs are generated into [config/nodes/node_X.json](config/nodes/) by [`scripts/run_docker_with_nodes.py`](scripts/run_docker_with_nodes.py) using the defaults in [config/node.config.template.json](config/node.config.template.json). Update the template to change the baseline settings before launching, or tweak any generated file manually if a specific node needs a different configuration. Set your target fleet size once via `number_of_nodes` inside `config/system-config.json` (copy the sample if needed); the helper reads that value automatically whenever `--nodes` is omitted.
 
 ```json
 {
@@ -177,10 +178,13 @@ Edit [config/nodes/node_X.json](config/nodes/) to customize:
 }
 ```
 
-### System Config (Convergence)
-- Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to define convergence tolerances (the file is gitignored so environment-specific tweaks stay local).
+The helper populates each node's `inter_cluster.ipfs.api_url` in a round-robin manner across the available IPFS nodes and assigns blockchain identities/paths following the `trainer-node-XXX` convention (matching the expected `config/keys/trainer-node-XXX_sk.pem` layout).
+
+### System Config (Convergence & Fleet Size)
+- Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to define convergence tolerances (the file is gitignored so environment-specific tweaks stay local), plus your desired `number_of_nodes` for Docker launches.
 - Fields mirror the previous per-node `convergence` block: `enabled`, `warmup_rounds`, `tol_abs`, `tol_rel`, and `patience`.
 - `warmup_rounds` replaces the old `CONVERGENCE_WARMUP_ROUNDS` environment variable; set it to `0` to enable convergence tracking immediately or raise it to delay detection.
+- `number_of_nodes` is consumed by `scripts/run_docker_with_nodes.py` when you omit `--nodes`; override it per-run with the CLI flag if you need a temporary change.
 - Override the lookup path via the `SYSTEM_CONFIG_PATH` environment variable if the nodes should share a different config location.
 
 ## 📈 Performance
@@ -194,19 +198,19 @@ Edit [config/nodes/node_X.json](config/nodes/) to customize:
 
 ```bash
 # View all logs in real-time
-docker compose -f docker/docker-compose.yml logs -f
+docker compose -f docker/docker-compose.auto.yml logs -f
 
 # View specific node logs
-docker compose -f docker/docker-compose.yml logs -f node_0
+docker compose -f docker/docker-compose.auto.yml logs -f node_0
 
 # Save all logs to file
-docker compose -f docker/docker-compose.yml logs > training.log
+docker compose -f docker/docker-compose.auto.yml logs > training.log
 
 # Check container status
-docker compose -f docker/docker-compose.yml ps
+docker compose -f docker/docker-compose.auto.yml ps
 
 # Stop the system
-docker compose -f docker/docker-compose.yml down
+docker compose -f docker/docker-compose.auto.yml down
 ```
 
 ## 🧩 Project Structure
@@ -276,7 +280,7 @@ See [LICENSE](LICENSE) file for details.
 The `prepare_data.py` script handles SSL issues automatically. If you still see errors:
 ```bash
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-python scripts/prepare_data.py
+python3 scripts/prepare_data.py
 ```
 
 ### gRPC Import Error
@@ -293,19 +297,19 @@ If port 50051 is already in use, edit [docker/docker-compose.yml](docker/docker-
 ### Docker Build Issues
 ```bash
 # Clean everything and rebuild
-docker compose -f docker/docker-compose.yml down -v
+docker compose -f docker/docker-compose.auto.yml down -v
 docker system prune -af --volumes
-docker compose -f docker/docker-compose.yml up --build
+docker compose -f docker/docker-compose.auto.yml up --build
 ```
 
 ### Nodes Stuck or Not Progressing
 ```bash
 # Check all container logs
-docker compose -f docker/docker-compose.yml logs --tail=50
+docker compose -f docker/docker-compose.auto.yml logs --tail=50
 
 # Restart the system
-docker compose -f docker/docker-compose.yml down
-docker compose -f docker/docker-compose.yml up
+docker compose -f docker/docker-compose.auto.yml down
+docker compose -f docker/docker-compose.auto.yml up
 ```
 
 ### Out of Disk Space

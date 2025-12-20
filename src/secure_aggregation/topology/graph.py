@@ -99,6 +99,47 @@ def build_d_cliques(
             cliques[idx_a].add(swap_b)
             cliques[idx_b].remove(swap_b)
             cliques[idx_b].add(swap_a)
+    return _merge_singleton_cliques(cliques, node_distributions, global_distribution)
+
+
+def _merge_singleton_cliques(
+    cliques: List[Set[str]],
+    node_distributions: Mapping[str, LabelDist],
+    global_distribution: LabelDist,
+) -> List[Set[str]]:
+    """
+    Ensure no clique is left with a single member by merging it into the least-disruptive clique.
+    """
+    if len(cliques) <= 1:
+        return cliques
+    idx = 0
+    while idx < len(cliques):
+        clique = cliques[idx]
+        if len(clique) > 1:
+            idx += 1
+            continue
+        # Merge singleton clique into the clique that minimizes skew increase.
+        node = next(iter(clique))
+        best_target: int | None = None
+        best_delta = float("inf")
+        for target_idx, target_clique in enumerate(cliques):
+            if target_idx == idx:
+                continue
+            current_skew = compute_skew(target_clique, node_distributions, global_distribution)
+            candidate = set(target_clique)
+            candidate.add(node)
+            new_skew = compute_skew(candidate, node_distributions, global_distribution)
+            delta = new_skew - current_skew
+            if delta < best_delta:
+                best_delta = delta
+                best_target = target_idx
+        if best_target is None:
+            idx += 1
+            continue
+        cliques[best_target].add(node)
+        cliques.pop(idx)
+        if len(cliques) <= 1:
+            break
     return cliques
 
 

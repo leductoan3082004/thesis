@@ -97,6 +97,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.stop_reason: str = ""
         self.delta_norm: float = 0.0
         self.cluster_converged: bool = False
+        self.convergence_streak: int = 0
+        self.metadata_ready: bool = False
         self._convergence_signal_handler = convergence_signal_handler
 
         logger.info(
@@ -116,6 +118,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         stop_reason: str,
         delta_norm: float,
         cluster_converged: bool,
+        convergence_streak: int,
     ) -> None:
         """Store IPFS reference and convergence info for distribution to all nodes."""
         self.merged_model_cid = model_cid
@@ -125,6 +128,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.stop_reason = stop_reason
         self.delta_norm = delta_norm
         self.cluster_converged = cluster_converged
+        self.convergence_streak = convergence_streak
+        self.metadata_ready = True
 
     def _validate_participant(self, node_id: str) -> bool:
         return node_id in self.participant_ids
@@ -293,8 +298,11 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 stop_reason="",
                 delta_norm=0.0,
                 cluster_converged=False,
+                convergence_streak=0,
+                metadata_ready=self.metadata_ready,
                 model_cid="",
                 model_hash="",
+                model_data_id="",
             )
 
         logger.info(
@@ -310,6 +318,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             stop_reason=self.stop_reason,
             delta_norm=self.delta_norm,
             cluster_converged=self.cluster_converged,
+            convergence_streak=self.convergence_streak,
+            metadata_ready=self.metadata_ready,
             model_cid=self.merged_model_cid or "",
             model_hash=self.merged_model_hash or "",
             model_data_id=self.merged_model_data_id or "",
@@ -396,6 +406,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.merged_model_cid = None
         self.merged_model_hash = None
         self.merged_model_data_id = None
+        self.convergence_streak = 0
+        self.metadata_ready = False
         self._adverts.clear()
         self._adverts_committed = False
         self._round3_signatures.clear()

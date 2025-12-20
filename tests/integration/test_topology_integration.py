@@ -251,6 +251,7 @@ class TestEndToEndTopology:
 
         servicer = TTPServicer(topology_config=config, labels=labels)
 
-        # Should have 3 cliques: two of size 3, one of size 1
+        # All clients assigned and each clique has at least 2 members
         total_nodes = sum(len(c) for c in servicer.topology.cliques)
         assert total_nodes == 7
+        assert all(len(clique) >= 2 for clique in servicer.topology.cliques)

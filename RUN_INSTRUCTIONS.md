@@ -12,7 +12,29 @@ Complete guide to running end-to-end federated learning with secure aggregation 
 
 ## Quick Start (Recommended)
 
+Before running any scripts, clone the blockchain helper repo so automation can locate shared assets. The expected layout keeps this repo under `full-system/system` with the blockchain repo alongside it as `full-system/thesis-blockchain`:
+
+```bash
+# From the full-system directory that already contains the system/ folder
+git clone https://github.com/letienthanh364/thesis-blockchain.git
+```
+
+As a result, your tree should look like:
+```
+full-system/
+├── system/            # this repo
+└── thesis-blockchain/ # cloned helper repo
+```
+Keep both directories next to each other under `full-system/` so automation in `system/` can reference blockchain artifacts without extra configuration.
+
 ### Step 1: Install Dependencies
+
+Using a Python virtual environment keeps Homebrew’s Python clean and avoids the “externally-managed-environment” error:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
 ```bash
 # Install Python dependencies
@@ -35,18 +57,27 @@ This downloads MNIST to the `data/` directory which is mounted in Docker contain
 ### Step 3: Run with Docker Compose
 
 ```bash
-# Build and start all services
-cd docker
-docker compose up --build
+# End-to-end automation: regenerates Fabric crypto, creates node configs,
+# generates blockchain identities, starts the Fabric stack, bulk-registers
+# trainers, and launches federated nodes. Omit --nodes to read
+# config/system-config.json:number_of_nodes.
+AUTH_JWT_SECRET="super-secret" python scripts/run_docker_with_nodes.py --nodes 10
 
-# View logs from all containers
-docker compose logs -f
+# View logs from all federated containers
+cd docker
+docker compose -f docker-compose.auto.yml logs -f
 
 # View logs from specific node
-docker compose logs -f node_0
+docker compose -f docker-compose.auto.yml logs -f node_0
 
 # Stop services
-docker compose down -v
+docker compose -f docker-compose.auto.yml down -v
+
+# Manual maintenance commands (if you need to manage stacks yourself):
+# Blockchain
+(cd ../thesis-blockchain/api-gateway && docker compose down -v && docker compose up --build -d)
+# Federated nodes
+(cd docker && docker compose -f docker-compose.auto.yml down -v && docker compose -f docker-compose.auto.yml up --build -d)
 ```
 
 ## What You'll See
@@ -111,6 +142,8 @@ For each round:
 
 ## Configuration
 
+Node configs live under `config/nodes/` and are generated automatically from `config/node.config.template.json` every time you run `scripts/run_docker_with_nodes.py`. Update the template to change defaults before launching, or tweak individual node files after generation if specific overrides are needed. The helper rotates IPFS endpoints and blockchain identities (`trainer-node-XXX`) automatically so you only need to supply the template once, and it reads the target fleet size from `number_of_nodes` in `config/system-config.json` whenever `--nodes` is omitted.
+
 ### Dataset Partitioning (Dirichlet)
 - `alpha=0.5`: Moderate non-IID (realistic federated setting)
 - Lower alpha = more non-IID, higher alpha = more IID
@@ -126,6 +159,7 @@ For each round:
 - `warmup_rounds` inside `config/system-config.json` controls how many rounds each node waits before emitting convergence signals (default `5` in the sample file).
 - Lower it to `0` to start convergence checks immediately or raise it to defer signals; this replaces the deprecated `CONVERGENCE_WARMUP_ROUNDS` environment override.
 - This is distinct from `MAX_TRAINING_ROUNDS`, which caps the total number of federated rounds.
+- Set `number_of_nodes` in the same file once so Docker launches know how many node configs/services to generate when you omit `--nodes`.
 
 ### Global Convergence Settings
 - Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to change `enabled`, `tol_abs`, `tol_rel`, or `patience` without touching every node file. The resolved file is gitignored so you can keep environment-specific thresholds private.
