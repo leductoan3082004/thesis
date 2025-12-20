@@ -1,68 +1,483 @@
-version: '3.9'
+version: "3.9"
+
 services:
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
+    hostname: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=1h'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - secureagg
+
+  dashboard-generator:
+    image: python:3.11-slim
+    container_name: dashboard-generator
+    volumes:
+      - ../config:/app/config:ro
+      - ../scripts:/app/scripts:ro
+      - ./grafana/dashboards:/app/output
+    working_dir: /app
+    command: ["python", "scripts/generate_grafana_dashboard.py"]
+    networks:
+      - secureagg
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: grafana
+    restart: always
+    hostname: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - secureagg
+    depends_on:
+      dashboard-generator:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_started
+
+  ipfs-node-1:
+    image: ipfs/kubo:v0.29.0
+    container_name: ipfs-node-1
+    restart: always
+    hostname: ipfs-node-1
+    environment:
+      NODE_NAME: "ipfs-node-1"
+    volumes:
+      - ../data/ipfs/node-1:/data/ipfs
+      - ./ipfs-bootstrap.sh:/container-bootstrap.sh
+    networks:
+      - secureagg
+    entrypoint: ["/bin/sh", "/container-bootstrap.sh"]
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  registry:
+    build:
+      context: ..
+      dockerfile: docker/registry.Dockerfile
+    container_name: model-registry
+    restart: always
+    hostname: registry
+    environment:
+      REGISTRY_STORAGE_PATH: "/data/registry.json"
+    volumes:
+      - ../data/registry:/data
+    networks:
+      - secureagg
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/gateway.Dockerfile
+    container_name: blockchain-gateway
+    restart: always
+    hostname: gateway
+    environment:
+      - GATEWAY_STORAGE_PATH=/data/blockchain_gateway.json
+      - GATEWAY_PUBLIC_KEYS_DIR=/app/config/keys
+    volumes:
+      - ../data/gateway:/data
+      - ../config/keys:/app/config/keys
+      - ../src:/app/src
+    networks:
+      - secureagg
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   ttp:
     build:
       context: ..
-      dockerfile: docker/ttp.Dockerfile
-    command:
-    - python
-    - -c
-    - print('TTP placeholder')
+      dockerfile: docker/node.Dockerfile
     container_name: ttp
+    command: ["python", "scripts/run_ttp_with_topology.py", "--num-clients", "12", "--clique-size", "4", "--topology-output", "/app/config/topology.json"]
     networks:
-    - secureagg
-    volumes: &id001
-    - ../config:/app/config
-    - ../data:/app/data
-    - ../logs:/app/logs
-    - ../checkpoints:/app/checkpoints
-  node_a:
+      - secureagg
+    ports:
+      - "50051:50051"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NUM_CLIENTS=12
+      - CLIQUE_SIZE=4
+      - ALPHA=0.5
+      - SEED=42
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../config:/app/config
+      - ../src:/app/src
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/app/config/topology.json') else 1)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  node_0:
     build:
       context: ..
       dockerfile: docker/node.Dockerfile
-    command:
-    - python
-    - -m
-    - secure_aggregation.node.service
-    container_name: node_a
-    environment:
-    - NODE_ID=node_a
-    - SCENARIO_PATH=/app/config/scenario.sample.json
-    - PORT=8000
+    container_name: node_0
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_0.json"]
     networks:
-    - secureagg
-    volumes: *id001
-  node_b:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_1:
     build:
       context: ..
       dockerfile: docker/node.Dockerfile
-    command:
-    - python
-    - -m
-    - secure_aggregation.node.service
-    container_name: node_b
-    environment:
-    - NODE_ID=node_b
-    - SCENARIO_PATH=/app/config/scenario.sample.json
-    - PORT=8000
+    container_name: node_1
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_1.json"]
     networks:
-    - secureagg
-    volumes: *id001
-  node_c:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_2:
     build:
       context: ..
       dockerfile: docker/node.Dockerfile
-    command:
-    - python
-    - -m
-    - secure_aggregation.node.service
-    container_name: node_c
-    environment:
-    - NODE_ID=node_c
-    - SCENARIO_PATH=/app/config/scenario.sample.json
-    - PORT=8000
+    container_name: node_2
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_2.json"]
     networks:
-    - secureagg
-    volumes: *id001
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_3:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_3
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_3.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_4:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_4
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_4.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_5:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_5
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_5.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_6:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_6
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_6.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_7:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_7
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_7.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_8:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_8
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_8.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_9:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_9
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_9.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_10:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_10
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_10.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
+  node_11:
+    build:
+      context: ..
+      dockerfile: docker/node.Dockerfile
+    container_name: node_11
+    command: ["sh", "-c", "sleep 10 && python -m secure_aggregation.communication.node_service --config /app/config/nodes/node_11.json"]
+    networks:
+      - secureagg
+    depends_on:
+      ttp:
+        condition: service_healthy
+      ipfs-node-1:
+        condition: service_healthy
+      registry:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ../config:/app/config
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+      - ../src:/app/src
+
 networks:
-  secureagg: {}
+  secureagg:
+    driver: bridge
+
+volumes:
+  grafana_data:

@@ -42,7 +42,13 @@ from secure_aggregation.storage.model_store import (
     verify_model_hash,
 )
 from secure_aggregation.topology import elect_clique_aggregator, get_inter_clique_neighbors, is_bridge_node
-from secure_aggregation.utils import configure_logging, get_logger
+from secure_aggregation.utils import (
+    configure_logging,
+    get_logger,
+    CommunicationTracker,
+    track_rpc_call,
+)
+from secure_aggregation.utils.prometheus_metrics import PrometheusMetrics
 
 logger = get_logger("node_service")
 
@@ -188,6 +194,13 @@ class NodeService:
             )
             self._max_aggregator_failure_rounds = 2
         self._consecutive_aggregator_failures = 0
+
+        # Metrics tracking state
+        self.prom_metrics: Optional[PrometheusMetrics] = None
+        self.comm_tracker: Optional[CommunicationTracker] = None
+        self.val_loader: Optional[DataLoader] = None
+        self.train_indices: List[int] = []
+        self.val_indices: List[int] = []
 
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
 
@@ -431,17 +444,32 @@ class NodeService:
             indices = parts.get(client_key, [])
             logger.info(f"Using {len(indices)} locally-computed data samples")
 
+        # Split indices into train (80%) and validation (20%) for metrics tracking
+        import random
+        indices_copy = list(indices)
+        random.seed(42)
+        random.shuffle(indices_copy)
+        split_point = int(len(indices_copy) * 0.8)
+        self.train_indices = indices_copy[:split_point]
+        self.val_indices = indices_copy[split_point:]
+
         batch_size = self.training_config["batch_size"]
-        self.train_loader = DataLoader(Subset(train_ds, indices), batch_size=batch_size, shuffle=True)
+        self.train_loader = DataLoader(Subset(train_ds, self.train_indices), batch_size=batch_size, shuffle=True)
+        self.val_loader = DataLoader(Subset(train_ds, self.val_indices), batch_size=batch_size, shuffle=False)
         self.test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
+        logger.info(f"Data split: {len(self.train_indices)} train, {len(self.val_indices)} validation samples")
 
     def setup_model(self) -> None:
         """Initialize model."""
         self.model = MnistLinear()
         logger.info("Model initialized")
 
-    def train_local(self, epochs: int) -> None:
-        """Train model locally for specified epochs."""
+    def train_local(self, epochs: int) -> Tuple[int, int]:
+        """Train model locally for specified epochs.
+
+        Returns:
+            Tuple of (total_samples, total_batches) for metrics tracking.
+        """
         if not self.model or not self.train_loader:
             raise RuntimeError("Model or data not initialized")
 
@@ -449,6 +477,9 @@ class NodeService:
         model = copy.deepcopy(self.model).to(device)
         opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
         model.train()
+
+        total_samples = 0
+        total_batches = 0
 
         for epoch in range(epochs):
             for data, target in self.train_loader:
@@ -458,9 +489,12 @@ class NodeService:
                 loss = torch.nn.functional.cross_entropy(logits, target)
                 loss.backward()
                 opt.step()
+                total_samples += data.size(0)
+                total_batches += 1
 
         self.model = model.cpu()
-        logger.info(f"Local training completed for {epochs} epochs")
+        logger.info(f"Local training completed for {epochs} epochs ({total_samples} samples, {total_batches} batches)")
+        return total_samples, total_batches
 
     def evaluate(self) -> float:
         """Evaluate model on test set."""
@@ -483,6 +517,49 @@ class NodeService:
 
         accuracy = correct / total if total else 0.0
         return accuracy
+
+    def evaluate_on_train(self) -> float:
+        """Evaluate model accuracy on training set."""
+        if not self.model or not self.train_loader:
+            return 0.0
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = copy.deepcopy(self.model).to(device)
+        model.eval()
+
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for data, target in self.train_loader:
+                data, target = data.to(device), target.to(device)
+                logits = model(data)
+                pred = logits.argmax(dim=1)
+                correct += (pred == target).sum().item()
+                total += target.size(0)
+
+        return correct / total if total else 0.0
+
+    def evaluate_on_val(self) -> float:
+        """Evaluate model accuracy on validation set."""
+        if not self.model or not self.val_loader:
+            return 0.0
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = copy.deepcopy(self.model).to(device)
+        model.eval()
+
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for data, target in self.val_loader:
+                data, target = data.to(device), target.to(device)
+                logits = model(data)
+                pred = logits.argmax(dim=1)
+                correct += (pred == target).sum().item()
+                total += target.size(0)
+
+        return correct / total if total else 0.0
+
 
     def elect_aggregator(self, round_idx: int) -> str:
         """Elect aggregator within clique using round-robin."""
@@ -988,6 +1065,8 @@ class NodeService:
 
         # SAP Round 0: Advertise keys
         logger.info("SAP-Round 0: Advertising keys")
+        sap_r0_start = time.monotonic()
+        self.comm_tracker.set_phase("sap_round0")
         advert_msg = client.advertise_keys()
 
         # Retry logic for initial aggregator connection.
@@ -1059,6 +1138,10 @@ class NodeService:
 
             logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
 
+        # Record Round 0 timing
+        if self.prom_metrics:
+            self.prom_metrics.observe_sap_phase("round0", time.monotonic() - sap_r0_start)
+
         # Pass received advertisements to client
         ordered_participants = [p.node_id for p in response.all_keys]
         adverts = [
@@ -1075,6 +1158,8 @@ class NodeService:
 
         # SAP Round 1: Share keys (simplified - just send empty shares)
         logger.info("SAP-Round 1: Sharing keys")
+        sap_r1_start = time.monotonic()
+        self.comm_tracker.set_phase("sap_round1")
         ct_list = client.create_round1_ciphertexts(ordered_participants, self.threshold)
         response1 = stub.Round1ShareKeys(
             secureagg_pb2.ShareKeysMessage(
@@ -1124,8 +1209,14 @@ class NodeService:
             ]
         client.receive_round1_ciphertexts(mailbox)
 
+        # Record Round 1 timing
+        if self.prom_metrics:
+            self.prom_metrics.observe_sap_phase("round1", time.monotonic() - sap_r1_start)
+
         # SAP Round 2: Send masked input
         logger.info("SAP-Round 2: Sending masked model")
+        sap_r2_start = time.monotonic()
+        self.comm_tracker.set_phase("sap_round2")
         model_vec = flatten_params(self.model)
         quantized = quantize_vector(model_vec, self.scale)
 
@@ -1148,16 +1239,28 @@ class NodeService:
 
         logger.info(f"SAP-Round 2 complete: {len(response2.survivors)} survivors")
 
+        # Record Round 2 timing
+        if self.prom_metrics:
+            self.prom_metrics.observe_sap_phase("round2", time.monotonic() - sap_r2_start)
+
         # SAP Round 3: Consistency check
         logger.info("SAP-Round 3: Consistency check")
+        sap_r3_start = time.monotonic()
+        self.comm_tracker.set_phase("sap_round3")
         survivor_sig = client.sign_survivor_list(response2.survivors)
         response3 = stub.Round3ConsistencyCheck(
             secureagg_pb2.ConsistencySignature(node_id=self.node_id, signature=survivor_sig.signature),
             timeout=30,
         )
 
+        # Record Round 3 timing
+        if self.prom_metrics:
+            self.prom_metrics.observe_sap_phase("round3", time.monotonic() - sap_r3_start)
+
         # SAP Round 4: Unmask (simplified - send empty shares)
         logger.info("SAP-Round 4: Unmasking")
+        sap_r4_start = time.monotonic()
+        self.comm_tracker.set_phase("sap_round4")
         dropouts = set(ordered_participants) - set(response2.survivors)
         unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
         response4 = stub.Round4Unmask(
@@ -1185,10 +1288,15 @@ class NodeService:
 
         logger.info("SAP-Round 4 complete: aggregation done")
 
+        # Record Round 4 timing
+        if self.prom_metrics:
+            self.prom_metrics.observe_sap_phase("round4", time.monotonic() - sap_r4_start)
+
         # Get global model
         aggregated: List[float] = []
         if self.is_aggregator:
             logger.info("Fetching global model")
+            self.comm_tracker.set_phase("model_fetch")
             model_response = stub.GetGlobalModel(secureagg_pb2.ModelRequest(round=self.current_round), timeout=30)
             aggregated = list(model_response.model_weights)
             logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
@@ -1215,6 +1323,12 @@ class NodeService:
         )
         self._refresh_central_metadata()
 
+        # Initialize Prometheus metrics
+        self.prom_metrics = PrometheusMetrics.get_instance(self.node_id, self.clique_id)
+        self.prom_metrics.set_training_samples(len(self.train_indices))
+        self.prom_metrics.set_model_parameters(sum(p.numel() for p in self.model.parameters()))
+        self.comm_tracker = CommunicationTracker(self.node_id)
+
         logger.info(
             f"Starting convergence-driven training (max_rounds={max_rounds}, "
             f"warmup_rounds={convergence_warmup}, "
@@ -1226,6 +1340,10 @@ class NodeService:
 
         while self.current_round < max_rounds and not should_stop:
             round_idx = self.current_round
+            round_start_time = time.monotonic()
+            self.comm_tracker.set_round(round_idx)
+            self.prom_metrics.set_round(round_idx)
+
             logger.info(f"\n{'='*60}")
             logger.info(f"Round {round_idx + 1}/{max_rounds}")
             logger.info(f"{'='*60}")
@@ -1236,7 +1354,14 @@ class NodeService:
 
             # Phase 1: Local training
             logger.info("Phase 1: Local training")
-            self.train_local(local_epochs)
+            train_start = time.monotonic()
+            train_samples, train_batches = self.train_local(local_epochs)
+            local_training_time = time.monotonic() - train_start
+            self.prom_metrics.observe_local_training(local_training_time)
+
+            # Evaluate on train/val/test sets for metrics
+            train_acc = self.evaluate_on_train()
+            val_acc = self.evaluate_on_val()
 
             acc_before = self.evaluate()
             logger.info(f"Accuracy before aggregation: {acc_before:.4f}")
@@ -1287,6 +1412,7 @@ class NodeService:
                 round_failed = False
                 # Phase 2: Secure aggregation
                 logger.info("Phase 2: Secure aggregation")
+                sap_start = time.monotonic()
                 try:
                     aggregated_weights = self.run_secure_aggregation_round()
                 except GlobalStopRequested:
@@ -1295,6 +1421,9 @@ class NodeService:
                     round_failed = True
                     logger.info("Aborting secure aggregation due to confirmed global convergence")
                     break
+                finally:
+                    agg_time = time.monotonic() - sap_start
+                    self.prom_metrics.observe_aggregation(agg_time)
 
                 # Phase 3: Bridge nodes forward ECMs (if inter-cluster is enabled)
                 if self.is_bridge_node:
@@ -1429,6 +1558,14 @@ class NodeService:
                     self._prime_convergence_tracker_state()
 
                 acc_after = self.evaluate()
+                # Update Prometheus metrics
+                self.prom_metrics.set_accuracy(train_acc, val_acc, acc_after)
+                self.prom_metrics.set_convergence(
+                    self._latest_delta_norm,
+                    self.convergence_tracker.state.convergence_streak if self.convergence_tracker else 0,
+                    self._latest_cluster_converged,
+                )
+                self.prom_metrics.set_aggregator_status(self.is_aggregator)
                 logger.info(f"Accuracy after aggregation: {acc_after:.4f}")
                 logger.info(f"Improvement: {acc_after - acc_before:+.4f}")
 
@@ -1487,6 +1624,17 @@ class NodeService:
                 logger.info(f"Stopping training: {stop_reason}")
                 self._check_cached_convergence_data()
                 break
+
+            # Record round total time
+            round_total_time = time.monotonic() - round_start_time
+            self.prom_metrics.observe_round_total(round_total_time)
+
+            # Get communication stats from tracker and record to Prometheus
+            comm_stats = self.comm_tracker.get_round_stats(round_idx)
+            self.prom_metrics.add_bytes_sent(comm_stats["bytes_sent"])
+            self.prom_metrics.add_bytes_received(comm_stats["bytes_received"])
+            self.prom_metrics.add_messages_sent(comm_stats["messages_sent"])
+            self.prom_metrics.add_messages_received(comm_stats["messages_received"])
 
             logger.info(f"Training Round {round_idx + 1} complete. Waiting before next round...")
             time.sleep(5)

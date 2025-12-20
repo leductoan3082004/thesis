@@ -1,6 +1,57 @@
 version: "3.9"
 
 services:
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
+    hostname: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=1h'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - secureagg
+
+  dashboard-generator:
+    image: python:3.11-slim
+    container_name: dashboard-generator
+    volumes:
+      - ../config:/app/config:ro
+      - ../scripts:/app/scripts:ro
+      - ./grafana/dashboards:/app/output
+    working_dir: /app
+    command: ["python", "scripts/generate_grafana_dashboard.py"]
+    networks:
+      - secureagg
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: grafana
+    restart: always
+    hostname: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - secureagg
+    depends_on:
+      dashboard-generator:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_started
+
   ipfs-node-1:
     image: ipfs/kubo:v0.29.0
     container_name: ipfs-node-1
@@ -35,6 +86,28 @@ services:
       - secureagg
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/gateway.Dockerfile
+    container_name: blockchain-gateway
+    restart: always
+    hostname: gateway
+    environment:
+      - GATEWAY_STORAGE_PATH=/data/blockchain_gateway.json
+      - GATEWAY_PUBLIC_KEYS_DIR=/app/config/keys
+    volumes:
+      - ../data/gateway:/data
+      - ../config/keys:/app/config/keys
+      - ../src:/app/src
+    networks:
+      - secureagg
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -81,8 +154,12 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
+      gateway:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -105,8 +182,12 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
+      gateway:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -129,8 +210,12 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
+      gateway:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -153,8 +238,12 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
+      gateway:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -177,8 +266,12 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
+      gateway:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -201,8 +294,12 @@ services:
         condition: service_healthy
       registry:
         condition: service_healthy
+      gateway:
+        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
+      - MAX_TRAINING_ROUNDS=10000
+      - PROMETHEUS_PORT=8000
     volumes:
       - ../config:/app/config
       - ../data:/app/data
@@ -213,3 +310,6 @@ services:
 networks:
   secureagg:
     driver: bridge
+
+volumes:
+  grafana_data:

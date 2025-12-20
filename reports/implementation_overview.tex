@@ -1,0 +1,65 @@
+% Implementation overview for thesis reporting.
+% This file is intended to be included from the main report body.
+
+\subsubsection{Implementation Overview}
+\label{sec:implementation-overview}
+
+This codebase realizes a privacy-preserving federated learning system in which secure aggregation is executed in a distributed setting. The architecture is layered to separate cryptography, protocol logic, communication, training, and inter-cluster coordination, supporting reproducible experimentation and clear alignment with privacy and robustness goals.
+
+\subsubsection{Technology Stack and Library Roles}
+\label{sec:implementation-tech-stack}
+
+The system is implemented in \textbf{Python 3.10} as a modular research prototype. The principal libraries and their roles are:
+\begin{itemize}
+  \item \textbf{Distributed communication}: \texttt{grpcio} + Protocol Buffers for RPC among nodes, aggregators, bridges, and the TTP.
+  \item \textbf{Cryptography}: \texttt{cryptography} for ECDH, Ed25519 signatures, and AEAD (AES-GCM).
+  \item \textbf{Machine learning}: \texttt{torch}, \texttt{torchvision}, \texttt{numpy} for training, vectorization, and evaluation on MNIST.
+  \item \textbf{Service APIs}: \texttt{fastapi}/\texttt{uvicorn} for registry/gateway services; \texttt{httpx} for HTTP access; \texttt{pydantic} for schemas.
+  \item \textbf{Monitoring}: \texttt{prometheus-client} with Grafana dashboards.
+  \item \textbf{Deployment}: Docker + Docker Compose; IPFS Kubo for content-addressed storage.
+\end{itemize}
+
+\subsubsection{Componentization and Functional Roles}
+\label{sec:implementation-components}
+
+\begin{description}
+  \item[Cryptographic layer.] Implements the primitives required by secure aggregation (ECDH, AEAD, signatures, PRG, Shamir). It provides the security substrate for privacy and verifiability.\\
+  \texttt{crypto/}
+
+  \item[Protocol layer.] Defines the secure aggregation rounds and the inter-cluster merge algorithm with adaptive clipping, isolating protocol logic from transport and training.\\
+  \texttt{protocol/}
+
+  \item[Communication layer.] Implements gRPC services for the TTP, aggregator, nodes, and bridge exchange, enabling protocol execution under distributed constraints.\\
+  \texttt{communication/}
+
+  \item[Node runtime and training workflows.] Coordinates local training, quantization, secure aggregation participation, and model updates, using non-IID data partitioning and round-based evaluation.\\
+  \texttt{communication/node\_service.py}, \texttt{training/}
+
+  \item[Topology and membership.] Builds D-cliques, inter-clique edges, and aggregator selection rules, with structured configuration for system and node parameters.\\
+  \texttt{topology/}, \texttt{config/}
+
+  \item[Inter-cluster coordination.] Bridge nodes exchange external cluster models (ECMs), and the inter-cluster aggregator verifies and merges neighbor models.\\
+  \texttt{communication/inter\_cluster\_aggregator.py}, \texttt{node/}
+
+  \item[Storage and anchoring services.] Provides IPFS content addressing and blockchain-like registries (mock registry or gateway) for provenance and auditable synchronization.\\
+  \texttt{storage/}
+
+  \item[Convergence coordination.] Tracks local convergence and coordinates global stopping across clusters.\\
+  \texttt{convergence/}
+
+  \item[Observability and utilities.] Logging, retry utilities, communication accounting, and Prometheus metrics support empirical traceability.\\
+  \texttt{utils/}
+\end{description}
+
+\subsubsection{Deployment Outline}
+\label{sec:implementation-deployment}
+
+The current implementation supports both containerized deployment and local execution. A typical deployment sequence is as follows:
+\begin{enumerate}
+  \item \textbf{Environment}: Install dependencies and generate gRPC stubs from \texttt{protos/secureagg.proto}.
+  \item \textbf{Data}: Download and partition MNIST data into the shared \texttt{data/} volume.
+  \item \textbf{Core services}: Start the TTP, then the federated nodes; aggregators are elected per round.
+  \item \textbf{Optional storage}: Deploy IPFS and a registry/gateway for anchoring model metadata.
+  \item \textbf{Monitoring}: Enable Prometheus scraping and Grafana dashboards.
+  \item \textbf{Orchestration}: Use Docker Compose in \texttt{docker/} or run locally for debugging.
+\end{enumerate}
