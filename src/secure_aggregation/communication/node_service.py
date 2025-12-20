@@ -116,7 +116,7 @@ class NodeService:
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
-        default_round_cap = 50
+        default_round_cap = 200
         if env_rounds:
             try:
                 self.max_training_rounds = max(1, int(env_rounds))
@@ -631,6 +631,7 @@ class NodeService:
             ipfs_timeout = ipfs_config.get("timeout", 30.0)
             ipfs_max_retries = ipfs_config.get("max_retries", 5)
             ipfs_retry_delay = ipfs_config.get("retry_delay", 2.0)
+            replica_urls = ipfs_config.get("replica_api_urls", [])
             gateway_url = blockchain_config.get(
                 "gateway_url",
                 os.environ.get("BLOCKCHAIN_GATEWAY_URL", "http://localhost:9000"),
@@ -652,6 +653,7 @@ class NodeService:
                 timeout=ipfs_timeout,
                 max_retries=ipfs_max_retries,
                 retry_delay=ipfs_retry_delay,
+                replica_api_urls=replica_urls,
             )
             self.blockchain = GatewayBlockchain(
                 base_url=gateway_url,

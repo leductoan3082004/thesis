@@ -82,6 +82,8 @@ CA_PORT = "7054"
 DEFAULT_GATEWAY_URL = os.environ.get("BLOCKCHAIN_GATEWAY_URL", "http://localhost:9000")
 GATEWAY_HEALTH_PATH = "/health"
 GATEWAY_BULK_PATH = "/auth/register-trainers"
+NODE_IMAGE_TAG = os.environ.get("SECUREAGG_NODE_IMAGE", "secureagg-node:latest")
+NODE_DOCKERFILE = ROOT_DIR / "docker" / "node.Dockerfile"
 
 
 DEFAULT_NODE_SERVICE: Dict[str, Any] = {
@@ -190,10 +192,19 @@ def _select_ipfs_service(node_index: int, services: List[str]) -> str:
     return services[node_index % len(services)]
 
 
-def _apply_ipfs_distribution(ipfs_service: str, config: Dict[str, Any]) -> None:
+def _apply_ipfs_distribution(ipfs_service: str, config: Dict[str, Any], all_services: List[str]) -> None:
     inter_cluster = config.setdefault("inter_cluster", {})
     ipfs_section = inter_cluster.setdefault("ipfs", {})
     ipfs_section["api_url"] = f"http://{ipfs_service}:5001"
+    replicas = [
+        f"http://{service}:5001"
+        for service in all_services
+        if service != ipfs_service
+    ]
+    if replicas:
+        ipfs_section["replica_api_urls"] = replicas
+    elif "replica_api_urls" in ipfs_section:
+        del ipfs_section["replica_api_urls"]
 
 
 def _apply_blockchain_identity(node_index: int, config: Dict[str, Any]) -> None:
@@ -905,6 +916,55 @@ def _wait_for_gateway_health(base_url: str, timeout: int = 240, interval: int = 
     raise SystemExit(f"Gateway at {url} did not become healthy within {timeout} seconds.")
 
 
+def _trainer_identifier(entry: Dict[str, Any]) -> str:
+    """Resolve a consistent identifier for trainer payloads/results."""
+    for key in (
+        "jwt_sub",
+        "jwtSub",
+        "JWTSub",
+        "nodeId",
+        "NodeID",
+        "node_id",
+        "did",
+        "DID",
+        "trainerId",
+        "trainer_id",
+        "subject",
+        "Subject",
+    ):
+        value = entry.get(key)
+        if value:
+            return str(value)
+    return "unknown"
+
+
+def _parse_bulk_errors(body: str) -> List[Dict[str, Any]]:
+    """Return the failing entries from a bulk registration response body."""
+    if not body.strip():
+        return []
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return []
+    errors: List[Dict[str, Any]] = []
+    for result in results:
+        status_raw = result.get("status") or result.get("Status") or ""
+        if str(status_raw).lower() == "ok":
+            continue
+        identifier = _trainer_identifier(result)
+        errors.append(
+            {
+                "id": identifier,
+                "error": result.get("error") or result.get("Error") or "unknown error",
+                "http_status": result.get("status_code") or result.get("HTTPStatus"),
+            },
+        )
+    return errors
+
+
 def _bulk_register_trainers(paths: Dict[str, Path], base_url: str) -> None:
     if not paths["admin_jwt_path"].exists():
         raise SystemExit(f"Admin JWT not found at {paths['admin_jwt_path']}.")
@@ -920,48 +980,78 @@ def _bulk_register_trainers(paths: Dict[str, Path], base_url: str) -> None:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+    total_batches = (len(entries) + batch_size - 1) // batch_size
     for offset in range(0, len(entries), batch_size):
         batch = entries[offset : offset + batch_size]
-        trainer_ids = [
-            entry.get("nodeId") or entry.get("trainerId") or entry.get("did") or "unknown"
-            for entry in batch
-        ]
-        payload = json.dumps(batch).encode()
-        request = urllib_request.Request(url, data=payload, headers=headers, method="POST")
+        batch_index = offset // batch_size + 1
+        trainer_ids = [_trainer_identifier(entry) for entry in batch]
         print(
-            f"Registering trainers {', '.join(trainer_ids)} (batch "
-            f"{offset // batch_size + 1}/{(len(entries) + batch_size - 1) // batch_size})",
+            f"Registering trainers {', '.join(trainer_ids)} (batch {batch_index}/{total_batches})",
         )
-        for attempt in range(1, 4):
+        pending = list(batch)
+        attempt = 1
+        last_errors: List[str] = []
+        while pending and attempt <= 3:
+            pending_ids = [_trainer_identifier(entry) for entry in pending]
+            payload = json.dumps(pending).encode()
+            request = urllib_request.Request(url, data=payload, headers=headers, method="POST")
             try:
                 with urllib_request.urlopen(request, timeout=60) as response:
-                    response.read()  # body unused
-                    print(f"Registered trainers {', '.join(trainer_ids)} successfully.")
+                    body = response.read().decode("utf-8", errors="replace")
+                errors = _parse_bulk_errors(body)
+                if not errors:
+                    print(f"Registered trainers {', '.join(pending_ids)} successfully.")
+                    pending = []
                     break
+                last_errors = [
+                    f"{err['id']}: {err['error']} (HTTP {err.get('http_status') or 'unknown'})"
+                    for err in errors
+                ]
+                print(
+                    f"Batch {batch_index} attempt {attempt} encountered {len(errors)} errors; "
+                    "retrying the affected trainers.",
+                )
+                entry_map = {_trainer_identifier(entry): entry for entry in pending}
+                pending = [
+                    entry_map[err["id"]]
+                    for err in errors
+                    if err["id"] in entry_map
+                ]
             except urllib_error.HTTPError as exc:
                 if exc.code == 409:
                     print(
-                        f"Trainers {', '.join(trainer_ids)} were already registered (HTTP 409).",
+                        f"Trainers {', '.join(pending_ids)} were already registered (HTTP 409).",
                     )
+                    pending = []
                     break
                 body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+                last_errors = [f"HTTP {exc.code}: {body.strip()}"]
                 if attempt >= 3:
                     raise SystemExit(
-                        f"Bulk registration batch {offset // batch_size + 1} failed "
+                        f"Bulk registration batch {batch_index} failed "
                         f"(HTTP {exc.code}): {body.strip()}",
                     )
                 print(
-                    f"Batch {offset // batch_size + 1} attempt {attempt} failed with HTTP {exc.code}; retrying...",
+                    f"Batch {batch_index} attempt {attempt} failed with HTTP {exc.code}; retrying...",
                 )
             except (urllib_error.URLError, http_client.RemoteDisconnected) as err:
+                last_errors = [str(err)]
                 if attempt >= 3:
                     raise SystemExit(
-                        f"Batch {offset // batch_size + 1} failed: {err}",
+                        f"Batch {batch_index} failed: {err}",
                     ) from err
                 print(
-                    f"Batch {offset // batch_size + 1} attempt {attempt} failed: {err}. Retrying...",
+                    f"Batch {batch_index} attempt {attempt} failed: {err}. Retrying...",
                 )
-            time.sleep(5)
+            attempt += 1
+            if pending and attempt <= 3:
+                time.sleep(5)
+        if pending:
+            detail = "; ".join(last_errors) or "unknown error"
+            failed_ids = ", ".join(_trainer_identifier(entry) for entry in pending)
+            raise SystemExit(
+                f"Bulk registration batch {batch_index} failed for trainers {failed_ids}: {detail}",
+            )
 
 
 def _start_blockchain_stack(paths: Dict[str, Path], auth_secret: str) -> str:
@@ -1080,6 +1170,55 @@ def _extract_ipfs_services(compose_data: Dict[str, Any]) -> List[str]:
     return sorted(ipfs_services, key=_ipfs_sort_key)
 
 
+def _apply_shared_node_image(service: Optional[Dict[str, Any]], image_tag: Optional[str]) -> None:
+    """Ensure a service reuses the shared node image to avoid redundant builds."""
+    if not service or not image_tag:
+        return
+    service["image"] = image_tag
+    service.pop("build", None)
+
+
+def _docker_image_exists(image_tag: str) -> bool:
+    result = subprocess.run(
+        ["docker", "image", "inspect", image_tag],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _build_shared_node_image(image_tag: str) -> None:
+    print(f"Building shared training node image '{image_tag}' from {NODE_DOCKERFILE}...")
+    cmd = [
+        "docker",
+        "build",
+        "-t",
+        image_tag,
+        "-f",
+        str(NODE_DOCKERFILE),
+        str(ROOT_DIR),
+    ]
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"docker build failed with exit code {result.returncode}; "
+            "see the logs above for details.",
+        )
+
+
+def _ensure_shared_node_image(image_tag: str, skip_build: bool) -> None:
+    if skip_build:
+        if not _docker_image_exists(image_tag):
+            raise SystemExit(
+                f"Shared node image '{image_tag}' not found. "
+                "Run without --no-build (or build it manually) before skipping builds.",
+            )
+        print(f"Skipping rebuild of '{image_tag}' (already present, --no-build specified).")
+        return
+    _build_shared_node_image(image_tag)
+
+
 def _locate_node_template(compose_data: Dict[str, Any]) -> Dict[str, Any]:
     services = compose_data.get("services", {})
     for name, service in services.items():
@@ -1092,8 +1231,10 @@ def _merge_node_service(
     node_name: str,
     base_template: Dict[str, Any],
     ipfs_service: str,
+    image_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     service = deepcopy(base_template)
+    _apply_shared_node_image(service, image_tag)
     service["container_name"] = node_name
     service["command"] = [
         "sh",
@@ -1105,7 +1246,8 @@ def _merge_node_service(
     depends_on.setdefault("registry", {"condition": "service_healthy"})
     depends_on[ipfs_service] = {"condition": "service_healthy"}
     service["depends_on"] = depends_on
-    service.setdefault("build", DEFAULT_NODE_SERVICE["build"])
+    if image_tag is None:
+        service.setdefault("build", DEFAULT_NODE_SERVICE["build"])
     service.setdefault("networks", DEFAULT_NODE_SERVICE["networks"])
     service.setdefault("env_file", DEFAULT_NODE_SERVICE["env_file"])
     service.setdefault("environment", DEFAULT_NODE_SERVICE["environment"])
@@ -1162,11 +1304,17 @@ def _update_environment_section(section: Any, key: str, value: int) -> Any:
     return section
 
 
-def _update_ttp_service(services: Dict[str, Any], num_nodes: int, clique_size: int) -> None:
+def _update_ttp_service(
+    services: Dict[str, Any],
+    num_nodes: int,
+    clique_size: int,
+    image_tag: Optional[str] = None,
+) -> None:
     """Propagate the generated node count and clique size to the TTP service config."""
     service = services.get("ttp")
     if not service:
         return
+    _apply_shared_node_image(service, image_tag)
     if "command" in service:
         service["command"] = _update_ttp_command(service["command"], num_nodes, clique_size)
     if "environment" in service:
@@ -1179,6 +1327,7 @@ def update_compose_file(
     num_nodes: int,
     ipfs_services: List[str],
     clique_size: int = 3,
+    node_image: Optional[str] = None,
 ) -> Dict[str, Any]:
     services = compose_data.setdefault("services", {})
     base_node_service = _locate_node_template(compose_data)
@@ -1186,11 +1335,13 @@ def update_compose_file(
     for key in list(services.keys()):
         if key.startswith("node_"):
             services.pop(key)
+    if "node" in services:
+        _apply_shared_node_image(services.get("node"), node_image)
     for idx in range(num_nodes):
         node_name = f"node_{idx}"
         ipfs_service = _select_ipfs_service(idx, ipfs_services)
-        services[node_name] = _merge_node_service(node_name, base_node_service, ipfs_service)
-    _update_ttp_service(services, num_nodes, clique_size)
+        services[node_name] = _merge_node_service(node_name, base_node_service, ipfs_service, node_image)
+    _update_ttp_service(services, num_nodes, clique_size, node_image)
     return compose_data
 
 
@@ -1240,6 +1391,7 @@ def main() -> None:
     compose_output_path = _resolve_repo_path(args.compose_output)
     system_config_path = resolve_system_config_path(args.system_config)
     node_count = determine_node_count(args.nodes, system_config_path)
+    shared_node_image = NODE_IMAGE_TAG
 
     template_config = load_node_template()
     compose_template = load_compose_template(compose_template_path)
@@ -1257,12 +1409,18 @@ def main() -> None:
         node_id = f"node_{idx}"
         config["node_id"] = node_id
         ipfs_service = _select_ipfs_service(idx, ipfs_services)
-        _apply_ipfs_distribution(ipfs_service, config)
+        _apply_ipfs_distribution(ipfs_service, config, ipfs_services)
         _apply_blockchain_identity(idx, config)
         config_path = NODES_DIR / f"{node_id}.json"
         config_path.write_text(json.dumps(config, indent=2) + "\n")
 
-    updated_compose = update_compose_file(compose_template, node_count, ipfs_services, args.clique_size)
+    updated_compose = update_compose_file(
+        compose_template,
+        node_count,
+        ipfs_services,
+        args.clique_size,
+        shared_node_image,
+    )
     compose_output_path.parent.mkdir(parents=True, exist_ok=True)
     write_compose_file(updated_compose, compose_output_path)
     print(f"Generated docker compose file with {node_count} nodes, clique_size={args.clique_size} -> {compose_output_path}")
@@ -1285,7 +1443,13 @@ def main() -> None:
     if args.generate_only:
         print("Skipped docker compose up (generate-only mode).")
         print(f"Run: (cd docker && docker compose -f {compose_output_path.name} up --build)")
+        print(
+            f"Build the shared node image with: docker build -t {shared_node_image} "
+            f"-f docker/node.Dockerfile {ROOT_DIR}",
+        )
         return
+
+    _ensure_shared_node_image(shared_node_image, skip_build=args.no_build)
 
     gateway_base_url = _start_blockchain_stack(blockchain_paths, auth_secret)
     _wait_for_gateway_health(gateway_base_url)

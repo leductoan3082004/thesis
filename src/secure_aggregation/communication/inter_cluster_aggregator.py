@@ -7,7 +7,7 @@ This module provides:
 3. Model publishing to IPFS and blockchain anchoring
 """
 
-import logging
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -139,7 +139,22 @@ class InterClusterAggregator:
             logger.warning("No IPFS client configured, skipping publish")
             return None, None
 
+        publish_start = time.monotonic()
+        logger.info(
+            "Publishing merged model to IPFS: cluster=%s round=%d params=%d",
+            self.cluster_id,
+            round_num,
+            int(model.size),
+        )
         cid = self.ipfs.add(model)
+        publish_elapsed = time.monotonic() - publish_start
+        logger.info(
+            "Published model to IPFS: cluster=%s round=%d cid=%s... (%.2fs)",
+            self.cluster_id,
+            round_num,
+            cid[:16],
+            publish_elapsed,
+        )
         if hasattr(self.ipfs, "provide"):
             try:
                 self.ipfs.provide(cid)
@@ -147,15 +162,23 @@ class InterClusterAggregator:
                 logger.warning("Failed to announce CID %s to DHT", cid[:16])
         model_hash = compute_model_hash(model)
 
-        logger.info(f"Published model to IPFS: cid={cid[:16]}...")
-
         data_id: Optional[str] = None
         if self.blockchain is not None:
             try:
+                anchor_start = time.monotonic()
+                logger.info(
+                    "Anchoring merged model on blockchain: cluster=%s round=%d cid=%s...",
+                    self.cluster_id,
+                    round_num,
+                    cid[:16],
+                )
                 data_id = self.blockchain.anchor(self.cluster_id, round_num, cid, model_hash)
                 logger.info(
-                    f"Anchored model on blockchain: cluster={self.cluster_id}, "
-                    f"round={round_num}, data_id={data_id or 'N/A'}"
+                    "Anchored model on blockchain: cluster=%s round=%d data_id=%s (%.2fs)",
+                    self.cluster_id,
+                    round_num,
+                    data_id or "N/A",
+                    time.monotonic() - anchor_start,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error(
