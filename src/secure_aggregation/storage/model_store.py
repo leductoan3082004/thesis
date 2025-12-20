@@ -20,7 +20,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import httpx
 import numpy as np
@@ -374,6 +374,7 @@ class KuboIPFS(IPFSInterface):
         timeout: float = 5.0,
         max_retries: int = 5,
         retry_delay: float = 2.0,
+        replica_api_urls: Optional[Iterable[str]] = None,
     ) -> None:
         """
         Initialize Kubo IPFS client.
@@ -389,6 +390,16 @@ class KuboIPFS(IPFSInterface):
         self._client = httpx.Client(timeout=timeout)
         self._max_retries = max(1, max_retries)
         self._retry_delay = max(0.1, retry_delay)
+        self._replica_clients: List[Tuple[str, httpx.Client]] = []
+        if replica_api_urls:
+            for replica in replica_api_urls:
+                cleaned = str(replica).strip()
+                if not cleaned:
+                    continue
+                cleaned = cleaned.rstrip("/")
+                if cleaned == self._api_url:
+                    continue
+                self._replica_clients.append((cleaned, httpx.Client(timeout=timeout)))
 
     def add(self, model: np.ndarray) -> str:
         """Store model in IPFS and return CID."""
@@ -406,11 +417,33 @@ class KuboIPFS(IPFSInterface):
             response.raise_for_status()
             result = response.json()
             cid = result["Hash"]
+            self._replicate_to_peers(serialized, cid)
             logger.info(f"{IPFS_LOG_TAG} Uploaded model to IPFS cid={cid[:16]}...")
             return cid
         except httpx.HTTPError as e:
             logger.error(f"{IPFS_LOG_TAG} Failed to add model to IPFS: {e}")
             raise RuntimeError(f"IPFS add failed: {e}") from e
+
+    def _replicate_to_peers(self, serialized: bytes, cid: str) -> None:
+        """Eagerly store the model on additional IPFS daemons to avoid cold fetches."""
+        if not self._replica_clients:
+            return
+        for replica_url, client in self._replica_clients:
+            try:
+                response = client.post(
+                    f"{replica_url}/api/v0/add",
+                    files={"file": ("model.pkl", io.BytesIO(serialized), "application/octet-stream")},
+                    params={"pin": "true"},
+                )
+                response.raise_for_status()
+                replica_cid = response.json().get("Hash")
+                if replica_cid != cid:
+                    logger.warning(
+                        f"{IPFS_LOG_TAG} Replica {replica_url} returned mismatched cid={replica_cid} "
+                        f"(expected {cid[:16]}...)"
+                    )
+            except httpx.HTTPError as exc:
+                logger.warning(f"{IPFS_LOG_TAG} Failed to replicate CID {cid[:16]} to {replica_url}: {exc}")
 
     def get(self, cid: str) -> Optional[np.ndarray]:
         """Retrieve model from IPFS by CID with retry/backoff."""
@@ -437,7 +470,7 @@ class KuboIPFS(IPFSInterface):
                 last_error = e
 
             if attempt < self._max_retries - 1:
-                delay = self._retry_delay * (attempt + 1)
+                delay = self._retry_delay 
                 logger.warning(
                     f"{IPFS_LOG_TAG} Get CID {cid[:16]} attempt {attempt + 1}/{self._max_retries} failed: "
                     f"{last_error}. Retrying in {delay:.1f}s"
@@ -465,19 +498,27 @@ class KuboIPFS(IPFSInterface):
 
     def provide(self, cid: str) -> None:
         """Announce CID to the DHT so other peers can find it."""
+        self._announce_provider(self._api_url, self._client, cid)
+        for replica_url, client in self._replica_clients:
+            self._announce_provider(replica_url, client, cid)
+
+    @staticmethod
+    def _announce_provider(api_url: str, client: httpx.Client, cid: str) -> None:
         try:
-            self._client.post(
-                f"{self._api_url}/api/v0/routing/provide",
+            client.post(
+                f"{api_url}/api/v0/routing/provide",
                 params={"arg": cid},
                 timeout=60.0,
             )
-            logger.info(f"{IPFS_LOG_TAG} Provided CID to DHT cid={cid[:16]}...")
+            logger.info(f"{IPFS_LOG_TAG} Provided CID via {api_url} cid={cid[:16]}...")
         except httpx.HTTPError as e:
-            logger.warning(f"{IPFS_LOG_TAG} Failed to provide CID to DHT: {e}")
+            logger.warning(f"{IPFS_LOG_TAG} Failed to provide CID via {api_url}: {e}")
 
     def close(self) -> None:
         """Close the HTTP client."""
         self._client.close()
+        for _, client in self._replica_clients:
+            client.close()
 
     def remember_anchor(
         self,
