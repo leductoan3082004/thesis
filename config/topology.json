@@ -1,33 +1,35 @@
 {
-  "num_cliques": 2,
+  "num_cliques": 4,
   "cliques": [
     [
+      "node_0",
       "node_1",
       "node_2",
       "node_3",
-      "node_5"
+      "node_4"
     ],
     [
-      "node_0",
-      "node_4"
-    ]
-  ],
-  "inter_edges": [
-    [
-      "node_1",
-      "node_0"
+      "node_5",
+      "node_6",
+      "node_7",
+      "node_8",
+      "node_9"
     ],
     [
-      "node_2",
-      "node_4"
+      "node_10",
+      "node_11",
+      "node_12",
+      "node_13",
+      "node_14"
+    ],
+    [
+      "node_15",
+      "node_16",
+      "node_17",
+      "node_18",
+      "node_19"
     ]
   ],
-  "edge_counts": {
-    "node_2": 4,
-    "node_1": 4,
-    "node_5": 3,
-    "node_3": 3,
-    "node_0": 2,
-    "node_4": 2
-  }
+  "inter_edges": [],
+  "edge_counts": {}
 }

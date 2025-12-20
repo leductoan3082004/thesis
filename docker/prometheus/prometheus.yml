@@ -1,0 +1,29 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+scrape_configs:
+- job_name: fl_nodes
+  static_configs:
+  - targets:
+    - node_0:8000
+    - node_1:8000
+    - node_2:8000
+    - node_3:8000
+    - node_4:8000
+    - node_5:8000
+    - node_6:8000
+    - node_7:8000
+    - node_8:8000
+    - node_9:8000
+    - node_10:8000
+    - node_11:8000
+    - node_12:8000
+    - node_13:8000
+    - node_14:8000
+    - node_15:8000
+    - node_16:8000
+    - node_17:8000
+    - node_18:8000
+    - node_19:8000
+    labels:
+      group: training_nodes

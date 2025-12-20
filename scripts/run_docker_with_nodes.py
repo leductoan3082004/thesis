@@ -27,6 +27,10 @@ except ImportError as exc:  # pragma: no cover - dependency guard
         "`python3 -m pip install -e '.[mnist]'`.",
     ) from exc
 
+# Add src to path for topology import
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from secure_aggregation.topology import generate_preliminary_topology
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 PARENT_DIR = ROOT_DIR.parent
@@ -35,6 +39,8 @@ DEFAULT_COMPOSE_OUTPUT = ROOT_DIR / "docker" / "docker-compose.auto.yml"
 NODE_TEMPLATE_PATH = ROOT_DIR / "config" / "node.config.template.json"
 NODES_DIR = ROOT_DIR / "config" / "nodes"
 KEYS_DIR = ROOT_DIR / "config" / "keys"
+TOPOLOGY_FILE = ROOT_DIR / "config" / "topology.json"
+PROMETHEUS_CONFIG = ROOT_DIR / "docker" / "prometheus" / "prometheus.yml"
 SYSTEM_CONFIG_FILENAME = "system-config.json"
 SYSTEM_CONFIG_ENV_VAR = "SYSTEM_CONFIG_PATH"
 BLOCKCHAIN_REPO_DIR = PARENT_DIR / "thesis-blockchain"
@@ -132,7 +138,13 @@ def parse_args() -> argparse.Namespace:
         "--detach",
         "-d",
         action="store_true",
-        help="Run docker compose in detached mode.",
+        default=True,
+        help="Run docker compose in detached mode (default: True).",
+    )
+    parser.add_argument(
+        "--no-detach",
+        action="store_true",
+        help="Run docker compose in foreground mode (disables --detach).",
     )
     parser.add_argument(
         "--no-build",
@@ -143,6 +155,12 @@ def parse_args() -> argparse.Namespace:
         "--system-config",
         type=Path,
         help="Override path to system-config.json when deriving the node count.",
+    )
+    parser.add_argument(
+        "--clique-size",
+        type=int,
+        default=3,
+        help="Size of each clique in the D-Cliques topology (default: 3).",
     )
     return parser.parse_args()
 
@@ -416,6 +434,7 @@ def _ensure_admin_keypair(paths: Dict[str, Path]) -> str:
     if not pub_text:
         pub_text = _derive_admin_public_key(private_key_path)
         public_key_path.write_text(f"{pub_text}\n")
+    paths["keys_dir"].mkdir(parents=True, exist_ok=True)
     dest_key = paths["keys_dir"] / private_key_path.name
     dest_pub = paths["keys_dir"] / public_key_path.name
     shutil.copy2(private_key_path, dest_key)
@@ -463,10 +482,31 @@ def _teardown_system_stack(compose_dir: Path, compose_filename: str) -> None:
     # )
 
 
-def _ensure_fabric_artifacts(paths: Dict[str, Path]) -> None:
+def _fabric_artifacts_exist(paths: Dict[str, Path]) -> bool:
+    """Check if Fabric artifacts already exist and are valid."""
     org_dir = paths["organizations_dir"]
     system_dir = paths["system_genesis_dir"]
     channel_dir = paths["channel_artifacts_dir"]
+    genesis_block = system_dir / "genesis.block"
+    channel_tx = channel_dir / "nebula-channel.tx"
+    peer_org = org_dir / "peerOrganizations" / "org1.nebula.com"
+    return (
+        genesis_block.exists()
+        and channel_tx.exists()
+        and peer_org.exists()
+        and any(peer_org.iterdir())
+    )
+
+
+def _ensure_fabric_artifacts(paths: Dict[str, Path], force: bool = False) -> None:
+    org_dir = paths["organizations_dir"]
+    system_dir = paths["system_genesis_dir"]
+    channel_dir = paths["channel_artifacts_dir"]
+
+    if not force and _fabric_artifacts_exist(paths):
+        print("Fabric MSP artifacts already exist, skipping regeneration...")
+        return
+
     print("Regenerating Fabric MSP artifacts...")
     for target in (org_dir, system_dir, channel_dir):
         if target.exists():
@@ -859,7 +899,7 @@ def _wait_for_gateway_health(base_url: str, timeout: int = 240, interval: int = 
                 if 200 <= response.status < 300:
                     print(f"Gateway is healthy at {url}")
                     return
-        except urllib_error.URLError:
+        except (urllib_error.URLError, ConnectionResetError, OSError):
             pass
         time.sleep(interval)
     raise SystemExit(f"Gateway at {url} did not become healthy within {timeout} seconds.")
@@ -1073,32 +1113,35 @@ def _merge_node_service(
     return service
 
 
-def _ensure_num_clients_argument(args: List[str], num_nodes: int) -> List[str]:
-    """Ensure --num-clients reflects the generated node count."""
-    value = str(num_nodes)
+def _ensure_argument(args: List[str], arg_name: str, value: int) -> List[str]:
+    """Ensure a command-line argument has the specified value."""
+    str_value = str(value)
     for idx, token in enumerate(args):
-        if token == "--num-clients":
+        if token == arg_name:
             if idx + 1 < len(args):
-                args[idx + 1] = value
+                args[idx + 1] = str_value
             else:
-                args.append(value)
-            break
-        if token.startswith("--num-clients="):
-            args[idx] = f"--num-clients={value}"
-            break
-    else:
-        args.extend(["--num-clients", value])
+                args.append(str_value)
+            return args
+        if token.startswith(f"{arg_name}="):
+            args[idx] = f"{arg_name}={str_value}"
+            return args
+    args.extend([arg_name, str_value])
     return args
 
 
-def _update_ttp_command(command: Any, num_nodes: int) -> Any:
-    """Update the TTP command definition (list or string) with the node count."""
+def _update_ttp_command(command: Any, num_nodes: int, clique_size: int) -> Any:
+    """Update the TTP command definition with node count and clique size."""
     if isinstance(command, list):
-        return _ensure_num_clients_argument(list(command), num_nodes)
+        args = list(command)
+        args = _ensure_argument(args, "--num-clients", num_nodes)
+        args = _ensure_argument(args, "--clique-size", clique_size)
+        return args
     if isinstance(command, str):
         tokens = shlex.split(command)
-        updated = _ensure_num_clients_argument(tokens, num_nodes)
-        return shlex.join(updated)
+        tokens = _ensure_argument(tokens, "--num-clients", num_nodes)
+        tokens = _ensure_argument(tokens, "--clique-size", clique_size)
+        return shlex.join(tokens)
     return command
 
 
@@ -1119,21 +1162,23 @@ def _update_environment_section(section: Any, key: str, value: int) -> Any:
     return section
 
 
-def _update_ttp_service(services: Dict[str, Any], num_nodes: int) -> None:
-    """Propagate the generated node count to the TTP service config."""
+def _update_ttp_service(services: Dict[str, Any], num_nodes: int, clique_size: int) -> None:
+    """Propagate the generated node count and clique size to the TTP service config."""
     service = services.get("ttp")
     if not service:
         return
     if "command" in service:
-        service["command"] = _update_ttp_command(service["command"], num_nodes)
+        service["command"] = _update_ttp_command(service["command"], num_nodes, clique_size)
     if "environment" in service:
         service["environment"] = _update_environment_section(service["environment"], "NUM_CLIENTS", num_nodes)
+        service["environment"] = _update_environment_section(service["environment"], "CLIQUE_SIZE", clique_size)
 
 
 def update_compose_file(
     compose_data: Dict[str, Any],
     num_nodes: int,
     ipfs_services: List[str],
+    clique_size: int = 3,
 ) -> Dict[str, Any]:
     services = compose_data.setdefault("services", {})
     base_node_service = _locate_node_template(compose_data)
@@ -1145,12 +1190,37 @@ def update_compose_file(
         node_name = f"node_{idx}"
         ipfs_service = _select_ipfs_service(idx, ipfs_services)
         services[node_name] = _merge_node_service(node_name, base_node_service, ipfs_service)
-    _update_ttp_service(services, num_nodes)
+    _update_ttp_service(services, num_nodes, clique_size)
     return compose_data
 
 
 def write_compose_file(data: Dict[str, Any], path: Path) -> None:
     path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+
+def generate_prometheus_config(num_nodes: int) -> None:
+    """Generate prometheus.yml with targets for all nodes."""
+    targets = [f"node_{i}:8000" for i in range(num_nodes)]
+    config = {
+        "global": {
+            "scrape_interval": "5s",
+            "evaluation_interval": "5s",
+        },
+        "scrape_configs": [
+            {
+                "job_name": "fl_nodes",
+                "static_configs": [
+                    {
+                        "targets": targets,
+                        "labels": {"group": "training_nodes"},
+                    }
+                ],
+            }
+        ],
+    }
+    PROMETHEUS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    PROMETHEUS_CONFIG.write_text(yaml.safe_dump(config, sort_keys=False))
+    print(f"Generated Prometheus config for {num_nodes} nodes -> {PROMETHEUS_CONFIG}")
 
 
 def run_docker_compose(compose_path: Path, detach: bool, build: bool) -> int:
@@ -1192,11 +1262,23 @@ def main() -> None:
         config_path = NODES_DIR / f"{node_id}.json"
         config_path.write_text(json.dumps(config, indent=2) + "\n")
 
-    updated_compose = update_compose_file(compose_template, node_count, ipfs_services)
+    updated_compose = update_compose_file(compose_template, node_count, ipfs_services, args.clique_size)
     compose_output_path.parent.mkdir(parents=True, exist_ok=True)
     write_compose_file(updated_compose, compose_output_path)
-    print(f"Generated docker compose file with {node_count} nodes -> {compose_output_path}")
+    print(f"Generated docker compose file with {node_count} nodes, clique_size={args.clique_size} -> {compose_output_path}")
     print(f"(node count source: {'--nodes CLI' if args.nodes is not None else system_config_path})")
+
+    generate_prometheus_config(node_count)
+
+    topology_data = generate_preliminary_topology(node_count, args.clique_size)
+    TOPOLOGY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOPOLOGY_FILE.write_text(json.dumps(topology_data, indent=2) + "\n")
+    print(f"Generated preliminary topology: {topology_data['num_cliques']} cliques -> {TOPOLOGY_FILE}")
+
+    dashboard_script = ROOT_DIR / "scripts" / "generate_grafana_dashboard.py"
+    if dashboard_script.exists():
+        print("Generating Grafana dashboard...")
+        subprocess.run([sys.executable, str(dashboard_script)], check=False)
 
     _prepare_blockchain_artifacts(blockchain_paths, auth_secret)
 
@@ -1210,7 +1292,8 @@ def main() -> None:
     _bulk_register_trainers(blockchain_paths, gateway_base_url)
 
     build = not args.no_build
-    return_code = run_docker_compose(compose_output_path, args.detach, build)
+    detach = args.detach and not args.no_detach
+    return_code = run_docker_compose(compose_output_path, detach, build)
     if return_code != 0:
         raise SystemExit(return_code)
 

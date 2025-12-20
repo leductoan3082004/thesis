@@ -1,14 +1,13 @@
 from .logging import configure_logging, get_logger
-from .metrics import CompositeMetrics, ConvergenceDetector, InMemoryMetrics, Timer
+from .comm_metrics import CommunicationTracker, get_message_size, track_rpc_call
 from .retry import CleanupManager, RetryError, retry
 
 __all__ = [
     "configure_logging",
     "get_logger",
-    "CompositeMetrics",
-    "ConvergenceDetector",
-    "InMemoryMetrics",
-    "Timer",
+    "CommunicationTracker",
+    "get_message_size",
+    "track_rpc_call",
     "CleanupManager",
     "RetryError",
     "retry",
