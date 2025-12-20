@@ -22,10 +22,13 @@
     "use_mock": false,
     "topology_file": "/app/config/topology.json",
     "ipfs": {
-      "api_url": "http://ipfs-node-1:5001"
+      "api_url": "http://ipfs-node-1:5001",
+      "timeout": 30.0,
+      "max_retries": 5,
+      "retry_delay": 2.0
     },
     "blockchain": {
-      "gateway_url": "http://gateway:9000",
+      "gateway_url": "http://host.docker.internal:9000",
       "identity": "",
       "private_key_path": "",
       "state_path": "",

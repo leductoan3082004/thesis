@@ -628,6 +628,9 @@ class NodeService:
             logger.info(f"Using mock storage: ipfs={ipfs_path}, blockchain={blockchain_path}")
         else:
             ipfs_url = ipfs_config.get("api_url", "http://ipfs-node-1:5001")
+            ipfs_timeout = ipfs_config.get("timeout", 30.0)
+            ipfs_max_retries = ipfs_config.get("max_retries", 5)
+            ipfs_retry_delay = ipfs_config.get("retry_delay", 2.0)
             gateway_url = blockchain_config.get(
                 "gateway_url",
                 os.environ.get("BLOCKCHAIN_GATEWAY_URL", "http://localhost:9000"),
@@ -644,7 +647,12 @@ class NodeService:
             jwt_role = blockchain_config.get("jwt_role", "trainer")
             jwt_state = blockchain_config.get("jwt_state", "system")
             jwt_ttl = blockchain_config.get("jwt_ttl_seconds", 24 * 3600)
-            self.ipfs = KuboIPFS(api_url=ipfs_url)
+            self.ipfs = KuboIPFS(
+                api_url=ipfs_url,
+                timeout=ipfs_timeout,
+                max_retries=ipfs_max_retries,
+                retry_delay=ipfs_retry_delay,
+            )
             self.blockchain = GatewayBlockchain(
                 base_url=gateway_url,
                 identity=identity,
@@ -1323,8 +1331,9 @@ class NodeService:
         )
         self._refresh_central_metadata()
 
-        # Initialize Prometheus metrics
+        # Initialize Prometheus metrics and start HTTP server for scraping
         self.prom_metrics = PrometheusMetrics.get_instance(self.node_id, self.clique_id)
+        self.prom_metrics.start_server(port=8000)
         self.prom_metrics.set_training_samples(len(self.train_indices))
         self.prom_metrics.set_model_parameters(sum(p.numel() for p in self.model.parameters()))
         self.comm_tracker = CommunicationTracker(self.node_id)

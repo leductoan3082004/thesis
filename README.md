@@ -1,63 +1,109 @@
 # Secure Aggregation for Federated Learning
 
-A complete implementation of privacy-preserving federated learning using the secure aggregation protocol from Bonawitz et al. (CCS 2017). This system enables multiple parties to collaboratively train a machine learning model while keeping their data private—the server learns only the aggregate model, never individual updates.
+A complete implementation of privacy-preserving federated learning using the secure aggregation protocol from Bonawitz et al. (CCS 2017). This system enables multiple parties to collaboratively train a machine learning model while keeping their data private. The server learns only the aggregate model, never individual updates.
 
-## 🎯 Features
+## Features
 
-- ✅ **4-Round Secure Aggregation Protocol**: Fully implemented with key exchange, masking, and reconstruction
-- ✅ **Automatic Coordination**: Nodes self-organize without manual intervention
-- ✅ **Dropout Tolerance**: Threshold-based aggregation (survives up to n-t failures)
-- ✅ **Aggregator Rotation**: Round-robin election distributes load across nodes
-- ✅ **Non-IID Data**: Dirichlet partitioning simulates realistic heterogeneous federated settings
-- ✅ **Docker Deployment**: One-command launch of entire federated network
-- ✅ **gRPC Communication**: Efficient, type-safe distributed protocol
-- ✅ **MNIST Demonstration**: Complete end-to-end training example
+- **4-Round Secure Aggregation Protocol**: Fully implemented with key exchange, masking, and reconstruction
+- **Automatic Coordination**: Nodes self-organize without manual intervention
+- **Dropout Tolerance**: Threshold-based aggregation (survives up to n-t failures)
+- **Aggregator Rotation**: Round-robin election distributes load across nodes
+- **Non-IID Data**: Dirichlet partitioning simulates realistic heterogeneous federated settings
+- **Blockchain Integration**: Hyperledger Fabric for trainer identity and model registry
+- **Docker Deployment**: One-command launch of entire federated network
+- **Monitoring**: Prometheus metrics and Grafana dashboards
+- **gRPC Communication**: Efficient, type-safe distributed protocol
+- **MNIST Demonstration**: Complete end-to-end training example
 
-## 🚀 Quick Start
+## Prerequisites
 
-### Prerequisites
 - Python 3.10+
 - Docker and Docker Compose
-- 2GB+ free disk space
+- Hyperledger Fabric binaries (cryptogen, configtxgen, fabric-ca-client)
+- Node.js 18+ (for blockchain scripts)
+- 4GB+ free disk space
 
-### Setup & Run
+The blockchain repository (`thesis-blockchain`) must be cloned as a sibling directory.
+
+## Quick Start
+
+### Using Makefile (Recommended)
+
+```bash
+# First time setup: install dependencies, generate gRPC code, download MNIST
+make setup
+
+# Start the full system (blockchain + monitoring + training nodes)
+make start
+
+# Start with custom number of nodes
+make start NODES=10
+
+# Start in background (detached mode)
+make start DETACH=1
+
+# View logs
+make logs
+
+# Stop all services
+make stop
+```
+
+### Available Make Targets
+
+| Target | Description |
+|--------|-------------|
+| `make setup` | Install dependencies, generate gRPC code, download MNIST |
+| `make start` | Start full system (blockchain + monitoring + training) |
+| `make start NODES=N` | Start with N training nodes (default: 6) |
+| `make start DETACH=1` | Start in background mode |
+| `make start-training` | Restart only training nodes (keeps infrastructure running) |
+| `make start-blockchain` | Start only blockchain infrastructure |
+| `make start-monitoring` | Start only Prometheus and Grafana |
+| `make stop` | Stop all services |
+| `make stop-training` | Stop only training nodes |
+| `make logs` | View logs from all containers |
+| `make logs-node NODE=0` | View logs from specific node |
+| `make clean` | Remove generated files and stop containers |
+| `make clean-all` | Full cleanup including virtual environment |
+| `make test` | Run unit tests |
+
+### Manual Setup
+
+If you prefer not to use the Makefile:
 
 ```bash
 # 1. Create virtual environment and install dependencies
 python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-python3 -m pip install -e ".[mnist]"
+source .venv/bin/activate
+pip install -e ".[mnist]"
+pip install grpcio grpcio-tools PyYAML
 
 # 2. Generate gRPC protobuf code
-.venv/bin/python3 -m grpc_tools.protoc -I=protos \
+python -m grpc_tools.protoc -I=protos \
     --python_out=src/secure_aggregation/communication \
     --grpc_python_out=src/secure_aggregation/communication \
     protos/secureagg.proto
 
-# Fix the generated import (change to relative import)
-sed -i '' 's/^import secureagg_pb2/from . import secureagg_pb2/' \
-    src/secure_aggregation/communication/secureagg_pb2_grpc.py
-
 # 3. Download MNIST dataset
-python3 scripts/prepare_data.py
+python scripts/prepare_data.py
 
-# 4. Run with Docker Compose (auto-generate configs + Compose file)
-#    (omit --nodes to use config/system-config.json:number_of_nodes)
-python3 scripts/run_docker_with_nodes.py --nodes 6
+# 4. Run with Docker Compose
+python scripts/run_docker_with_nodes.py --nodes 6
 ```
 
-**Quick restart (without rebuilding):**
-```bash
-./quick_start.sh
-```
+## System Behavior
 
-The system will automatically:
-1. Start a TTP (Trusted Third Party) for key distribution
-2. Launch 4 federated nodes with partitioned MNIST data
-3. Run 10 rounds of federated training with secure aggregation
-4. Log accuracy improvements after each round
+The system automatically:
+1. Starts blockchain infrastructure (Hyperledger Fabric network)
+2. Registers trainer identities with verifiable credentials
+3. Starts IPFS for decentralized model storage
+4. Launches a TTP (Trusted Third Party) for key distribution
+5. Spawns N federated nodes with partitioned MNIST data
+6. Runs federated training with secure aggregation
+7. Logs accuracy improvements after each round
 
-## 📊 What You'll See
+## Expected Output
 
 ```
 [node_0] Round 1/10
@@ -76,263 +122,224 @@ The system will automatically:
 [node_0] Improvement: +0.0769
 ```
 
-**Actual accuracy progression (verified):**
+**Accuracy progression (verified):**
 - Round 1: 74-78% (local models with non-IID data)
 - Round 5: 85-88% (after collaboration)
-- Round 10: **91.81%** (all nodes converge to same accuracy)
+- Round 10: 91.81% (all nodes converge to same accuracy)
 
-## 🏗️ Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   TTP Service                        │
-│         (Ed25519 Key Distribution)                   │
-└───────────────┬─────────────────────────────────────┘
-                │ Register & Get Keys
-    ┌───────────┴───────────┬───────────────┬─────────┐
-    │                       │               │         │
-┌───▼────┐  ┌───────────┐ ┌▼──────────┐ ┌─▼─────────┐
-│ Node 0 │  │  Node 1   │ │  Node 2   │ │  Node 3   │
-│ 11.6K  │  │  11.7K    │ │  19.2K    │ │  17.4K    │
-│samples │  │  samples  │ │  samples  │ │  samples  │
-│(19.4%) │  │  (19.5%)  │ │  (32.0%)  │ │  (29.1%)  │
-└────────┘  └───────────┘ └───────────┘ └───────────┘
-     │              │            │             │
-     └──────────────┴────────────┴─────────────┘
-              Secure Aggregation
-         (Rounds 0→2→4, simplified)
-                     │
-               ┌─────▼──────┐
-               │   Global   │
-               │   Model    │
-               └────────────┘
++-----------------------------------------------------+
+|                   TTP Service                       |
+|         (Ed25519 Key Distribution)                  |
++-----------------------+-----------------------------+
+                        | Register & Get Keys
+    +-------------------+-------------------+-------------------+
+    |                   |                   |                   |
++---v----+        +-----v-----+       +-----v-----+       +-----v-----+
+| Node 0 |        |  Node 1   |       |  Node 2   |       |  Node 3   |
+| 11.6K  |        |  11.7K    |       |  19.2K    |       |  17.4K    |
+|samples |        |  samples  |       |  samples  |       |  samples  |
+|(19.4%) |        |  (19.5%)  |       |  (32.0%)  |       |  (29.1%)  |
++--------+        +-----------+       +-----------+       +-----------+
+     |                  |                   |                   |
+     +------------------+-------------------+-------------------+
+                    Secure Aggregation
+               (Rounds 0 -> 2 -> 4, simplified)
+                            |
+                      +-----v------+
+                      |   Global   |
+                      |   Model    |
+                      +------------+
 ```
 
 **Data Distribution:**
-- Non-IID partitioning using Dirichlet(α=0.5)
+- Non-IID partitioning using Dirichlet(alpha=0.5)
 - Each sample assigned to exactly ONE node (no overlap)
 - Nodes have different amounts and label distributions
 
 **Per Training Round:**
 1. **Local Training**: Each node trains on its partition (2 epochs)
-2. **Aggregator Election**: Round-robin selection (node_0 → node_1 → ...)
+2. **Aggregator Election**: Round-robin selection (node_0 -> node_1 -> ...)
 3. **Secure Aggregation**: 3-round protocol (Rounds 0, 2, 4)
    - Round 0: Advertise ECDH + Ed25519 keys
    - Round 2: Send masked model (quantized weights + PRG masks)
-   - Round 4: Unmask shares for dropped nodes (none in our case)
+   - Round 4: Unmask shares for dropped nodes
 4. **Model Update**: All nodes receive aggregated weights from aggregator
 5. **Evaluation**: Accuracy measured on global test set
 
-## 📚 Documentation
+## Documentation
 
-- **[RUN_INSTRUCTIONS.md](RUN_INSTRUCTIONS.md)**: Detailed usage guide with troubleshooting
-- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)**: Complete technical overview
-- **[TOPOLOGY_IMPLEMENTATION.md](TOPOLOGY_IMPLEMENTATION.md)**: D-Cliques topology design and implementation
-- **[INTER_CLUSTER_AGGREGATION.md](INTER_CLUSTER_AGGREGATION.md)**: Inter-cluster flow with IPFS/Blockchain and robust merge algorithm
-- **[context_codex.md](context_codex.md)**: Protocol specification and design notes
-- **[plan.md](plan.md)**: Phase-by-phase implementation plan
+- [RUN_INSTRUCTIONS.md](RUN_INSTRUCTIONS.md): Detailed usage guide with troubleshooting
+- [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md): Complete technical overview
+- [TOPOLOGY_IMPLEMENTATION.md](TOPOLOGY_IMPLEMENTATION.md): D-Cliques topology design and implementation
+- [INTER_CLUSTER_AGGREGATION.md](INTER_CLUSTER_AGGREGATION.md): Inter-cluster flow with IPFS/Blockchain
 
-## 🔐 Security Properties
+## Security Properties
 
 1. **Privacy**: Server learns only aggregate model (individual updates remain private)
 2. **Authentication**: Ed25519 signatures prevent impersonation
 3. **Consistency**: Round 3 signatures ensure all parties agree on participants
-4. **Dropout Tolerance**: System continues if ≥ threshold nodes survive
+4. **Dropout Tolerance**: System continues if threshold nodes survive
 5. **No Central Trust**: After TTP setup, no single party controls the system
 
-## 🧪 Implementation Status
+## Configuration
 
-| Component | Status | Description |
-|-----------|--------|-------------|
-| Cryptographic Primitives | ✅ Complete | ECDH (P-256), Shamir, AES-GCM, Ed25519 |
-| Secure Aggregation Protocol | ✅ Complete | 3-round protocol (0→2→4) with gRPC |
-| TTP Service | ✅ Complete | Ed25519 key distribution |
-| Node Service | ✅ Complete | Training + aggregation + PyTorch |
-| Aggregator Election | ✅ Complete | Round-robin deterministic |
-| Data Partitioning | ✅ Complete | Dirichlet(α=0.5) non-IID, verified non-overlapping |
-| Docker Infrastructure | ✅ Complete | 5 containers (1 TTP + 4 nodes) |
-| MNIST Training | ✅ Complete | 91.81% final accuracy |
-| Deadlock Handling | ✅ Fixed | Duplicate request handling in all rounds |
-| Topology Utilities | 📦 Available | D-cliques code available but not used in Docker |
-| Alternative Training | 📦 Available | Standalone mnist_flow.py runner |
+Node configs are generated into `config/nodes/node_X.json` by `scripts/run_docker_with_nodes.py` using the defaults in `config/node.config.template.json`. Update the template to change the baseline settings before launching.
 
-## 🛠️ Configuration
-
-Node configs are generated into [config/nodes/node_X.json](config/nodes/) by [`scripts/run_docker_with_nodes.py`](scripts/run_docker_with_nodes.py) using the defaults in [config/node.config.template.json](config/node.config.template.json). Update the template to change the baseline settings before launching, or tweak any generated file manually if a specific node needs a different configuration. Set your target fleet size once via `number_of_nodes` inside `config/system-config.json` (copy the sample if needed); the helper reads that value automatically whenever `--nodes` is omitted.
+Set the target fleet size via `number_of_nodes` in `config/system-config.json`. The script reads that value automatically when `--nodes` is omitted.
 
 ```json
 {
   "dataset": {
-    "alpha": 0.5,        // Dirichlet parameter (lower = more non-IID)
+    "alpha": 0.5,
     "num_clients": 4
   },
   "training": {
-    "num_rounds": 10,     // Federated rounds
-    "local_epochs": 2,    // Epochs per round
+    "num_rounds": 10,
+    "local_epochs": 2,
     "batch_size": 64
   },
   "secure_agg": {
-    "threshold": 3,       // Minimum nodes for aggregation
-    "scale": 1000000.0    // Quantization scale
+    "threshold": 3,
+    "scale": 1000000.0
   }
 }
 ```
 
-The helper populates each node's `inter_cluster.ipfs.api_url` in a round-robin manner across the available IPFS nodes and assigns blockchain identities/paths following the `trainer-node-XXX` convention (matching the expected `config/keys/trainer-node-XXX_sk.pem` layout).
+### System Config
 
-### System Config (Convergence & Fleet Size)
-- Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to define convergence tolerances (the file is gitignored so environment-specific tweaks stay local), plus your desired `number_of_nodes` for Docker launches.
-- Fields mirror the previous per-node `convergence` block: `enabled`, `warmup_rounds`, `tol_abs`, `tol_rel`, and `patience`.
-- `warmup_rounds` replaces the old `CONVERGENCE_WARMUP_ROUNDS` environment variable; set it to `0` to enable convergence tracking immediately or raise it to delay detection.
-- `number_of_nodes` is consumed by `scripts/run_docker_with_nodes.py` when you omit `--nodes`; override it per-run with the CLI flag if you need a temporary change.
-- Override the lookup path via the `SYSTEM_CONFIG_PATH` environment variable if the nodes should share a different config location.
+Copy `config/system-config.sample.json` to `config/system-config.json` to configure:
+- Convergence detection: `enabled`, `warmup_rounds`, `tol_abs`, `tol_rel`, `patience`
+- Fleet size: `number_of_nodes` for Docker launches
 
-## 📈 Performance
+## Project Structure
 
-- **Training Time**: ~3-5 minutes for 10 rounds on CPU
+```
+secure_aggregation/
+├── Makefile                 # Build and run commands
+├── src/secure_aggregation/
+│   ├── communication/       # gRPC services (node_service, aggregator_service, ttp_service)
+│   ├── protocol/            # Secure aggregation protocol (core.py)
+│   ├── crypto/              # Primitives (dh.py, sign.py, aead.py, prg.py, shamir.py)
+│   ├── data/                # Dirichlet partitioning (partition.py)
+│   ├── node/                # Node engine (engine.py)
+│   ├── training/            # MNIST training flow (mnist_flow.py)
+│   ├── topology/            # Topology utilities (graph.py)
+│   └── config/              # Configuration models (models.py)
+├── config/
+│   ├── nodes/               # Generated node configurations
+│   ├── keys/                # Trainer keys (generated)
+│   └── node.config.template.json
+├── docker/
+│   ├── docker-compose.yml   # Base compose template
+│   ├── docker-compose.auto.yml  # Generated compose file
+│   └── node.Dockerfile
+├── protos/                  # gRPC protocol definitions
+├── scripts/
+│   ├── run_docker_with_nodes.py  # Main orchestrator
+│   ├── prepare_data.py           # Download MNIST
+│   ├── run_ttp_with_topology.py  # TTP service runner
+│   ├── generate_grafana_dashboard.py  # Dashboard generator
+│   └── generate_keys.py          # Key generation utility
+└── tests/                   # Unit and integration tests
+```
+
+## Performance
+
+- **Training Time**: 3-5 minutes for 10 rounds on CPU
 - **Communication**: ~5MB per node per round (quantized weights)
-- **Final Accuracy**: **91.81%** on MNIST test set (verified)
-- **Scalability**: Tested with 4 nodes, threshold = 3 (75% required)
+- **Final Accuracy**: 91.81% on MNIST test set (verified)
+- **Scalability**: Tested with 4-10 nodes
 
-## 🔍 Monitoring
+## Monitoring
 
 ```bash
 # View all logs in real-time
-docker compose -f docker/docker-compose.auto.yml logs -f
+make logs
 
 # View specific node logs
-docker compose -f docker/docker-compose.auto.yml logs -f node_0
+make logs-node NODE=0
 
 # Save all logs to file
 docker compose -f docker/docker-compose.auto.yml logs > training.log
 
 # Check container status
 docker compose -f docker/docker-compose.auto.yml ps
-
-# Stop the system
-docker compose -f docker/docker-compose.auto.yml down
 ```
 
-## 🧩 Project Structure
+Access the monitoring dashboards:
+- Grafana: http://localhost:3000 (admin/admin)
+- Prometheus: http://localhost:9090
 
-```
-secure_aggregation/
-├── src/secure_aggregation/
-│   ├── communication/      # gRPC services (node_service, aggregator_service, ttp_service)
-│   ├── protocol/           # Secure aggregation protocol (core.py)
-│   ├── crypto/             # Primitives (dh.py, sign.py, aead.py, prg.py, shamir.py)
-│   ├── data/               # Dirichlet partitioning (partition.py)
-│   ├── node/               # Node engine (engine.py)
-│   ├── training/           # MNIST training flow (mnist_flow.py)
-│   ├── topology/           # Topology utilities (graph.py)
-│   ├── config/             # Configuration models (models.py)
-│   ├── models/             # Reserved for future model abstractions
-│   └── utils/              # Logging utilities (logging.py)
-├── config/nodes/           # Node configurations (node_0.json ... node_3.json)
-├── docker/                 # Docker Compose + Dockerfiles
-│   ├── docker-compose.yml  # Main compose file
-│   └── node.Dockerfile     # Node container image
-├── protos/                 # gRPC protocol definitions (secureagg.proto)
-├── scripts/                # Helper scripts
-│   ├── prepare_data.py     # Download MNIST
-│   └── run_mnist_secure_agg.py  # Standalone runner
-├── quick_start.sh          # Fast startup script
-└── tests/                  # Unit and integration tests
-```
-
-## 🧪 Testing
+## Testing
 
 ```bash
-# Run all tests (ensure src/ is on PYTHONPATH)
-PYTHONPATH=src /usr/local/bin/python3 -m pytest tests/
+# Run all tests
+make test
 
-# Specific test suite
-pytest tests/test_protocol.py
+# Run with coverage
+make test-coverage
 
-# With coverage
-pytest --cov=src/secure_aggregation tests/
+# Run specific test suite
+PYTHONPATH=src .venv/bin/python -m pytest tests/test_protocol.py -v
 ```
 
-## 🤝 Contributing
-
-This implementation follows the paper:
-> Bonawitz, Keith, et al. "Practical secure aggregation for privacy-preserving machine learning." ACM CCS 2017.
-
-Key design principles:
-- **Modularity**: Each component (crypto, protocol, communication) is independent
-- **Testability**: All modules have comprehensive unit tests
-- **Configurability**: Datasets, models, and protocols are pluggable
-- **Simplicity**: Code prioritizes clarity over premature optimization
-
-## 📄 License
-
-See [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Protocol design: Bonawitz et al. (CCS 2017)
-- Topology inspiration: D-cliques for label-skew mitigation
-- Reference implementation: ~/nebula federated learning framework
-
-## 🚧 Troubleshooting
+## Troubleshooting
 
 ### SSL Certificate Errors (MNIST Download)
-The `prepare_data.py` script handles SSL issues automatically. If you still see errors:
+
+The `prepare_data.py` script handles SSL issues automatically. If errors persist:
 ```bash
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-python3 scripts/prepare_data.py
+python scripts/prepare_data.py
 ```
 
 ### gRPC Import Error
+
 If you see `ModuleNotFoundError: No module named 'secureagg_pb2'`:
 ```bash
-# Fix the import in the generated file
 sed -i '' 's/^import secureagg_pb2/from . import secureagg_pb2/' \
     src/secure_aggregation/communication/secureagg_pb2_grpc.py
 ```
 
 ### Port Conflicts
-If port 50051 is already in use, edit [docker/docker-compose.yml](docker/docker-compose.yml) to change the TTP port mapping.
+
+If port 50051 is in use, edit `docker/docker-compose.yml` to change the TTP port mapping.
 
 ### Docker Build Issues
+
 ```bash
-# Clean everything and rebuild
-docker compose -f docker/docker-compose.auto.yml down -v
-docker system prune -af --volumes
-docker compose -f docker/docker-compose.auto.yml up --build
+make clean-all
+make start
 ```
 
 ### Nodes Stuck or Not Progressing
-```bash
-# Check all container logs
-docker compose -f docker/docker-compose.auto.yml logs --tail=50
 
-# Restart the system
-docker compose -f docker/docker-compose.auto.yml down
-docker compose -f docker/docker-compose.auto.yml up
+```bash
+make logs
+make stop
+make start
 ```
 
-### Out of Disk Space
+### Blockchain Setup Failures
+
+Ensure the `thesis-blockchain` repository is cloned as a sibling directory and Hyperledger Fabric binaries are installed:
 ```bash
-# Remove old Docker data (frees ~40GB+)
-docker system prune -af --volumes
+ls ../thesis-blockchain/api-gateway/
+which cryptogen configtxgen fabric-ca-client
 ```
 
-## 📞 Support
+## References
 
-- **Issues**: Open a GitHub issue for bugs or questions
-- **Documentation**: See [RUN_INSTRUCTIONS.md](RUN_INSTRUCTIONS.md)
-- **Technical Details**: See [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+This implementation follows the paper:
+> Bonawitz, Keith, et al. "Practical secure aggregation for privacy-preserving machine learning." ACM CCS 2017.
+
+## License
+
+See [LICENSE](LICENSE) file for details.
 
 ---
 
-**Status**: ✅ Fully Functional | **Last Updated**: 2025-11-22 | **Version**: 1.0.0
-
-## ✨ Recent Updates (v1.0.0)
-
-- ✅ Fixed deadlock in secure aggregation protocol (duplicate request handling)
-- ✅ Verified non-overlapping data partitioning (Dirichlet α=0.5)
-- ✅ Achieved 91.81% final accuracy on MNIST
-- ✅ Added `quick_start.sh` for faster restarts
-- ✅ Cleaned up unused code files (models, utils)
-- ✅ Updated documentation with verified performance metrics
+**Status**: Fully Functional | **Last Updated**: 2025-12-20 | **Version**: 1.1.0
