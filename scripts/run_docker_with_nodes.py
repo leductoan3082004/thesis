@@ -899,7 +899,7 @@ def _wait_for_gateway_health(base_url: str, timeout: int = 240, interval: int = 
                 if 200 <= response.status < 300:
                     print(f"Gateway is healthy at {url}")
                     return
-        except urllib_error.URLError:
+        except (urllib_error.URLError, ConnectionResetError, OSError):
             pass
         time.sleep(interval)
     raise SystemExit(f"Gateway at {url} did not become healthy within {timeout} seconds.")

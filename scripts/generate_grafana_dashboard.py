@@ -9,8 +9,31 @@ This script reads topology.json and generates a dashboard with panels for each c
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any
+
+# Time window for last_over_time() to preserve metrics after training stops.
+RETENTION_WINDOW = "1h"
+
+
+def wrap_metric_with_retention(query: str) -> str:
+    """Wrap metric selectors with last_over_time() to preserve data after scraping stops.
+
+    Prometheus marks metrics as stale ~5 minutes after nodes stop sending them.
+    Using last_over_time(metric[1h]) ensures stat/gauge panels show the last
+    known value even after training completes.
+    """
+    # Pattern to match metric selectors like: metric_name or metric_name{labels}
+    # This handles nested aggregations by wrapping the innermost metric.
+    pattern = r'(fl_\w+)(\{[^}]*\})?(?!\[)'
+
+    def replacer(match: re.Match) -> str:
+        metric = match.group(1)
+        labels = match.group(2) or ""
+        return f"last_over_time({metric}{labels}[{RETENTION_WINDOW}])"
+
+    return re.sub(pattern, replacer, query)
 
 
 def create_stat_panel(
@@ -19,14 +42,21 @@ def create_stat_panel(
     grid_pos: dict[str, int],
     thresholds: list[dict] | None = None,
     unit: str = "none",
-    color_mode: str = "value",
+    use_retention: bool = True,
 ) -> dict[str, Any]:
-    """Create a stat panel configuration."""
+    """Create a stat panel configuration.
+
+    Args:
+        use_retention: If True, wrap query with last_over_time() to preserve
+            data after training stops.
+    """
     if thresholds is None:
         thresholds = [
             {"color": "red", "value": None},
             {"color": "green", "value": 1},
         ]
+
+    final_query = wrap_metric_with_retention(query) if use_retention else query
 
     return {
         "id": None,
@@ -38,7 +68,7 @@ def create_stat_panel(
             "defaults": {
                 "unit": unit,
                 "thresholds": {"mode": "absolute", "steps": thresholds},
-                "color": {"mode": color_mode},
+                "color": {"mode": "thresholds"},
                 "mappings": [],
             },
             "overrides": [],
@@ -54,7 +84,7 @@ def create_stat_panel(
         "targets": [
             {
                 "datasource": {"type": "prometheus", "uid": "DS_PROMETHEUS"},
-                "expr": query,
+                "expr": final_query,
                 "refId": "A",
                 "legendFormat": "__auto",
             }
@@ -161,7 +191,7 @@ def create_accuracy_vs_round_panel(cluster_id: int, grid_pos: dict[str, int]) ->
                 "datasource": {"type": "prometheus", "uid": "DS_PROMETHEUS"},
                 "expr": (
                     "avg by (round) "
-                    f'(fl_accuracy_by_round{{clique_id="{cluster_id}", dataset="train"}}) * 100'
+                    f'(last_over_time(fl_accuracy_by_round{{clique_id="{cluster_id}", dataset="train"}}[{RETENTION_WINDOW}])) * 100'
                 ),
                 "refId": "Training",
                 "legendFormat": "Training",
@@ -172,7 +202,7 @@ def create_accuracy_vs_round_panel(cluster_id: int, grid_pos: dict[str, int]) ->
                 "datasource": {"type": "prometheus", "uid": "DS_PROMETHEUS"},
                 "expr": (
                     "avg by (round) "
-                    f'(fl_accuracy_by_round{{clique_id="{cluster_id}", dataset="validation"}}) * 100'
+                    f'(last_over_time(fl_accuracy_by_round{{clique_id="{cluster_id}", dataset="validation"}}[{RETENTION_WINDOW}])) * 100'
                 ),
                 "refId": "Validation",
                 "legendFormat": "Validation",
@@ -183,7 +213,7 @@ def create_accuracy_vs_round_panel(cluster_id: int, grid_pos: dict[str, int]) ->
                 "datasource": {"type": "prometheus", "uid": "DS_PROMETHEUS"},
                 "expr": (
                     "avg by (round) "
-                    f'(fl_accuracy_by_round{{clique_id="{cluster_id}", dataset="test"}}) * 100'
+                    f'(last_over_time(fl_accuracy_by_round{{clique_id="{cluster_id}", dataset="test"}}[{RETENTION_WINDOW}])) * 100'
                 ),
                 "refId": "Test",
                 "legendFormat": "Test",
@@ -271,8 +301,16 @@ def create_gauge_panel(
     min_val: float = 0,
     max_val: float = 100,
     unit: str = "percent",
+    use_retention: bool = True,
 ) -> dict[str, Any]:
-    """Create a gauge panel configuration."""
+    """Create a gauge panel configuration.
+
+    Args:
+        use_retention: If True, wrap query with last_over_time() to preserve
+            data after training stops.
+    """
+    final_query = wrap_metric_with_retention(query) if use_retention else query
+
     return {
         "id": None,
         "type": "gauge",
@@ -306,7 +344,7 @@ def create_gauge_panel(
         "targets": [
             {
                 "datasource": {"type": "prometheus", "uid": "DS_PROMETHEUS"},
-                "expr": query,
+                "expr": final_query,
                 "refId": "A",
             }
         ],
@@ -370,18 +408,6 @@ def generate_cluster_panels(
             query=f'count(fl_current_round{{clique_id="{cluster_id}"}})',
             grid_pos={"x": 16, "y": current_y, "w": 4, "h": 4},
             thresholds=[{"color": "blue", "value": None}],
-        )
-    )
-    panels.append(
-        create_stat_panel(
-            title="Avg Delta Norm",
-            query=f'avg(fl_delta_norm{{clique_id="{cluster_id}"}})',
-            grid_pos={"x": 20, "y": current_y, "w": 4, "h": 4},
-            thresholds=[
-                {"color": "green", "value": None},
-                {"color": "yellow", "value": 0.01},
-                {"color": "red", "value": 0.1},
-            ],
         )
     )
     current_y += 4
@@ -578,34 +604,6 @@ def generate_overview_panels(num_clusters: int) -> tuple[list[dict], int]:
     )
     current_y += 6
 
-    clusters_per_row = min(num_clusters, 4)
-    panel_width = 24 // clusters_per_row
-
-    # Convergence status.
-    for i in range(num_clusters):
-        x_pos = (i % clusters_per_row) * panel_width
-        panels.append(
-            create_stat_panel(
-                title=f"Cluster {i} Converged",
-                query=f'min(fl_cluster_converged{{clique_id="{i}"}})',
-                grid_pos={"x": x_pos, "y": current_y, "w": panel_width, "h": 3},
-                thresholds=[{"color": "red", "value": None}, {"color": "green", "value": 1}],
-            )
-        )
-    current_y += 3
-
-    # Accuracy gauges.
-    for i in range(num_clusters):
-        x_pos = (i % clusters_per_row) * panel_width
-        panels.append(
-            create_gauge_panel(
-                title=f"Cluster {i} Test Accuracy",
-                query=f'avg(fl_accuracy{{clique_id="{i}", dataset="test"}}) * 100',
-                grid_pos={"x": x_pos, "y": current_y, "w": panel_width, "h": 4},
-            )
-        )
-    current_y += 4
-
     # All clusters comparison.
     comparison_targets = [
         {
@@ -626,44 +624,6 @@ def generate_overview_panels(num_clusters: int) -> tuple[list[dict], int]:
         )
     )
     current_y += 6
-
-    return panels, current_y
-
-
-def generate_communication_panels(num_clusters: int, y_offset: int) -> tuple[list[dict], int]:
-    """Generate communication metrics panels."""
-    panels = []
-    current_y = y_offset
-
-    panels.append(
-        create_row_panel("Communication Metrics", {"x": 0, "y": current_y, "w": 24, "h": 1})
-    )
-    current_y += 1
-
-    for i in range(num_clusters):
-        panels.append(
-            create_timeseries_panel(
-                title=f"Cluster {i} - Network Traffic",
-                targets=[
-                    {
-                        "datasource": {"type": "prometheus", "uid": "DS_PROMETHEUS"},
-                        "expr": f'sum(rate(fl_bytes_sent_total{{clique_id="{i}"}}[1m]))',
-                        "refId": "Sent",
-                        "legendFormat": "Bytes Sent/s",
-                    },
-                    {
-                        "datasource": {"type": "prometheus", "uid": "DS_PROMETHEUS"},
-                        "expr": f'sum(rate(fl_bytes_received_total{{clique_id="{i}"}}[1m]))',
-                        "refId": "Received",
-                        "legendFormat": "Bytes Received/s",
-                    },
-                ],
-                grid_pos={"x": (i % 2) * 12, "y": current_y + (i // 2) * 6, "w": 12, "h": 6},
-                unit="Bps",
-            )
-        )
-
-    current_y += ((num_clusters + 1) // 2) * 6
 
     return panels, current_y
 
@@ -721,9 +681,6 @@ def generate_dashboard(topology: dict) -> dict:
         nodes = cliques[cluster_id] if cluster_id < len(cliques) else []
         cluster_panels, current_y = generate_cluster_panels(cluster_id, nodes, current_y)
         panels.extend(cluster_panels)
-
-    comm_panels, current_y = generate_communication_panels(num_clusters, current_y)
-    panels.extend(comm_panels)
 
     timing_panels, current_y = generate_timing_panels(num_clusters, current_y)
     panels.extend(timing_panels)

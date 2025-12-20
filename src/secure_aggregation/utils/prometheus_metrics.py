@@ -60,6 +60,11 @@ class PrometheusMetrics:
             "Test accuracy after aggregation",
             labels,
         )
+        self.accuracy = Gauge(
+            "fl_accuracy",
+            "Model accuracy with dataset label",
+            ["node_id", "clique_id", "dataset"],
+        )
         self.accuracy_by_round = Gauge(
             "fl_accuracy_by_round",
             "Model accuracy indexed by round",
@@ -73,6 +78,21 @@ class PrometheusMetrics:
         self.convergence_metric = Gauge(
             "fl_convergence_metric",
             "Current convergence metric value",
+            labels,
+        )
+        self.cluster_converged = Gauge(
+            "fl_cluster_converged",
+            "Cluster convergence status (1 if converged)",
+            labels,
+        )
+        self.convergence_streak = Gauge(
+            "fl_convergence_streak",
+            "Current convergence streak count",
+            labels,
+        )
+        self.delta_norm = Gauge(
+            "fl_delta_norm",
+            "Model delta norm between rounds",
             labels,
         )
         self.delta_by_round = Gauge(
@@ -200,6 +220,9 @@ class PrometheusMetrics:
             self.train_accuracy.labels(**labels).set(train_acc)
             self.val_accuracy.labels(**labels).set(val_acc)
             self.test_accuracy.labels(**labels).set(test_acc)
+            self.accuracy.labels(**labels, dataset="train").set(train_acc)
+            self.accuracy.labels(**labels, dataset="validation").set(val_acc)
+            self.accuracy.labels(**labels, dataset="test").set(test_acc)
             round_labels = self._round_labels()
             self.accuracy_by_round.labels(**round_labels, dataset="train").set(train_acc)
             self.accuracy_by_round.labels(**round_labels, dataset="validation").set(val_acc)
@@ -210,6 +233,9 @@ class PrometheusMetrics:
             labels = self._labels()
             self.convergence_signal.labels(**labels).set(1 if converged else 0)
             self.convergence_metric.labels(**labels).set(delta_norm)
+            self.cluster_converged.labels(**labels).set(1 if converged else 0)
+            self.convergence_streak.labels(**labels).set(streak)
+            self.delta_norm.labels(**labels).set(delta_norm)
             round_labels = self._round_labels()
             self.delta_by_round.labels(**round_labels).set(delta_norm)
             self.streak_by_round.labels(**round_labels).set(streak)

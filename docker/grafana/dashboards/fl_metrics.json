@@ -49,7 +49,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -75,7 +75,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "count(count by (clique_id) (fl_current_round))",
+          "expr": "count(count by (clique_id) (last_over_time(fl_current_round[1h])))",
           "refId": "A",
           "legendFormat": "__auto"
         }
@@ -108,7 +108,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -134,7 +134,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "max(fl_current_round)",
+          "expr": "max(last_over_time(fl_current_round[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
@@ -171,7 +171,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -197,7 +197,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "min(fl_cluster_converged)",
+          "expr": "min(last_over_time(fl_cluster_converged[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
@@ -230,7 +230,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -256,7 +256,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "count(fl_current_round)",
+          "expr": "count(last_over_time(fl_current_round[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
@@ -297,7 +297,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -323,7 +323,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg(fl_accuracy{dataset=\"test\"}) * 100",
+          "expr": "avg(last_over_time(fl_accuracy{dataset=\"test\"}[1h])) * 100",
           "refId": "A",
           "legendFormat": "__auto"
         }
@@ -355,12 +355,12 @@
               },
               {
                 "color": "green",
-                "value": 2
+                "value": 4
               }
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -386,7 +386,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "sum(min by (clique_id) (fl_cluster_converged))",
+          "expr": "sum(min by (clique_id) (last_over_time(fl_cluster_converged[1h])))",
           "refId": "A",
           "legendFormat": "__auto"
         }
@@ -477,6 +477,24 @@
           "expr": "max(fl_current_round{clique_id=\"1\"})",
           "refId": "Cluster1",
           "legendFormat": "Cluster 1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "max(fl_current_round{clique_id=\"2\"})",
+          "refId": "Cluster2",
+          "legendFormat": "Cluster 2"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "max(fl_current_round{clique_id=\"3\"})",
+          "refId": "Cluster3",
+          "legendFormat": "Cluster 3"
         },
         {
           "datasource": {
@@ -574,274 +592,34 @@
           "expr": "min(fl_cluster_converged{clique_id=\"1\"})",
           "refId": "Cluster1",
           "legendFormat": "Cluster 1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "min(fl_cluster_converged{clique_id=\"2\"})",
+          "refId": "Cluster2",
+          "legendFormat": "Cluster 2"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "min(fl_cluster_converged{clique_id=\"3\"})",
+          "refId": "Cluster3",
+          "legendFormat": "Cluster 3"
         }
       ]
     },
     {
       "id": 10,
-      "type": "stat",
-      "title": "Cluster 0 Converged",
-      "gridPos": {
-        "x": 0,
-        "y": 10,
-        "w": 12,
-        "h": 3
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "DS_PROMETHEUS"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          },
-          "color": {
-            "mode": "value"
-          },
-          "mappings": []
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "min(fl_cluster_converged{clique_id=\"0\"})",
-          "refId": "A",
-          "legendFormat": "__auto"
-        }
-      ]
-    },
-    {
-      "id": 11,
-      "type": "stat",
-      "title": "Cluster 1 Converged",
-      "gridPos": {
-        "x": 12,
-        "y": 10,
-        "w": 12,
-        "h": 3
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "DS_PROMETHEUS"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          },
-          "color": {
-            "mode": "value"
-          },
-          "mappings": []
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "min(fl_cluster_converged{clique_id=\"1\"})",
-          "refId": "A",
-          "legendFormat": "__auto"
-        }
-      ]
-    },
-    {
-      "id": 12,
-      "type": "gauge",
-      "title": "Cluster 0 Test Accuracy",
-      "gridPos": {
-        "x": 0,
-        "y": 13,
-        "w": 12,
-        "h": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "DS_PROMETHEUS"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "min": 0,
-          "max": 100,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 50
-              },
-              {
-                "color": "green",
-                "value": 80
-              }
-            ]
-          },
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": []
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "avg(fl_accuracy{clique_id=\"0\", dataset=\"test\"}) * 100",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "id": 13,
-      "type": "gauge",
-      "title": "Cluster 1 Test Accuracy",
-      "gridPos": {
-        "x": 12,
-        "y": 13,
-        "w": 12,
-        "h": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "DS_PROMETHEUS"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "min": 0,
-          "max": 100,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 50
-              },
-              {
-                "color": "green",
-                "value": 80
-              }
-            ]
-          },
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": []
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "avg(fl_accuracy{clique_id=\"1\", dataset=\"test\"}) * 100",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "id": 14,
       "type": "timeseries",
       "title": "All Clusters - Test Accuracy Comparison",
       "gridPos": {
         "x": 0,
-        "y": 17,
+        "y": 10,
         "w": 24,
         "h": 6
       },
@@ -920,16 +698,34 @@
           "expr": "avg(fl_accuracy{clique_id=\"1\", dataset=\"test\"}) * 100",
           "refId": "Cluster1",
           "legendFormat": "Cluster 1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(fl_accuracy{clique_id=\"2\", dataset=\"test\"}) * 100",
+          "refId": "Cluster2",
+          "legendFormat": "Cluster 2"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(fl_accuracy{clique_id=\"3\", dataset=\"test\"}) * 100",
+          "refId": "Cluster3",
+          "legendFormat": "Cluster 3"
         }
       ]
     },
     {
-      "id": 15,
+      "id": 11,
       "type": "row",
       "title": "Cluster 0",
       "gridPos": {
         "x": 0,
-        "y": 23,
+        "y": 16,
         "w": 24,
         "h": 1
       },
@@ -937,12 +733,12 @@
       "panels": []
     },
     {
-      "id": 16,
+      "id": 12,
       "type": "stat",
       "title": "Converged",
       "gridPos": {
         "x": 0,
-        "y": 24,
+        "y": 17,
         "w": 4,
         "h": 4
       },
@@ -967,7 +763,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -993,19 +789,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "min(fl_cluster_converged{clique_id=\"0\"})",
+          "expr": "min(last_over_time(fl_cluster_converged{clique_id=\"0\"}[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 17,
+      "id": 13,
       "type": "stat",
       "title": "Current Round",
       "gridPos": {
         "x": 4,
-        "y": 24,
+        "y": 17,
         "w": 4,
         "h": 4
       },
@@ -1026,7 +822,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -1052,19 +848,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "max(fl_current_round{clique_id=\"0\"})",
+          "expr": "max(last_over_time(fl_current_round{clique_id=\"0\"}[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 18,
+      "id": 14,
       "type": "stat",
       "title": "Avg Test Accuracy",
       "gridPos": {
         "x": 8,
-        "y": 24,
+        "y": 17,
         "w": 4,
         "h": 4
       },
@@ -1093,7 +889,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -1119,19 +915,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg(fl_accuracy{clique_id=\"0\", dataset=\"test\"}) * 100",
+          "expr": "avg(last_over_time(fl_accuracy{clique_id=\"0\", dataset=\"test\"}[1h])) * 100",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 19,
+      "id": 15,
       "type": "stat",
       "title": "Convergence Streak",
       "gridPos": {
         "x": 12,
-        "y": 24,
+        "y": 17,
         "w": 4,
         "h": 4
       },
@@ -1156,7 +952,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -1182,19 +978,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg(fl_convergence_streak{clique_id=\"0\"})",
+          "expr": "avg(last_over_time(fl_convergence_streak{clique_id=\"0\"}[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 20,
+      "id": 16,
       "type": "stat",
       "title": "Active Nodes",
       "gridPos": {
         "x": 16,
-        "y": 24,
+        "y": 17,
         "w": 4,
         "h": 4
       },
@@ -1215,7 +1011,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -1241,86 +1037,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "count(fl_current_round{clique_id=\"0\"})",
+          "expr": "count(last_over_time(fl_current_round{clique_id=\"0\"}[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 21,
-      "type": "stat",
-      "title": "Avg Delta Norm",
-      "gridPos": {
-        "x": 20,
-        "y": 24,
-        "w": 4,
-        "h": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "DS_PROMETHEUS"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 0.01
-              },
-              {
-                "color": "red",
-                "value": 0.1
-              }
-            ]
-          },
-          "color": {
-            "mode": "value"
-          },
-          "mappings": []
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "avg(fl_delta_norm{clique_id=\"0\"})",
-          "refId": "A",
-          "legendFormat": "__auto"
-        }
-      ]
-    },
-    {
-      "id": 22,
+      "id": 17,
       "type": "barchart",
       "title": "Cluster 0 - Accuracy vs Round",
       "gridPos": {
         "x": 0,
-        "y": 28,
+        "y": 21,
         "w": 12,
         "h": 8
       },
@@ -1383,7 +1112,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg by (round) (fl_accuracy_by_round{clique_id=\"0\", dataset=\"train\"}) * 100",
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"0\", dataset=\"train\"}[1h])) * 100",
           "refId": "Training",
           "legendFormat": "Training",
           "format": "table",
@@ -1394,7 +1123,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg by (round) (fl_accuracy_by_round{clique_id=\"0\", dataset=\"validation\"}) * 100",
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"0\", dataset=\"validation\"}[1h])) * 100",
           "refId": "Validation",
           "legendFormat": "Validation",
           "format": "table",
@@ -1405,7 +1134,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg by (round) (fl_accuracy_by_round{clique_id=\"0\", dataset=\"test\"}) * 100",
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"0\", dataset=\"test\"}[1h])) * 100",
           "refId": "Test",
           "legendFormat": "Test",
           "format": "table",
@@ -1507,12 +1236,12 @@
       ]
     },
     {
-      "id": 23,
+      "id": 18,
       "type": "timeseries",
       "title": "Cluster 0 - Convergence Metrics",
       "gridPos": {
         "x": 12,
-        "y": 28,
+        "y": 21,
         "w": 12,
         "h": 8
       },
@@ -1595,12 +1324,12 @@
       ]
     },
     {
-      "id": 24,
+      "id": 19,
       "type": "timeseries",
       "title": "Cluster 0 - Per-Node Test Accuracy",
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 29,
         "w": 12,
         "h": 8
       },
@@ -1688,16 +1417,34 @@
           "expr": "fl_accuracy{clique_id=\"0\", node_id=\"node_2\", dataset=\"test\"} * 100",
           "refId": "node_2",
           "legendFormat": "node_2"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"0\", node_id=\"node_3\", dataset=\"test\"} * 100",
+          "refId": "node_3",
+          "legendFormat": "node_3"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"0\", node_id=\"node_4\", dataset=\"test\"} * 100",
+          "refId": "node_4",
+          "legendFormat": "node_4"
         }
       ]
     },
     {
-      "id": 25,
+      "id": 20,
       "type": "timeseries",
       "title": "Cluster 0 - Per-Node Delta Norm",
       "gridPos": {
         "x": 12,
-        "y": 36,
+        "y": 29,
         "w": 12,
         "h": 8
       },
@@ -1785,16 +1532,34 @@
           "expr": "fl_delta_norm{clique_id=\"0\", node_id=\"node_2\"}",
           "refId": "node_2",
           "legendFormat": "node_2"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"0\", node_id=\"node_3\"}",
+          "refId": "node_3",
+          "legendFormat": "node_3"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"0\", node_id=\"node_4\"}",
+          "refId": "node_4",
+          "legendFormat": "node_4"
         }
       ]
     },
     {
-      "id": 26,
+      "id": 21,
       "type": "row",
       "title": "Cluster 1",
       "gridPos": {
         "x": 0,
-        "y": 44,
+        "y": 37,
         "w": 24,
         "h": 1
       },
@@ -1802,12 +1567,12 @@
       "panels": []
     },
     {
-      "id": 27,
+      "id": 22,
       "type": "stat",
       "title": "Converged",
       "gridPos": {
         "x": 0,
-        "y": 45,
+        "y": 38,
         "w": 4,
         "h": 4
       },
@@ -1832,7 +1597,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -1858,19 +1623,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "min(fl_cluster_converged{clique_id=\"1\"})",
+          "expr": "min(last_over_time(fl_cluster_converged{clique_id=\"1\"}[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 28,
+      "id": 23,
       "type": "stat",
       "title": "Current Round",
       "gridPos": {
         "x": 4,
-        "y": 45,
+        "y": 38,
         "w": 4,
         "h": 4
       },
@@ -1891,7 +1656,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -1917,19 +1682,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "max(fl_current_round{clique_id=\"1\"})",
+          "expr": "max(last_over_time(fl_current_round{clique_id=\"1\"}[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 29,
+      "id": 24,
       "type": "stat",
       "title": "Avg Test Accuracy",
       "gridPos": {
         "x": 8,
-        "y": 45,
+        "y": 38,
         "w": 4,
         "h": 4
       },
@@ -1958,7 +1723,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -1984,19 +1749,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg(fl_accuracy{clique_id=\"1\", dataset=\"test\"}) * 100",
+          "expr": "avg(last_over_time(fl_accuracy{clique_id=\"1\", dataset=\"test\"}[1h])) * 100",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 30,
+      "id": 25,
       "type": "stat",
       "title": "Convergence Streak",
       "gridPos": {
         "x": 12,
-        "y": 45,
+        "y": 38,
         "w": 4,
         "h": 4
       },
@@ -2021,7 +1786,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -2047,19 +1812,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg(fl_convergence_streak{clique_id=\"1\"})",
+          "expr": "avg(last_over_time(fl_convergence_streak{clique_id=\"1\"}[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 31,
+      "id": 26,
       "type": "stat",
       "title": "Active Nodes",
       "gridPos": {
         "x": 16,
-        "y": 45,
+        "y": 38,
         "w": 4,
         "h": 4
       },
@@ -2080,7 +1845,7 @@
             ]
           },
           "color": {
-            "mode": "value"
+            "mode": "thresholds"
           },
           "mappings": []
         },
@@ -2106,86 +1871,19 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "count(fl_current_round{clique_id=\"1\"})",
+          "expr": "count(last_over_time(fl_current_round{clique_id=\"1\"}[1h]))",
           "refId": "A",
           "legendFormat": "__auto"
         }
       ]
     },
     {
-      "id": 32,
-      "type": "stat",
-      "title": "Avg Delta Norm",
-      "gridPos": {
-        "x": 20,
-        "y": 45,
-        "w": 4,
-        "h": 4
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "DS_PROMETHEUS"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 0.01
-              },
-              {
-                "color": "red",
-                "value": 0.1
-              }
-            ]
-          },
-          "color": {
-            "mode": "value"
-          },
-          "mappings": []
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "avg(fl_delta_norm{clique_id=\"1\"})",
-          "refId": "A",
-          "legendFormat": "__auto"
-        }
-      ]
-    },
-    {
-      "id": 33,
+      "id": 27,
       "type": "barchart",
       "title": "Cluster 1 - Accuracy vs Round",
       "gridPos": {
         "x": 0,
-        "y": 49,
+        "y": 42,
         "w": 12,
         "h": 8
       },
@@ -2248,7 +1946,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg by (round) (fl_accuracy_by_round{clique_id=\"1\", dataset=\"train\"}) * 100",
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"1\", dataset=\"train\"}[1h])) * 100",
           "refId": "Training",
           "legendFormat": "Training",
           "format": "table",
@@ -2259,7 +1957,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg by (round) (fl_accuracy_by_round{clique_id=\"1\", dataset=\"validation\"}) * 100",
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"1\", dataset=\"validation\"}[1h])) * 100",
           "refId": "Validation",
           "legendFormat": "Validation",
           "format": "table",
@@ -2270,7 +1968,7 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "avg by (round) (fl_accuracy_by_round{clique_id=\"1\", dataset=\"test\"}) * 100",
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"1\", dataset=\"test\"}[1h])) * 100",
           "refId": "Test",
           "legendFormat": "Test",
           "format": "table",
@@ -2372,12 +2070,12 @@
       ]
     },
     {
-      "id": 34,
+      "id": 28,
       "type": "timeseries",
       "title": "Cluster 1 - Convergence Metrics",
       "gridPos": {
         "x": 12,
-        "y": 49,
+        "y": 42,
         "w": 12,
         "h": 8
       },
@@ -2460,12 +2158,12 @@
       ]
     },
     {
-      "id": 35,
+      "id": 29,
       "type": "timeseries",
       "title": "Cluster 1 - Per-Node Test Accuracy",
       "gridPos": {
         "x": 0,
-        "y": 57,
+        "y": 50,
         "w": 12,
         "h": 8
       },
@@ -2532,37 +2230,55 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_3\", dataset=\"test\"} * 100",
-          "refId": "node_3",
-          "legendFormat": "node_3"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_4\", dataset=\"test\"} * 100",
-          "refId": "node_4",
-          "legendFormat": "node_4"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
           "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_5\", dataset=\"test\"} * 100",
           "refId": "node_5",
           "legendFormat": "node_5"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_6\", dataset=\"test\"} * 100",
+          "refId": "node_6",
+          "legendFormat": "node_6"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_7\", dataset=\"test\"} * 100",
+          "refId": "node_7",
+          "legendFormat": "node_7"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_8\", dataset=\"test\"} * 100",
+          "refId": "node_8",
+          "legendFormat": "node_8"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_9\", dataset=\"test\"} * 100",
+          "refId": "node_9",
+          "legendFormat": "node_9"
         }
       ]
     },
     {
-      "id": 36,
+      "id": 30,
       "type": "timeseries",
       "title": "Cluster 1 - Per-Node Delta Norm",
       "gridPos": {
         "x": 12,
-        "y": 57,
+        "y": 50,
         "w": 12,
         "h": 8
       },
@@ -2629,37 +2345,55 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_3\"}",
-          "refId": "node_3",
-          "legendFormat": "node_3"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_4\"}",
-          "refId": "node_4",
-          "legendFormat": "node_4"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
           "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_5\"}",
           "refId": "node_5",
           "legendFormat": "node_5"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_6\"}",
+          "refId": "node_6",
+          "legendFormat": "node_6"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_7\"}",
+          "refId": "node_7",
+          "legendFormat": "node_7"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_8\"}",
+          "refId": "node_8",
+          "legendFormat": "node_8"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_9\"}",
+          "refId": "node_9",
+          "legendFormat": "node_9"
         }
       ]
     },
     {
-      "id": 37,
+      "id": 31,
       "type": "row",
-      "title": "Communication Metrics",
+      "title": "Cluster 2",
       "gridPos": {
         "x": 0,
-        "y": 65,
+        "y": 58,
         "w": 24,
         "h": 1
       },
@@ -2667,14 +2401,14 @@
       "panels": []
     },
     {
-      "id": 38,
-      "type": "timeseries",
-      "title": "Cluster 0 - Network Traffic",
+      "id": 32,
+      "type": "stat",
+      "title": "Converged",
       "gridPos": {
         "x": 0,
-        "y": 66,
-        "w": 12,
-        "h": 6
+        "y": 59,
+        "w": 4,
+        "h": 4
       },
       "datasource": {
         "type": "prometheus",
@@ -2682,7 +2416,510 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "min(last_over_time(fl_cluster_converged{clique_id=\"2\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Current Round",
+      "gridPos": {
+        "x": 4,
+        "y": 59,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "max(last_over_time(fl_current_round{clique_id=\"2\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "stat",
+      "title": "Avg Test Accuracy",
+      "gridPos": {
+        "x": 8,
+        "y": 59,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 80
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(last_over_time(fl_accuracy{clique_id=\"2\", dataset=\"test\"}[1h])) * 100",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "stat",
+      "title": "Convergence Streak",
+      "gridPos": {
+        "x": 12,
+        "y": 59,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "yellow",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 3
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(last_over_time(fl_convergence_streak{clique_id=\"2\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "stat",
+      "title": "Active Nodes",
+      "gridPos": {
+        "x": 16,
+        "y": 59,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "count(last_over_time(fl_current_round{clique_id=\"2\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 37,
+      "type": "barchart",
+      "title": "Cluster 2 - Accuracy vs Round",
+      "gridPos": {
+        "x": 0,
+        "y": 63,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "round"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "xField": "round",
+        "orientation": "vertical",
+        "barWidth": 0.9,
+        "groupWidth": 0.7,
+        "barRadius": 0,
+        "showValue": "auto",
+        "stacking": "none",
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"2\", dataset=\"train\"}[1h])) * 100",
+          "refId": "Training",
+          "legendFormat": "Training",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"2\", dataset=\"validation\"}[1h])) * 100",
+          "refId": "Validation",
+          "legendFormat": "Validation",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"2\", dataset=\"test\"}[1h])) * 100",
+          "refId": "Test",
+          "legendFormat": "Test",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns",
+            "keepLabels": [
+              "round"
+            ]
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "round",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "round 1": true,
+              "round 2": true,
+              "round 3": true,
+              "__name__": true
+            }
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "Value #(.*)",
+            "renamePattern": "$1"
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "destinationType": "number",
+                "targetField": "round"
+              },
+              {
+                "destinationType": "number",
+                "targetField": "Training"
+              },
+              {
+                "destinationType": "number",
+                "targetField": "Validation"
+              },
+              {
+                "destinationType": "number",
+                "targetField": "Test"
+              }
+            ]
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "desc": true,
+                "field": "round"
+              }
+            ]
+          }
+        },
+        {
+          "id": "limit",
+          "options": {
+            "count": 20
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "desc": false,
+                "field": "round"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Cluster 2 - Convergence Metrics",
+      "gridPos": {
+        "x": 12,
+        "y": 63,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
           "custom": {
             "drawStyle": "line",
             "lineInterpolation": "smooth",
@@ -2697,7 +2934,7 @@
               "group": "A"
             },
             "axisPlacement": "auto",
-            "axisLabel": "",
+            "axisLabel": "Value",
             "scaleDistribution": {
               "type": "linear"
             }
@@ -2739,30 +2976,30 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "sum(rate(fl_bytes_sent_total{clique_id=\"0\"}[1m]))",
-          "refId": "Sent",
-          "legendFormat": "Bytes Sent/s"
+          "expr": "avg(fl_convergence_streak{clique_id=\"2\"})",
+          "refId": "Streak",
+          "legendFormat": "Convergence Streak"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "sum(rate(fl_bytes_received_total{clique_id=\"0\"}[1m]))",
-          "refId": "Received",
-          "legendFormat": "Bytes Received/s"
+          "expr": "avg(fl_delta_norm{clique_id=\"2\"}) * 100",
+          "refId": "Delta",
+          "legendFormat": "Delta Norm (\u00d7100)"
         }
       ]
     },
     {
       "id": 39,
       "type": "timeseries",
-      "title": "Cluster 1 - Network Traffic",
+      "title": "Cluster 2 - Per-Node Test Accuracy",
       "gridPos": {
-        "x": 12,
-        "y": 66,
+        "x": 0,
+        "y": 71,
         "w": 12,
-        "h": 6
+        "h": 8
       },
       "datasource": {
         "type": "prometheus",
@@ -2770,7 +3007,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
+          "unit": "percent",
           "custom": {
             "drawStyle": "line",
             "lineInterpolation": "smooth",
@@ -2827,28 +3064,170 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "sum(rate(fl_bytes_sent_total{clique_id=\"1\"}[1m]))",
-          "refId": "Sent",
-          "legendFormat": "Bytes Sent/s"
+          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_10\", dataset=\"test\"} * 100",
+          "refId": "node_10",
+          "legendFormat": "node_10"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "sum(rate(fl_bytes_received_total{clique_id=\"1\"}[1m]))",
-          "refId": "Received",
-          "legendFormat": "Bytes Received/s"
+          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_11\", dataset=\"test\"} * 100",
+          "refId": "node_11",
+          "legendFormat": "node_11"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_12\", dataset=\"test\"} * 100",
+          "refId": "node_12",
+          "legendFormat": "node_12"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_13\", dataset=\"test\"} * 100",
+          "refId": "node_13",
+          "legendFormat": "node_13"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_14\", dataset=\"test\"} * 100",
+          "refId": "node_14",
+          "legendFormat": "node_14"
         }
       ]
     },
     {
       "id": 40,
+      "type": "timeseries",
+      "title": "Cluster 2 - Per-Node Delta Norm",
+      "gridPos": {
+        "x": 12,
+        "y": 71,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "spanNulls": true,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_10\"}",
+          "refId": "node_10",
+          "legendFormat": "node_10"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_11\"}",
+          "refId": "node_11",
+          "legendFormat": "node_11"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_12\"}",
+          "refId": "node_12",
+          "legendFormat": "node_12"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_13\"}",
+          "refId": "node_13",
+          "legendFormat": "node_13"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_14\"}",
+          "refId": "node_14",
+          "legendFormat": "node_14"
+        }
+      ]
+    },
+    {
+      "id": 41,
       "type": "row",
-      "title": "Timing Metrics",
+      "title": "Cluster 3",
       "gridPos": {
         "x": 0,
-        "y": 72,
+        "y": 79,
         "w": 24,
         "h": 1
       },
@@ -2856,12 +3235,846 @@
       "panels": []
     },
     {
-      "id": 41,
+      "id": 42,
+      "type": "stat",
+      "title": "Converged",
+      "gridPos": {
+        "x": 0,
+        "y": 80,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "min(last_over_time(fl_cluster_converged{clique_id=\"3\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 43,
+      "type": "stat",
+      "title": "Current Round",
+      "gridPos": {
+        "x": 4,
+        "y": 80,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "max(last_over_time(fl_current_round{clique_id=\"3\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 44,
+      "type": "stat",
+      "title": "Avg Test Accuracy",
+      "gridPos": {
+        "x": 8,
+        "y": 80,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 80
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(last_over_time(fl_accuracy{clique_id=\"3\", dataset=\"test\"}[1h])) * 100",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 45,
+      "type": "stat",
+      "title": "Convergence Streak",
+      "gridPos": {
+        "x": 12,
+        "y": 80,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "yellow",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 3
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(last_over_time(fl_convergence_streak{clique_id=\"3\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 46,
+      "type": "stat",
+      "title": "Active Nodes",
+      "gridPos": {
+        "x": 16,
+        "y": 80,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "count(last_over_time(fl_current_round{clique_id=\"3\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "__auto"
+        }
+      ]
+    },
+    {
+      "id": 47,
+      "type": "barchart",
+      "title": "Cluster 3 - Accuracy vs Round",
+      "gridPos": {
+        "x": 0,
+        "y": 84,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "round"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "xField": "round",
+        "orientation": "vertical",
+        "barWidth": 0.9,
+        "groupWidth": 0.7,
+        "barRadius": 0,
+        "showValue": "auto",
+        "stacking": "none",
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"3\", dataset=\"train\"}[1h])) * 100",
+          "refId": "Training",
+          "legendFormat": "Training",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"3\", dataset=\"validation\"}[1h])) * 100",
+          "refId": "Validation",
+          "legendFormat": "Validation",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg by (round) (last_over_time(fl_accuracy_by_round{clique_id=\"3\", dataset=\"test\"}[1h])) * 100",
+          "refId": "Test",
+          "legendFormat": "Test",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns",
+            "keepLabels": [
+              "round"
+            ]
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "round",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "round 1": true,
+              "round 2": true,
+              "round 3": true,
+              "__name__": true
+            }
+          }
+        },
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "Value #(.*)",
+            "renamePattern": "$1"
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "destinationType": "number",
+                "targetField": "round"
+              },
+              {
+                "destinationType": "number",
+                "targetField": "Training"
+              },
+              {
+                "destinationType": "number",
+                "targetField": "Validation"
+              },
+              {
+                "destinationType": "number",
+                "targetField": "Test"
+              }
+            ]
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "desc": true,
+                "field": "round"
+              }
+            ]
+          }
+        },
+        {
+          "id": "limit",
+          "options": {
+            "count": 20
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "desc": false,
+                "field": "round"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 48,
+      "type": "timeseries",
+      "title": "Cluster 3 - Convergence Metrics",
+      "gridPos": {
+        "x": 12,
+        "y": 84,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "spanNulls": true,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "Value",
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(fl_convergence_streak{clique_id=\"3\"})",
+          "refId": "Streak",
+          "legendFormat": "Convergence Streak"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(fl_delta_norm{clique_id=\"3\"}) * 100",
+          "refId": "Delta",
+          "legendFormat": "Delta Norm (\u00d7100)"
+        }
+      ]
+    },
+    {
+      "id": 49,
+      "type": "timeseries",
+      "title": "Cluster 3 - Per-Node Test Accuracy",
+      "gridPos": {
+        "x": 0,
+        "y": 92,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "spanNulls": true,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_15\", dataset=\"test\"} * 100",
+          "refId": "node_15",
+          "legendFormat": "node_15"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_16\", dataset=\"test\"} * 100",
+          "refId": "node_16",
+          "legendFormat": "node_16"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_17\", dataset=\"test\"} * 100",
+          "refId": "node_17",
+          "legendFormat": "node_17"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_18\", dataset=\"test\"} * 100",
+          "refId": "node_18",
+          "legendFormat": "node_18"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_19\", dataset=\"test\"} * 100",
+          "refId": "node_19",
+          "legendFormat": "node_19"
+        }
+      ]
+    },
+    {
+      "id": 50,
+      "type": "timeseries",
+      "title": "Cluster 3 - Per-Node Delta Norm",
+      "gridPos": {
+        "x": 12,
+        "y": 92,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "spanNulls": true,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_15\"}",
+          "refId": "node_15",
+          "legendFormat": "node_15"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_16\"}",
+          "refId": "node_16",
+          "legendFormat": "node_16"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_17\"}",
+          "refId": "node_17",
+          "legendFormat": "node_17"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_18\"}",
+          "refId": "node_18",
+          "legendFormat": "node_18"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_19\"}",
+          "refId": "node_19",
+          "legendFormat": "node_19"
+        }
+      ]
+    },
+    {
+      "id": 51,
+      "type": "row",
+      "title": "Timing Metrics",
+      "gridPos": {
+        "x": 0,
+        "y": 100,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 52,
       "type": "timeseries",
       "title": "Cluster 0 - Round Timing",
       "gridPos": {
         "x": 0,
-        "y": 73,
+        "y": 101,
         "w": 12,
         "h": 6
       },
@@ -2944,12 +4157,12 @@
       ]
     },
     {
-      "id": 42,
+      "id": 53,
       "type": "timeseries",
       "title": "Cluster 1 - Round Timing",
       "gridPos": {
         "x": 12,
-        "y": 73,
+        "y": 101,
         "w": 12,
         "h": 6
       },
@@ -3026,6 +4239,182 @@
             "uid": "DS_PROMETHEUS"
           },
           "expr": "avg(rate(fl_aggregation_seconds_sum{clique_id=\"1\"}[1m]) / rate(fl_aggregation_seconds_count{clique_id=\"1\"}[1m]))",
+          "refId": "Aggregation",
+          "legendFormat": "Avg Aggregation Time"
+        }
+      ]
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Cluster 2 - Round Timing",
+      "gridPos": {
+        "x": 0,
+        "y": 107,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "spanNulls": true,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(rate(fl_local_training_seconds_sum{clique_id=\"2\"}[1m]) / rate(fl_local_training_seconds_count{clique_id=\"2\"}[1m]))",
+          "refId": "Training",
+          "legendFormat": "Avg Training Time"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(rate(fl_aggregation_seconds_sum{clique_id=\"2\"}[1m]) / rate(fl_aggregation_seconds_count{clique_id=\"2\"}[1m]))",
+          "refId": "Aggregation",
+          "legendFormat": "Avg Aggregation Time"
+        }
+      ]
+    },
+    {
+      "id": 55,
+      "type": "timeseries",
+      "title": "Cluster 3 - Round Timing",
+      "gridPos": {
+        "x": 12,
+        "y": 107,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "DS_PROMETHEUS"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "spanNulls": true,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(rate(fl_local_training_seconds_sum{clique_id=\"3\"}[1m]) / rate(fl_local_training_seconds_count{clique_id=\"3\"}[1m]))",
+          "refId": "Training",
+          "legendFormat": "Avg Training Time"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "avg(rate(fl_aggregation_seconds_sum{clique_id=\"3\"}[1m]) / rate(fl_aggregation_seconds_count{clique_id=\"3\"}[1m]))",
           "refId": "Aggregation",
           "legendFormat": "Avg Aggregation Time"
         }
