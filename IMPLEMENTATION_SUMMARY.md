@@ -66,6 +66,14 @@
 - **Centralized Settings**: Dataset, training, secure aggregation parameters
 - **Easy Tuning**: Change alpha, rounds, epochs, threshold in JSON
 
+### 8. Hierarchical State Aggregation
+- **State Config**: `config/system-config.json` now carries a `state_aggregation` block (enabled, interval, approach, timeouts).
+- **Candidate Pool**: In ring-star mode, central clique nodes automatically become state aggregators.
+- **ECM Mirroring**: Bridge servers mirror every ECM into a dedicated buffer so central nodes can collect per-cluster snapshots without draining clique-level buffers.
+- **State Aggregator**: New helper (see [`state/aggregation.py`](src/secure_aggregation/state/aggregation.py)) fetches all cluster models from IPFS, averages them, and can publish the merged state model.
+- **Digest Consensus**: Central nodes broadcast lightweight “state::” signals containing hashes of their merged model; quorum is reached when all hashes match.
+- **Round-Robin Commit**: Once consensus is achieved, the round-robin leader anchors the aggregated state model on-chain, with automatic failover if a leader is down.
+
 ## 🔧 How It Works (End-to-End Flow)
 
 ```

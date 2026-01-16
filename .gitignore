@@ -58,3 +58,4 @@ docker/docker-compose.auto.yml
 nodes/
 
 pr-not-push.md
+report/

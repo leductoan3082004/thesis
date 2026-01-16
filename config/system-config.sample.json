@@ -6,5 +6,15 @@
     "tol_abs": 1e-05,
     "tol_rel": 0.001,
     "patience": 3
+  },
+  "state_aggregation": {
+    "enabled": false,
+    "approach": "ring_star",
+    "rounds_per_state": 0,
+    "state_id": "state_0",
+    "collection_timeout_seconds": 20.0,
+    "digest_timeout_seconds": 5.0,
+    "consensus_timeout_seconds": 30.0,
+    "commit_timeout_seconds": 10.0
   }
 }

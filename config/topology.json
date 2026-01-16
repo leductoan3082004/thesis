@@ -1,0 +1,16 @@
+{
+  "num_cliques": 2,
+  "cliques": [
+    [
+      "node_0",
+      "node_1",
+      "node_2"
+    ],
+    [
+      "node_3",
+      "node_4"
+    ]
+  ],
+  "inter_edges": [],
+  "edge_counts": {}
+}

@@ -7,7 +7,7 @@ Bridge nodes use this service to:
 """
 
 from concurrent import futures
-from typing import Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import grpc
 
@@ -21,10 +21,23 @@ logger = get_logger("bridge_service")
 class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
     """gRPC servicer for receiving ECMs from neighbor clusters."""
 
-    def __init__(self, node_id: str, ecm_buffer: ECMBuffer) -> None:
+    def __init__(
+        self,
+        node_id: str,
+        ecm_buffer: ECMBuffer,
+        ecm_hooks: Optional[Iterable[Callable[[ECM], None]]] = None,
+    ) -> None:
         self.node_id = node_id
         self.ecm_buffer = ecm_buffer
+        self._ecm_hooks = list(ecm_hooks or [])
         logger.info(f"BridgeServicer initialized for node {node_id}")
+
+    def _emit_hooks(self, ecm: ECM) -> None:
+        for hook in self._ecm_hooks:
+            try:
+                hook(ecm)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Bridge ECM hook raised error: %s", exc)
 
     def SubmitECMs(
         self,
@@ -39,6 +52,7 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
                 source_cluster=ecm_msg.source_cluster,
             )
             self.ecm_buffer.add(ecm)
+            self._emit_hooks(ecm)
             logger.debug(f"Received ECM submission: cid={ecm.cid[:8]}...")
 
         return secureagg_pb2.ECMSubmitResponse(
@@ -67,6 +81,7 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
             convergence_data_id=request.convergence_data_id or None,
         )
         self.ecm_buffer.add(ecm)
+        self._emit_hooks(ecm)
         logger.info(
             f"Received ECM from cluster {request.cluster_id} "
             f"round {request.round}: cid={request.cid[:8]}... "
@@ -237,9 +252,10 @@ def serve_bridge(
     node_id: str,
     port: int,
     ecm_buffer: ECMBuffer,
+    ecm_hooks: Optional[Iterable[Callable[[ECM], None]]] = None,
 ) -> grpc.Server:
     """Start the bridge gRPC server."""
-    servicer = BridgeServicer(node_id, ecm_buffer)
+    servicer = BridgeServicer(node_id, ecm_buffer, ecm_hooks=ecm_hooks)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     secureagg_pb2_grpc.add_BridgeServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")

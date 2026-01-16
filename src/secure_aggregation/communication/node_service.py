@@ -6,7 +6,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import grpc
 import numpy as np
@@ -29,9 +29,18 @@ from secure_aggregation.config.models import NodeRole
 from secure_aggregation.config.system import load_system_config
 from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition
-from secure_aggregation.node import ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
+from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
+from secure_aggregation.state import (
+    StateAggregationApproach,
+    StateAggregationConfig,
+    StateAggregationError,
+    StateAggregator,
+    StateDigest,
+    build_state_signal_cid,
+    parse_state_digest_signal,
+)
 from secure_aggregation.storage.model_store import (
     BlockchainInterface,
     GatewayBlockchain,
@@ -39,6 +48,7 @@ from secure_aggregation.storage.model_store import (
     KuboIPFS,
     MockBlockchain,
     MockIPFS,
+    compute_model_hash,
     verify_model_hash,
 )
 from secure_aggregation.topology import elect_clique_aggregator, get_inter_clique_neighbors, is_bridge_node
@@ -165,6 +175,20 @@ class NodeService:
         self.blockchain: Optional[BlockchainInterface] = None
         self.ecm_forward_wait = float(self.inter_cluster_config.get("ecm_forward_wait_seconds", 5.0))
 
+        # State-level aggregation (hierarchy) state
+        self.state_config = self._load_state_config()
+        self.state_candidates: List[str] = []
+        self.is_state_candidate = False
+        self.state_ecm_buffer: Optional[ECMBuffer] = None
+        self.state_aggregator: Optional[StateAggregator] = None
+        self._bridge_ecm_hooks: List[Callable[[ECM], None]] = []
+        self._state_round_cache: Dict[int, np.ndarray] = {}
+        self._state_round_hashes: Dict[int, str] = {}
+        self._state_digest_records: Dict[int, Dict[str, StateDigest]] = {}
+        self._state_committed_rounds: Set[int] = set()
+        self._state_round_to_cluster_round: Dict[int, int] = {}
+        self._pending_state_rounds: Set[int] = set()
+
         # Convergence state
         self.convergence_config = self._load_convergence_config()
         self.convergence_tracker: Optional[ConvergenceTracker] = None
@@ -223,6 +247,23 @@ class NodeService:
             )
             return ConvergenceConfig.from_dict(node_convergence)
         return ConvergenceConfig()
+
+    def _load_state_config(self) -> StateAggregationConfig:
+        """Load state aggregation configuration and apply training defaults."""
+        state_section = (self.system_config or {}).get("state_aggregation")
+        config = StateAggregationConfig.from_mapping(state_section)
+        rounds_hint = None
+        training_rounds = self.training_config.get("state_round_interval") or self.training_config.get("rounds")
+        if training_rounds is not None:
+            try:
+                rounds_hint = int(training_rounds)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid training state_round hint=%s; ignoring for state config",
+                    training_rounds,
+                )
+        config.apply_training_defaults(rounds_hint)
+        return config
 
     def _prime_convergence_tracker_state(self) -> None:
         """Advance convergence tracker state without computing deltas."""
@@ -702,6 +743,7 @@ class NodeService:
                     self.node_id,
                     self.port + 2000,
                     self.ecm_buffer,
+                    ecm_hooks=self._bridge_ecm_hooks or None,
                 )
                 logger.info("Bridge server started on port %d", self.port + 2000)
             except Exception as exc:  # noqa: BLE001
@@ -709,6 +751,18 @@ class NodeService:
                 logger.error("Failed to start bridge server on port %d: %s", self.port + 2000, exc, exc_info=True)
         if self.bridge_client is None:
             self.bridge_client = BridgeClient(self.node_id)
+
+    def _update_bridge_hooks(self) -> None:
+        """Rebuild the list of ECM hooks and restart the bridge server if needed."""
+        hooks: List[Callable[[ECM], None]] = []
+        if self.state_ecm_buffer is not None:
+            hooks.append(self.state_ecm_buffer.add)
+        if hooks == self._bridge_ecm_hooks:
+            return
+        self._bridge_ecm_hooks = hooks
+        if self.bridge_server:
+            self.stop_bridge_server()
+            self.bridge_server = None
 
     def setup_bridge_node(self, inter_edges: List[Tuple[str, str]]) -> bool:
         """Setup bridge node if this node has inter-clique connections."""
@@ -865,6 +919,300 @@ class NodeService:
             details = ", ".join(f"{node}@{addr}" for node, addr in self.central_neighbor_addresses.items())
             logger.info(f"Central neighbor addresses: {details}")
             self._logged_central_addresses = True
+
+        if self.state_config.enabled:
+            self._configure_state_layer()
+
+    def _configure_state_layer(self) -> None:
+        """Determine which nodes act as state aggregators based on metadata."""
+        if not self.state_config.enabled:
+            if self.state_ecm_buffer is not None:
+                self.state_ecm_buffer = None
+                self._update_bridge_hooks()
+                self._ensure_bridge_stack()
+            self.state_candidates = []
+            self.is_state_candidate = False
+            return
+        if not self.central_metadata:
+            return
+        if self.state_config.approach == StateAggregationApproach.RING_STAR:
+            candidates = list(self.central_metadata.central_nodes)
+        else:
+            candidates = list(self.central_metadata.central_nodes)
+        candidates = sorted(dict.fromkeys(candidates))
+        previous_candidates = self.state_candidates
+        self.state_candidates = candidates
+        was_candidate = self.is_state_candidate
+        self.is_state_candidate = self.node_id in self.state_candidates
+        if self.is_state_candidate and self.state_ecm_buffer is None:
+            freshness = float(
+                max(
+                    self.inter_cluster_config.get("freshness_window", 300.0),
+                    self.state_config.collection_timeout_seconds * 2,
+                )
+            )
+            self.state_ecm_buffer = ECMBuffer(freshness_window=freshness)
+            self._update_bridge_hooks()
+            self._ensure_bridge_stack()
+        elif not self.is_state_candidate and self.state_ecm_buffer is not None:
+            self.state_ecm_buffer = None
+            self._update_bridge_hooks()
+            self._ensure_bridge_stack()
+        if self.is_state_candidate and self.state_aggregator is None and self.ipfs is not None:
+            self.state_aggregator = StateAggregator(self.state_config, self.ipfs, self.blockchain)
+        if (
+            candidates
+            and candidates != previous_candidates
+            and self.is_state_candidate
+            and not was_candidate
+        ):
+            logger.info(
+                "Node %s joined state aggregator pool with %d candidates",
+                self.node_id,
+                len(candidates),
+            )
+
+    def _state_layer_enabled(self) -> bool:
+        return bool(self.state_config.enabled and self.state_config.rounds_per_state > 0)
+
+    def _maybe_start_state_round(self, round_idx: int) -> None:
+        """Trigger state aggregation when the configured interval elapses."""
+        if not (self._state_layer_enabled() and self.is_state_candidate):
+            return
+        interval = self.state_config.rounds_per_state
+        if interval > 0 and (round_idx + 1) % interval == 0:
+            state_round = (round_idx + 1) // interval
+            if state_round not in self._state_round_to_cluster_round:
+                self._state_round_to_cluster_round[state_round] = round_idx
+                self._pending_state_rounds.add(state_round)
+        for state_round in sorted(self._pending_state_rounds):
+            cluster_round = self._state_round_to_cluster_round.get(state_round, round_idx)
+            if self._execute_state_round(state_round, cluster_round):
+                self._pending_state_rounds.discard(state_round)
+
+    def _execute_state_round(self, state_round: int, cluster_round: int) -> bool:
+        """Collect ECMs, merge models, and broadcast digest for a state round."""
+        if (
+            not self._state_layer_enabled()
+            or not self.is_state_candidate
+            or not self.state_aggregator
+            or not self.state_ecm_buffer
+            or not self.central_metadata
+        ):
+            return False
+        if state_round in self._state_round_cache:
+            return True
+        deadline = time.time() + max(1.0, float(self.state_config.collection_timeout_seconds))
+        snapshot: Mapping[str, StateClusterModel] = {}
+        missing: List[str] = []
+        while time.time() < deadline:
+            ecms = self.state_ecm_buffer.get_fresh_ecms()
+            snapshot, missing = self.state_aggregator.build_snapshot(
+                ecms,
+                self.central_metadata.cluster_ids,
+                cluster_round,
+            )
+            if not missing:
+                break
+            logger.debug(
+                "State round %d waiting for ECMs from clusters: %s",
+                state_round,
+                ", ".join(sorted(missing)),
+            )
+            time.sleep(1.0)
+        if missing:
+            logger.warning(
+                "State round %d missing ECMs from clusters: %s",
+                state_round,
+                ", ".join(sorted(missing)),
+            )
+            return False
+        try:
+            models = self.state_aggregator.fetch_models(snapshot, fallback_lookup=self._lookup_cluster_anchor)
+            merged_model = self.state_aggregator.merge_models(models)
+        except StateAggregationError as exc:
+            logger.error("State aggregation failed for round %d: %s", state_round, exc)
+            return False
+        model_hash = compute_model_hash(merged_model)
+        self._state_round_cache[state_round] = merged_model
+        self._state_round_hashes[state_round] = model_hash
+        self._state_round_to_cluster_round[state_round] = cluster_round
+        self._broadcast_state_digest(state_round, cluster_round, model_hash)
+        self._record_local_state_digest(state_round, cluster_round, model_hash)
+        return True
+
+    def _lookup_cluster_anchor(self, cluster_id: str, round_idx: int) -> Optional[Tuple[str, str]]:
+        if not self.blockchain:
+            return None
+        try:
+            return self.blockchain.get_anchor(cluster_id, round_idx)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to fetch anchor for cluster %s round %s: %s",
+                cluster_id,
+                round_idx,
+                exc,
+            )
+            return None
+
+    def _broadcast_state_digest(self, state_round: int, cluster_round: int, model_hash: str) -> None:
+        """Share this node's state digest with other central candidates."""
+        if (
+            not self.bridge_client
+            or not self.central_neighbor_addresses
+            or not self._state_layer_enabled()
+        ):
+            return
+        payload = json.dumps(
+            {
+                "cluster_round": cluster_round,
+                "node_id": self.node_id,
+            }
+        )
+        cid = build_state_signal_cid(self.state_config.state_id, state_round, self.node_id)
+        targets = [
+            addr for node_id, addr in self.central_neighbor_addresses.items() if node_id != self.node_id
+        ]
+        if not targets:
+            return
+        accepted = self.bridge_client.broadcast_ecm_with_convergence(
+            targets,
+            f"state::{self.state_config.state_id}",
+            state_round,
+            cid,
+            model_hash,
+            True,
+            0.0,
+            convergence_data_id=payload,
+        )
+        logger.info(
+            "Broadcast state digest round=%d hash=%s... to %d/%d central nodes",
+            state_round,
+            model_hash[:8],
+            accepted,
+            len(targets),
+        )
+
+    def _record_local_state_digest(self, state_round: int, cluster_round: int, model_hash: str) -> None:
+        digest = StateDigest(
+            node_id=self.node_id,
+            state_id=self.state_config.state_id,
+            state_round=state_round,
+            cluster_round=cluster_round,
+            model_hash=model_hash,
+            model_cid=None,
+            received_at=time.time(),
+        )
+        self._record_state_digest(digest)
+
+    def _record_state_digest(self, digest: StateDigest) -> None:
+        if not self._state_layer_enabled():
+            return
+        records = self._state_digest_records.setdefault(digest.state_round, {})
+        prev = records.get(digest.node_id)
+        if prev and prev.model_hash == digest.model_hash:
+            return
+        records[digest.node_id] = digest
+        logger.info(
+            "Observed state digest round=%d from %s hash=%s...",
+            digest.state_round,
+            digest.node_id,
+            digest.model_hash[:8],
+        )
+        self._maybe_finalize_state_round(digest.state_round)
+
+    def _maybe_finalize_state_round(self, state_round: int) -> None:
+        if (
+            not self._state_layer_enabled()
+            or state_round in self._state_committed_rounds
+            or not self.state_candidates
+        ):
+            return
+        records = self._state_digest_records.get(state_round, {})
+        if len(records) < len(self.state_candidates):
+            return
+        hashes = {digest.model_hash for digest in records.values()}
+        if len(hashes) != 1:
+            logger.warning(
+                "State round %d has conflicting digests: %s",
+                state_round,
+                ", ".join(sorted(hashes)),
+            )
+            return
+        self._try_state_commit(state_round)
+
+    def _try_state_commit(self, state_round: int) -> None:
+        if (
+            not self._state_layer_enabled()
+            or not self.state_candidates
+            or not self.state_aggregator
+            or state_round in self._state_committed_rounds
+        ):
+            return
+        model = self._state_round_cache.get(state_round)
+        if model is None:
+            # This node may not have completed aggregation yet.
+            logger.debug(
+                "State round %d consensus reached but local model missing; waiting to commit",
+                state_round,
+            )
+            return
+        leader_index = state_round % len(self.state_candidates)
+        ordered_candidates = [
+            self.state_candidates[(leader_index + offset) % len(self.state_candidates)]
+            for offset in range(len(self.state_candidates))
+        ]
+        for candidate in ordered_candidates:
+            if candidate == self.node_id:
+                anchor = self.state_aggregator.get_anchor(state_round)
+                if anchor:
+                    self._mark_state_round_committed(state_round)
+                    return
+                try:
+                    cid, hash_val, data_id = self.state_aggregator.publish_state_model(model, state_round)
+                except StateAggregationError as exc:
+                    logger.error("State round %d commit failed on %s: %s", state_round, self.node_id, exc)
+                    continue
+                if cid and hash_val:
+                    logger.info(
+                        "State round %d committed by %s (cid=%s..., data_id=%s)",
+                        state_round,
+                        self.node_id,
+                        cid[:8],
+                        data_id or "N/A",
+                    )
+                    self._mark_state_round_committed(state_round)
+                    return
+            else:
+                anchor = self._wait_for_state_anchor(state_round, self.state_config.commit_timeout_seconds)
+                if anchor:
+                    logger.info(
+                        "State round %d observed anchor (cid=%s...) by peer",
+                        state_round,
+                        anchor[0][:8],
+                    )
+                    self._mark_state_round_committed(state_round)
+                    return
+        logger.warning("State round %d not anchored after iterating all candidates", state_round)
+
+    def _wait_for_state_anchor(self, state_round: int, timeout: float) -> Optional[Tuple[str, str]]:
+        if not self.state_aggregator:
+            return None
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            anchor = self.state_aggregator.get_anchor(state_round)
+            if anchor:
+                return anchor
+            time.sleep(1.0)
+        return None
+
+    def _mark_state_round_committed(self, state_round: int) -> None:
+        self._state_committed_rounds.add(state_round)
+        self._state_digest_records.pop(state_round, None)
+        self._state_round_cache.pop(state_round, None)
+        self._state_round_hashes.pop(state_round, None)
+        self._pending_state_rounds.discard(state_round)
+        self._state_round_to_cluster_round.pop(state_round, None)
 
     def _update_clique_signal_addresses(self) -> None:
         """Precompute bridge endpoints for clique peers to receive convergence broadcasts."""
@@ -1636,6 +1984,8 @@ class NodeService:
                 self._check_cached_convergence_data()
                 break
 
+            self._maybe_start_state_round(round_idx)
+
             # Record round total time
             round_total_time = time.monotonic() - round_start_time
             self.prom_metrics.observe_round_total(round_total_time)
@@ -1954,6 +2304,10 @@ class NodeService:
             return
         signals = self.ecm_buffer.pop_signal_ecms()
         for ecm in signals:
+            digest = parse_state_digest_signal(ecm)
+            if digest:
+                self._record_state_digest(digest)
+                continue
             if ecm.convergence_data_id:
                 is_new = self._register_convergence_data_id(ecm.convergence_data_id, ecm.round_idx)
                 if is_new and self.is_bridge_node:

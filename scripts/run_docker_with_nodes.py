@@ -164,6 +164,11 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Size of each clique in the D-Cliques topology (default: 3).",
     )
+    parser.add_argument(
+        "--blockchain-only",
+        action="store_true",
+        help="Prepare artifacts and start only the blockchain/api-gateway stack.",
+    )
     return parser.parse_args()
 
 
@@ -1386,6 +1391,8 @@ def run_docker_compose(compose_path: Path, detach: bool, build: bool) -> int:
 
 def main() -> None:
     args = parse_args()
+    if args.blockchain_only and args.generate_only:
+        raise SystemExit("--blockchain-only cannot be combined with --generate-only.")
 
     compose_template_path = _resolve_repo_path(args.compose_template)
     compose_output_path = _resolve_repo_path(args.compose_output)
@@ -1449,11 +1456,17 @@ def main() -> None:
         )
         return
 
-    _ensure_shared_node_image(shared_node_image, skip_build=args.no_build)
+    if not args.blockchain_only:
+        _ensure_shared_node_image(shared_node_image, skip_build=args.no_build)
 
     gateway_base_url = _start_blockchain_stack(blockchain_paths, auth_secret)
     _wait_for_gateway_health(gateway_base_url)
     _bulk_register_trainers(blockchain_paths, gateway_base_url)
+
+    if args.blockchain_only:
+        print("Blockchain network and API gateway are running. Skipping IPFS/FL stack (--blockchain-only).")
+        print(f"Gateway URL: {gateway_base_url}")
+        return
 
     build = not args.no_build
     detach = args.detach and not args.no_detach
