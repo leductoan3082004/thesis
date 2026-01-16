@@ -8,11 +8,12 @@ from .aggregation import (
     build_state_signal_cid,
     parse_state_digest_signal,
 )
-from .config import StateAggregationApproach, StateAggregationConfig
+from .config import NationAggregationConfig, StateAggregationApproach, StateAggregationConfig
 
 __all__ = [
     "StateAggregationApproach",
     "StateAggregationConfig",
+    "NationAggregationConfig",
     "StateAggregationError",
     "StateAggregator",
     "StateClusterModel",

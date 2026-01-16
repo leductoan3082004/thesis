@@ -81,3 +81,29 @@ class StateAggregationConfig:
             self.rounds_per_state = max(1, int(rounds_hint))
         if self.rounds_per_state > 0 and not self.enabled:
             self.enabled = True
+
+
+@dataclass
+class NationAggregationConfig:
+    """Configuration for scheduling nation-level rounds (built atop state rounds)."""
+
+    enabled: bool = False
+    rounds_per_nation: int = 0
+    nation_id: str = "nation_0"
+
+    @classmethod
+    def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "NationAggregationConfig":
+        if not data:
+            return cls()
+        kwargs: dict[str, Any] = {}
+        for key in ("enabled", "rounds_per_nation", "nation_id"):
+            if key not in data:
+                continue
+            value = data[key]
+            if key == "enabled":
+                kwargs[key] = bool(value)
+            elif key == "rounds_per_nation":
+                kwargs[key] = max(0, int(value))
+            else:
+                kwargs[key] = str(value)
+        return cls(**kwargs)

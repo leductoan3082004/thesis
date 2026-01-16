@@ -33,6 +33,7 @@ from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfi
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
 from secure_aggregation.state import (
+    NationAggregationConfig,
     StateAggregationApproach,
     StateAggregationConfig,
     StateAggregationError,
@@ -177,6 +178,7 @@ class NodeService:
 
         # State-level aggregation (hierarchy) state
         self.state_config = self._load_state_config()
+        self.nation_config = self._load_nation_config()
         self.state_candidates: List[str] = []
         self.is_state_candidate = False
         self.state_ecm_buffer: Optional[ECMBuffer] = None
@@ -188,6 +190,8 @@ class NodeService:
         self._state_committed_rounds: Set[int] = set()
         self._state_round_to_cluster_round: Dict[int, int] = {}
         self._pending_state_rounds: Set[int] = set()
+        self._pending_nation_rounds: Set[int] = set()
+        self._nation_round_to_state_round: Dict[int, int] = {}
 
         # Convergence state
         self.convergence_config = self._load_convergence_config()
@@ -264,6 +268,11 @@ class NodeService:
                 )
         config.apply_training_defaults(rounds_hint)
         return config
+
+    def _load_nation_config(self) -> NationAggregationConfig:
+        """Load scheduling config for nation-level aggregation rounds."""
+        nation_section = (self.system_config or {}).get("nation_aggregation")
+        return NationAggregationConfig.from_mapping(nation_section)
 
     def _prime_convergence_tracker_state(self) -> None:
         """Advance convergence tracker state without computing deltas."""
@@ -975,6 +984,9 @@ class NodeService:
     def _state_layer_enabled(self) -> bool:
         return bool(self.state_config.enabled and self.state_config.rounds_per_state > 0)
 
+    def _nation_layer_enabled(self) -> bool:
+        return bool(self.nation_config.enabled and self.nation_config.rounds_per_nation > 0)
+
     def _maybe_start_state_round(self, round_idx: int) -> None:
         """Trigger state aggregation when the configured interval elapses."""
         if not (self._state_layer_enabled() and self.is_state_candidate):
@@ -989,6 +1001,7 @@ class NodeService:
             cluster_round = self._state_round_to_cluster_round.get(state_round, round_idx)
             if self._execute_state_round(state_round, cluster_round):
                 self._pending_state_rounds.discard(state_round)
+                self._maybe_start_nation_round(state_round)
 
     def _execute_state_round(self, state_round: int, cluster_round: int) -> bool:
         """Collect ECMs, merge models, and broadcast digest for a state round."""
@@ -1213,6 +1226,42 @@ class NodeService:
         self._state_round_hashes.pop(state_round, None)
         self._pending_state_rounds.discard(state_round)
         self._state_round_to_cluster_round.pop(state_round, None)
+
+    def _maybe_start_nation_round(self, completed_state_round: int) -> None:
+        """Schedule a nation-level round after enough state rounds have finished."""
+        if not self._nation_layer_enabled():
+            return
+        interval = self.nation_config.rounds_per_nation
+        if interval <= 0:
+            return
+        if completed_state_round % interval == 0:
+            nation_round = completed_state_round // interval
+            if nation_round not in self._nation_round_to_state_round:
+                self._nation_round_to_state_round[nation_round] = completed_state_round
+                self._pending_nation_rounds.add(nation_round)
+                logger.info(
+                    "Nation layer scheduled round %d after state round %d (interval=%d)",
+                    nation_round,
+                    completed_state_round,
+                    interval,
+                )
+        for nation_round in sorted(self._pending_nation_rounds):
+            anchor_state_round = self._nation_round_to_state_round.get(nation_round)
+            if anchor_state_round is None:
+                continue
+            self._announce_nation_round(nation_round, anchor_state_round)
+            self._pending_nation_rounds.discard(nation_round)
+
+    def _announce_nation_round(self, nation_round: int, source_state_round: int) -> None:
+        """Placeholder for nation-level aggregation flow."""
+        if not self._nation_layer_enabled():
+            return
+        logger.info(
+            "Nation round %d triggered after state round %d (nation_id=%s)",
+            nation_round,
+            source_state_round,
+            self.nation_config.nation_id,
+        )
 
     def _update_clique_signal_addresses(self) -> None:
         """Precompute bridge endpoints for clique peers to receive convergence broadcasts."""

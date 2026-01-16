@@ -73,6 +73,7 @@
 - **State Aggregator**: New helper (see [`state/aggregation.py`](src/secure_aggregation/state/aggregation.py)) fetches all cluster models from IPFS, averages them, and can publish the merged state model.
 - **Digest Consensus**: Central nodes broadcast lightweight “state::” signals containing hashes of their merged model; quorum is reached when all hashes match.
 - **Round-Robin Commit**: Once consensus is achieved, the round-robin leader anchors the aggregated state model on-chain, with automatic failover if a leader is down.
+- **Nation Scheduling**: `nation_aggregation` config keys reserve space for a “nation” tier—after every N state rounds the system currently logs the nation-round trigger so future nation-level aggregation code can hook in.
 
 ## 🔧 How It Works (End-to-End Flow)
 
