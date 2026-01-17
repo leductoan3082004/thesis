@@ -33,6 +33,17 @@ COMPOSE_TEMPLATE := $(PROJECT_ROOT)/docker/docker-compose.yml
 NODES ?= 6
 CLIQUE_SIZE ?= 3
 FOREGROUND ?= 0
+STATE_MAP ?=
+NO_BUILD ?= 0
+
+ifeq ($(strip $(STATE_MAP)),)
+STATE_ARG := --nodes $(NODES)
+else
+STATE_ARG := --state-map $(STATE_MAP)
+override NODES := $(shell $(PYTHON) $(PROJECT_ROOT)/scripts/state_map_count.py $(STATE_MAP))
+endif
+
+BUILD_ARG := $(if $(filter 1,$(NO_BUILD)),--no-build,)
 
 # Default target
 help:
@@ -50,10 +61,14 @@ help:
 	@echo "Options:"
 	@echo "  NODES=N                 Number of training nodes (default: 6)"
 	@echo "  CLIQUE_SIZE=N           Size of each clique (default: 3)"
+	@echo "  STATE_MAP=path          JSON file describing states -> node identities"
+	@echo "  NO_BUILD=1              Skip rebuilding the shared node image"
 	@echo "  FOREGROUND=1            Run containers in foreground (default: background)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make start NODES=10 CLIQUE_SIZE=5    Start with 10 nodes in cliques of 5"
+	@echo "  make start STATE_MAP=config/state-map.json CLIQUE_SIZE=4"
+	@echo "  make start NO_BUILD=1                Reuse previously built images"
 	@echo "  make start FOREGROUND=1              Start in foreground (watch logs)"
 	@echo "  make start-training NODES=8          Restart training with 8 nodes"
 
@@ -124,8 +139,9 @@ setup-blockchain:
 generate-configs: setup-deps setup-blockchain
 	@echo "Generating node configurations for $(NODES) nodes (clique_size=$(CLIQUE_SIZE))..."
 	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
-		--nodes $(NODES) \
+		$(STATE_ARG) \
 		--clique-size $(CLIQUE_SIZE) \
+		$(BUILD_ARG) \
 		--generate-only
 
 generate-dashboard: setup-deps
@@ -141,8 +157,9 @@ start: setup
 	@echo ""
 	@echo "Starting full system with $(NODES) nodes (clique_size=$(CLIQUE_SIZE))..."
 	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
-		--nodes $(NODES) \
+		$(STATE_ARG) \
 		--clique-size $(CLIQUE_SIZE) \
+		$(BUILD_ARG) \
 		$(if $(filter 1,$(FOREGROUND)),--no-detach,)
 
 start-training: setup generate-configs stop-training clean-state
@@ -154,8 +171,9 @@ start-training: setup generate-configs stop-training clean-state
 start-blockchain: setup
 	@echo "Starting blockchain infrastructure..."
 	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
-		--nodes $(NODES) \
+		$(STATE_ARG) \
 		--clique-size $(CLIQUE_SIZE) \
+		$(BUILD_ARG) \
 		--generate-only
 	@cd $(PROJECT_ROOT)/../thesis-blockchain/api-gateway && \
 		docker compose up -d --build

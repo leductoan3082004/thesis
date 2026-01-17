@@ -7,6 +7,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,7 @@ NODE_TEMPLATE_PATH = ROOT_DIR / "config" / "node.config.template.json"
 NODES_DIR = ROOT_DIR / "config" / "nodes"
 KEYS_DIR = ROOT_DIR / "config" / "keys"
 TOPOLOGY_FILE = ROOT_DIR / "config" / "topology.json"
+STATE_MAP_FILE = ROOT_DIR / "config" / "state-map.json"
 PROMETHEUS_CONFIG = ROOT_DIR / "docker" / "prometheus" / "prometheus.yml"
 SYSTEM_CONFIG_FILENAME = "system-config.json"
 SYSTEM_CONFIG_ENV_VAR = "SYSTEM_CONFIG_PATH"
@@ -165,6 +167,12 @@ def parse_args() -> argparse.Namespace:
         help="Size of each clique in the D-Cliques topology (default: 3).",
     )
     parser.add_argument(
+        "--state-map",
+        type=Path,
+        help="Optional JSON file describing which nodes belong to which state. "
+        "Overrides --nodes and system-config counts when provided.",
+    )
+    parser.add_argument(
         "--blockchain-only",
         action="store_true",
         help="Prepare artifacts and start only the blockchain/api-gateway stack.",
@@ -212,9 +220,13 @@ def _apply_ipfs_distribution(ipfs_service: str, config: Dict[str, Any], all_serv
         del ipfs_section["replica_api_urls"]
 
 
-def _apply_blockchain_identity(node_index: int, config: Dict[str, Any]) -> None:
+def _apply_blockchain_identity(
+    node_index: int,
+    config: Dict[str, Any],
+    identity_override: Optional[str] = None,
+) -> None:
     suffix = f"{node_index + 1:03d}"
-    identity = f"trainer-node-{suffix}"
+    identity = identity_override or f"trainer-node-{suffix}"
     inter_cluster = config.setdefault("inter_cluster", {})
     blockchain = inter_cluster.setdefault("blockchain", {})
     blockchain["identity"] = identity
@@ -1163,6 +1175,103 @@ def determine_node_count(cli_nodes: Optional[int], system_config_path: Path) -> 
     return node_count_int
 
 
+def _resolve_state_map_path(cli_path: Optional[Path]) -> Optional[Path]:
+    if cli_path:
+        return _resolve_repo_path(cli_path).resolve()
+    default_path = STATE_MAP_FILE
+    if default_path.exists():
+        return default_path
+    return None
+
+
+def _normalize_trainer_id(raw: Optional[str], seq_index: int) -> str:
+    base = (raw or "").strip()
+    if base:
+        match = re.search(r"(\d+)(?!.*\d)", base)
+        if match:
+            number = int(match.group(1))
+            return f"trainer-node-{number:03d}"
+        sanitized = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+        if sanitized:
+            return sanitized
+    return f"trainer-node-{seq_index + 1:03d}"
+
+
+def _load_state_assignments(state_map_path: Optional[Path]) -> List[Tuple[str, str, str]]:
+    """
+    Load state-to-node assignments from configuration file.
+
+    The JSON schema is:
+    {
+        "states": [
+            {"state_id": "state_a", "count": 20},
+            {"state_id": "state_b", "count": 15}
+        ]
+    }
+    The system always creates container names sequentially (node_0, node_1, ...),
+    but each state may optionally define the logical node identifiers via the
+    "nodes" list. When provided, those identifiers become the node_id and
+    blockchain identity inside the generated config while the container keeps its
+    predictable node_X name.
+    """
+    if state_map_path is None:
+        return []
+    if not state_map_path.exists():
+        raise SystemExit(f"State map file not found: {state_map_path}")
+    try:
+        data = json.loads(state_map_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in state map {state_map_path}: {exc}") from exc
+
+    states = data.get("states")
+    if not isinstance(states, list) or not states:
+        raise SystemExit(f"State map {state_map_path} must contain a non-empty 'states' list.")
+
+    assignments: List[Tuple[str, str, str]] = []
+    next_index = 0
+    for entry in states:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"Invalid state entry in {state_map_path}: {entry!r}")
+        state_id = entry.get("state_id") or entry.get("id")
+        if not state_id:
+            raise SystemExit(f"State entry missing 'state_id': {entry!r}")
+        explicit_nodes = entry.get("nodes")
+        if explicit_nodes:
+            if not isinstance(explicit_nodes, list):
+                raise SystemExit(f"'nodes' for state {state_id} must be a list")
+            for alias in explicit_nodes:
+                alias_str = str(alias).strip()
+                if not alias_str:
+                    raise SystemExit(f"Invalid node identifier in state {state_id}: {alias!r}")
+                node_name = f"node_{next_index}"
+                trainer_id = _normalize_trainer_id(alias_str, next_index)
+                assignments.append((node_name, str(state_id), trainer_id))
+                next_index += 1
+            count = entry.get("count")
+            if count is not None and int(count) != len(explicit_nodes):
+                raise SystemExit(
+                    f"State {state_id} specifies count={count} but provided {len(explicit_nodes)} nodes."
+                )
+            continue
+        count = entry.get("count")
+        if count is None:
+            raise SystemExit(
+                f"State entry for {state_id} must include either 'nodes' or 'count'."
+            )
+        try:
+            count_val = int(count)
+        except (TypeError, ValueError):
+            raise SystemExit(f"Invalid count for state {state_id}: {count!r}") from None
+        if count_val <= 0:
+            raise SystemExit(f"State {state_id} must have count >= 1 (found {count_val}).")
+        for _ in range(count_val):
+            node_name = f"node_{next_index}"
+            trainer_id = _normalize_trainer_id(None, next_index)
+            assignments.append((node_name, str(state_id), trainer_id))
+            next_index += 1
+    return assignments
+
+
 def load_compose_template(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise SystemExit(f"Docker compose template not found at {path}")
@@ -1329,7 +1438,7 @@ def _update_ttp_service(
 
 def update_compose_file(
     compose_data: Dict[str, Any],
-    num_nodes: int,
+    node_names: List[str],
     ipfs_services: List[str],
     clique_size: int = 3,
     node_image: Optional[str] = None,
@@ -1342,11 +1451,10 @@ def update_compose_file(
             services.pop(key)
     if "node" in services:
         _apply_shared_node_image(services.get("node"), node_image)
-    for idx in range(num_nodes):
-        node_name = f"node_{idx}"
+    for idx, node_name in enumerate(node_names):
         ipfs_service = _select_ipfs_service(idx, ipfs_services)
         services[node_name] = _merge_node_service(node_name, base_node_service, ipfs_service, node_image)
-    _update_ttp_service(services, num_nodes, clique_size, node_image)
+    _update_ttp_service(services, len(node_names), clique_size, node_image)
     return compose_data
 
 
@@ -1354,9 +1462,9 @@ def write_compose_file(data: Dict[str, Any], path: Path) -> None:
     path.write_text(yaml.safe_dump(data, sort_keys=False))
 
 
-def generate_prometheus_config(num_nodes: int) -> None:
+def generate_prometheus_config(node_names: List[str]) -> None:
     """Generate prometheus.yml with targets for all nodes."""
-    targets = [f"node_{i}:8000" for i in range(num_nodes)]
+    targets = [f"{name}:8000" for name in node_names]
     config = {
         "global": {
             "scrape_interval": "5s",
@@ -1376,7 +1484,7 @@ def generate_prometheus_config(num_nodes: int) -> None:
     }
     PROMETHEUS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     PROMETHEUS_CONFIG.write_text(yaml.safe_dump(config, sort_keys=False))
-    print(f"Generated Prometheus config for {num_nodes} nodes -> {PROMETHEUS_CONFIG}")
+    print(f"Generated Prometheus config for {len(node_names)} nodes -> {PROMETHEUS_CONFIG}")
 
 
 def run_docker_compose(compose_path: Path, detach: bool, build: bool) -> int:
@@ -1397,7 +1505,24 @@ def main() -> None:
     compose_template_path = _resolve_repo_path(args.compose_template)
     compose_output_path = _resolve_repo_path(args.compose_output)
     system_config_path = resolve_system_config_path(args.system_config)
-    node_count = determine_node_count(args.nodes, system_config_path)
+    state_map_path = _resolve_state_map_path(args.state_map)
+    state_assignments = _load_state_assignments(state_map_path)
+    if state_assignments:
+        node_names = [name for name, _, _ in state_assignments]
+        node_count = len(node_names)
+        state_counts: Dict[str, int] = {}
+        for _, state_id, _ in state_assignments:
+            state_counts[state_id or "unassigned"] = state_counts.get(state_id or "unassigned", 0) + 1
+        state_summary = ", ".join(f"{state}: {count}" for state, count in state_counts.items())
+        print(f"Loaded state map {state_map_path} ({state_summary})")
+    else:
+        node_count = determine_node_count(args.nodes, system_config_path)
+        node_names = [f"node_{i}" for i in range(node_count)]
+        state_assignments = [(name, "", _normalize_trainer_id(None, idx)) for idx, name in enumerate(node_names)]
+        print(
+            f"Using node count {node_count} from "
+            f"{'--nodes CLI' if args.nodes is not None else system_config_path}"
+        )
     shared_node_image = NODE_IMAGE_TAG
 
     template_config = load_node_template()
@@ -1411,19 +1536,21 @@ def main() -> None:
     _clear_runtime_state(blockchain_paths)
     _reset_nodes_dir()
     # Generate configs with the correct IPFS/blockchain layout.
-    for idx in range(node_count):
+    for idx, (container_name, state_id, trainer_id) in enumerate(state_assignments):
         config = deepcopy(template_config)
-        node_id = f"node_{idx}"
-        config["node_id"] = node_id
+        config["node_id"] = trainer_id
+        config["trainer_id"] = trainer_id
+        if state_id:
+            config["state_id"] = state_id
         ipfs_service = _select_ipfs_service(idx, ipfs_services)
         _apply_ipfs_distribution(ipfs_service, config, ipfs_services)
-        _apply_blockchain_identity(idx, config)
-        config_path = NODES_DIR / f"{node_id}.json"
+        _apply_blockchain_identity(idx, config, identity_override=trainer_id)
+        config_path = NODES_DIR / f"{container_name}.json"
         config_path.write_text(json.dumps(config, indent=2) + "\n")
 
     updated_compose = update_compose_file(
         compose_template,
-        node_count,
+        node_names,
         ipfs_services,
         args.clique_size,
         shared_node_image,
@@ -1431,9 +1558,12 @@ def main() -> None:
     compose_output_path.parent.mkdir(parents=True, exist_ok=True)
     write_compose_file(updated_compose, compose_output_path)
     print(f"Generated docker compose file with {node_count} nodes, clique_size={args.clique_size} -> {compose_output_path}")
-    print(f"(node count source: {'--nodes CLI' if args.nodes is not None else system_config_path})")
+    if state_map_path:
+        print(f"(node count source: {state_map_path})")
+    else:
+        print(f"(node count source: {'--nodes CLI' if args.nodes is not None else system_config_path})")
 
-    generate_prometheus_config(node_count)
+    generate_prometheus_config(node_names)
 
     topology_data = generate_preliminary_topology(node_count, args.clique_size)
     TOPOLOGY_FILE.parent.mkdir(parents=True, exist_ok=True)

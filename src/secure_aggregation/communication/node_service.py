@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -118,6 +119,7 @@ class NodeService:
         self.config = self._load_config(config_path)
         self.system_config, self.system_config_path = load_system_config(Path(config_path))
         self.node_id = self.config["node_id"]
+        self.state_id = self.config.get("state_id")
         self.role = NodeRole(self.config["role"])
         self.ttp_address = self.config["ttp_address"]
         self.port = self.config["port"]
@@ -481,7 +483,11 @@ class NodeService:
         else:
             # Fallback: compute partition locally
             labels = {i: int(train_ds[i][1]) for i in range(len(train_ds))}
+            node_index = self._extract_node_index()
             num_clients = self.dataset_config["num_clients"]
+            num_clients = max(num_clients, node_index + 1)
+            if self.participants:
+                num_clients = max(num_clients, len(self.participants))
             alpha = self.dataset_config["alpha"]
             seed = self.dataset_config.get("seed", 42)
 
@@ -489,9 +495,15 @@ class NodeService:
                 list(range(len(train_ds))), labels, num_clients=num_clients, alpha=alpha, seed=seed
             )
 
-            node_index = int(self.node_id.split("_")[-1])
             client_key = f"client_{node_index}"
             indices = parts.get(client_key, [])
+            if not indices:
+                logger.warning(
+                    "Dirichlet partition returned no samples for %s (client_%s); falling back to deterministic split",
+                    self.node_id,
+                    node_index,
+                )
+                indices = self._deterministic_partition(len(train_ds), num_clients, node_index)
             logger.info(f"Using {len(indices)} locally-computed data samples")
 
         # Split indices into train (80%) and validation (20%) for metrics tracking
@@ -508,6 +520,28 @@ class NodeService:
         self.val_loader = DataLoader(Subset(train_ds, self.val_indices), batch_size=batch_size, shuffle=False)
         self.test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
         logger.info(f"Data split: {len(self.train_indices)} train, {len(self.val_indices)} validation samples")
+
+    def _extract_node_index(self) -> int:
+        """Extract trailing numeric component from node_id, regardless of delimiters."""
+        suffix = self.node_id.split("_")[-1]
+        if suffix.isdigit():
+            return int(suffix)
+        match = re.search(r"(\d+)$", self.node_id)
+        if match:
+            return int(match.group(1))
+        raise ValueError(f"Node ID '{self.node_id}' does not end with a numeric index")
+
+    @staticmethod
+    def _deterministic_partition(dataset_size: int, num_clients: int, node_index: int) -> List[int]:
+        """Split dataset evenly when probabilistic partitioning yields zero samples."""
+        base = dataset_size // num_clients
+        remainder = dataset_size % num_clients
+        extra = 1 if node_index < remainder else 0
+        start = node_index * base + min(node_index, remainder)
+        end = min(dataset_size, start + base + extra)
+        if start >= dataset_size:
+            return [dataset_size - 1]
+        return list(range(start, end))
 
     def setup_model(self) -> None:
         """Initialize model."""
