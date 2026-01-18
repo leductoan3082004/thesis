@@ -214,6 +214,52 @@ Copy `config/system-config.sample.json` to `config/system-config.json` to config
 - Convergence detection: `enabled`, `warmup_rounds`, `tol_abs`, `tol_rel`, `patience`
 - Fleet size: `number_of_nodes` for Docker launches
 
+### Dataset Configuration
+
+Datasets are configured in `config/datasets.json`. To switch datasets:
+
+1. Download the dataset:
+```bash
+# List available datasets
+python scripts/prepare_data.py --list
+
+# Download a specific dataset
+python scripts/prepare_data.py --dataset mnist
+python scripts/prepare_data.py --dataset fashion_mnist
+python scripts/prepare_data.py --dataset cifar10
+```
+
+2. Update `config/node.config.template.json`:
+```json
+{
+  "dataset": {
+    "name": "fashion_mnist",
+    "num_clients": 12,
+    "alpha": 0.5,
+    "seed": 42
+  }
+}
+```
+
+To add a custom dataset (e.g., from Kaggle), add an entry to `config/datasets.json`:
+
+```json
+{
+  "my_kaggle_dataset": {
+    "type": "csv",
+    "train_path": "/app/data/kaggle/train.csv",
+    "test_path": "/app/data/kaggle/test.csv",
+    "num_classes": 10,
+    "input_shape": [1, 784],
+    "label_column": "label"
+  }
+}
+```
+
+Supported dataset types:
+- `torchvision`: Built-in datasets (MNIST, FashionMNIST, CIFAR10, etc.)
+- `csv`: CSV files with features and a label column
+
 ## Project Structure
 
 ```
@@ -231,6 +277,7 @@ secure_aggregation/
 ├── config/
 │   ├── nodes/               # Generated node configurations
 │   ├── keys/                # Trainer keys (generated)
+│   ├── datasets.json        # Dataset configurations
 │   └── node.config.template.json
 ├── docker/
 │   ├── docker-compose.yml   # Base compose template
@@ -239,7 +286,7 @@ secure_aggregation/
 ├── protos/                  # gRPC protocol definitions
 ├── scripts/
 │   ├── run_docker_with_nodes.py  # Main orchestrator
-│   ├── prepare_data.py           # Download MNIST
+│   ├── prepare_data.py           # Download datasets
 │   ├── run_ttp_with_topology.py  # TTP service runner
 │   ├── generate_grafana_dashboard.py  # Dashboard generator
 │   └── generate_keys.py          # Key generation utility

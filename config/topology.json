@@ -3,33 +3,91 @@
   "cliques": [
     [
       "node_0",
-      "node_1",
-      "node_2",
-      "node_3",
-      "node_4"
-    ],
-    [
-      "node_5",
-      "node_6",
-      "node_7",
-      "node_8",
-      "node_9"
-    ],
-    [
       "node_10",
-      "node_11",
-      "node_12",
-      "node_13",
-      "node_14"
+      "node_19",
+      "node_4",
+      "node_5"
     ],
     [
+      "node_11",
+      "node_14",
+      "node_2",
+      "node_6",
+      "node_7"
+    ],
+    [
+      "node_12",
       "node_15",
       "node_16",
       "node_17",
-      "node_18",
-      "node_19"
+      "node_18"
+    ],
+    [
+      "node_1",
+      "node_13",
+      "node_3",
+      "node_8",
+      "node_9"
     ]
   ],
-  "inter_edges": [],
-  "edge_counts": {}
+  "inter_edges": [
+    [
+      "node_0",
+      "node_11"
+    ],
+    [
+      "node_10",
+      "node_12"
+    ],
+    [
+      "node_0",
+      "node_1"
+    ],
+    [
+      "node_14",
+      "node_15"
+    ],
+    [
+      "node_2",
+      "node_13"
+    ],
+    [
+      "node_16",
+      "node_3"
+    ],
+    [
+      "node_10",
+      "node_6"
+    ],
+    [
+      "node_0",
+      "node_17"
+    ],
+    [
+      "node_10",
+      "node_8"
+    ]
+  ],
+  "edge_counts": {
+    "node_19": 4,
+    "node_4": 4,
+    "node_0": 7,
+    "node_5": 4,
+    "node_10": 7,
+    "node_11": 5,
+    "node_7": 4,
+    "node_2": 5,
+    "node_6": 5,
+    "node_14": 5,
+    "node_17": 5,
+    "node_12": 5,
+    "node_16": 5,
+    "node_15": 5,
+    "node_18": 4,
+    "node_1": 5,
+    "node_9": 4,
+    "node_13": 5,
+    "node_3": 5,
+    "node_8": 5
+  }
 }
