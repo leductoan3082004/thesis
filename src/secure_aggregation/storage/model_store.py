@@ -19,6 +19,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -31,6 +32,14 @@ logger = logging.getLogger(__name__)
 
 IPFS_LOG_TAG = "~ IPFS ~"
 BLOCKCHAIN_LOG_TAG = "~ BLOCKCHAIN ~"
+
+
+class AnchorScope(str, Enum):
+    """Different namespaces supported by the blockchain gateway."""
+
+    CLUSTER = "cluster"
+    STATE = "state"
+    CONTROL = "control"
 
 
 def compute_model_hash(model: np.ndarray) -> str:
@@ -78,7 +87,15 @@ class BlockchainInterface(ABC):
     """Abstract interface for blockchain-like model registry."""
 
     @abstractmethod
-    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> Optional[str]:
+    def anchor(
+        self,
+        scope_id: str,
+        round_num: int,
+        cid: str,
+        hash_val: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[str]:
         """Record model reference on-chain."""
         pass
 
@@ -88,23 +105,36 @@ class BlockchainInterface(ABC):
         pass
 
     @abstractmethod
-    def get_anchor(self, cluster_id: str, round_num: int) -> Optional[Tuple[str, str]]:
+    def get_anchor(
+        self,
+        scope_id: str,
+        round_num: int,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash) for cluster/round."""
         pass
 
     @abstractmethod
-    def get_latest_anchor(self, cluster_id: str) -> Optional[ModelAnchor]:
+    def get_latest_anchor(
+        self,
+        scope_id: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[ModelAnchor]:
         """Get most recent anchor for a cluster."""
         pass
 
     @abstractmethod
     def remember_anchor(
         self,
-        cluster_id: str,
+        scope_id: str,
         round_num: int,
         data_id: str,
         cid: Optional[str] = None,
         hash_val: Optional[str] = None,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
     ) -> None:
         """Persist a reference that was anchored elsewhere."""
         pass
@@ -255,7 +285,15 @@ class MockBlockchain(BlockchainInterface):
                 }
         self._storage_path.write_text(json.dumps(data, indent=2))
 
-    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> Optional[str]:
+    def anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        cid: str,
+        hash_val: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[str]:
         """Record model reference."""
         anchor = ModelAnchor(cluster_id=cluster_id, round_num=round_num, cid=cid, hash=hash_val)
 
@@ -276,7 +314,13 @@ class MockBlockchain(BlockchainInterface):
         )
         return None
 
-    def get_anchor(self, cluster_id: str, round_num: int) -> Optional[Tuple[str, str]]:
+    def get_anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash)."""
         with self._registry_lock:
             if self._storage_path:
@@ -293,7 +337,12 @@ class MockBlockchain(BlockchainInterface):
                 return (anchor.cid, anchor.hash)
             return None
 
-    def get_latest_anchor(self, cluster_id: str) -> Optional[ModelAnchor]:
+    def get_latest_anchor(
+        self,
+        cluster_id: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[ModelAnchor]:
         """Get most recent anchor for a cluster."""
         with self._registry_lock:
             if self._storage_path:
@@ -327,6 +376,8 @@ class MockBlockchain(BlockchainInterface):
         data_id: str,
         cid: Optional[str] = None,
         hash_val: Optional[str] = None,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
     ) -> None:
         """Mock registry ignores data_id and stores provided fields."""
         if cid is None or hash_val is None:
@@ -557,7 +608,15 @@ class RegistryBlockchain(BlockchainInterface):
         self._timeout = timeout
         self._client = httpx.Client(timeout=timeout)
 
-    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> None:
+    def anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        cid: str,
+        hash_val: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> None:
         """Record model reference in registry."""
         try:
             response = self._client.post(
@@ -575,7 +634,13 @@ class RegistryBlockchain(BlockchainInterface):
             logger.error(f"Failed to anchor model: {e}")
             raise RuntimeError(f"Registry anchor failed: {e}") from e
 
-    def get_anchor(self, cluster_id: str, round_num: int) -> Optional[Tuple[str, str]]:
+    def get_anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash) from registry."""
         try:
             response = self._client.get(
@@ -590,7 +655,12 @@ class RegistryBlockchain(BlockchainInterface):
             logger.error(f"Failed to get anchor: {e}")
             raise RuntimeError(f"Registry get_anchor failed: {e}") from e
 
-    def get_latest_anchor(self, cluster_id: str) -> Optional[ModelAnchor]:
+    def get_latest_anchor(
+        self,
+        cluster_id: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[ModelAnchor]:
         """Get most recent anchor for a cluster from registry."""
         try:
             response = self._client.get(
@@ -634,11 +704,19 @@ class LocalAnchorStore:
                     logger.warning("Failed to parse anchor state at %s", self._path)
 
         self._data.setdefault("clusters", {})
+        self._data.setdefault("states", {})
 
     def _persist(self) -> None:
         if not self._path:
             return
         self._path.write_text(json.dumps(self._data, indent=2))
+
+    def _bucket_for_scope(self, scope: AnchorScope) -> str:
+        if scope == AnchorScope.STATE:
+            return "states"
+        if scope == AnchorScope.CLUSTER:
+            return "clusters"
+        return f"scopes::{scope.value}"
 
     def remember(
         self,
@@ -648,33 +726,50 @@ class LocalAnchorStore:
         cid: Optional[str],
         hash_val: Optional[str],
         submitted_at: Optional[str] = None,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
     ) -> None:
         with self._lock:
-            clusters = self._data.setdefault("clusters", {})
+            bucket_name = self._bucket_for_scope(scope)
+            clusters = self._data.setdefault(bucket_name, {})
             cluster_entry = clusters.setdefault(cluster_id, {"rounds": {}, "latest_round": -1})
             cluster_entry["rounds"][str(round_num)] = {
                 "data_id": data_id,
                 "cid": cid,
                 "hash": hash_val,
                 "submitted_at": submitted_at,
+                "entity": scope.value,
             }
             latest = cluster_entry.get("latest_round", -1)
             if round_num >= latest:
                 cluster_entry["latest_round"] = round_num
             self._persist()
 
-    def get_round(self, cluster_id: str, round_num: int) -> Optional[Dict]:
+    def get_round(
+        self,
+        cluster_id: str,
+        round_num: int,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[Dict]:
         with self._lock:
-            cluster_entry = self._data.get("clusters", {}).get(cluster_id, {})
+            bucket_name = self._bucket_for_scope(scope)
+            cluster_entry = self._data.get(bucket_name, {}).get(cluster_id, {})
             rounds = cluster_entry.get("rounds", {})
             entry = rounds.get(str(round_num))
             if entry is None:
                 return None
             return dict(entry)
 
-    def get_latest(self, cluster_id: str) -> Optional[Tuple[int, Dict]]:
+    def get_latest(
+        self,
+        cluster_id: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[Tuple[int, Dict]]:
         with self._lock:
-            cluster_entry = self._data.get("clusters", {}).get(cluster_id)
+            bucket_name = self._bucket_for_scope(scope)
+            cluster_entry = self._data.get(bucket_name, {}).get(cluster_id)
             if not cluster_entry:
                 return None
             latest_round = cluster_entry.get("latest_round")
@@ -769,7 +864,49 @@ class GatewayBlockchain(BlockchainInterface):
         )
         return result
 
-    def _fetch_data(self, data_id: str) -> Dict:
+    def _commit_cluster_model(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> Dict:
+        response = self._client.post(
+            f"{self._base_url}/cluster/models",
+            headers=self._auth_headers(),
+            json={
+                "cluster_id": cluster_id,
+                "payload": {
+                    "model_hash": hash_val,
+                    "cid": cid,
+                    "round": round_num,
+                },
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+        logger.info(
+            f"{BLOCKCHAIN_LOG_TAG} Submitted cluster model cluster={cluster_id} round={round_num} "
+            f"data_id={result.get('data_id')}"
+        )
+        return result
+
+    def _commit_state_model(self, state_id: str, state_round: int, cid: str, hash_val: str) -> Dict:
+        response = self._client.post(
+            f"{self._base_url}/state/models",
+            headers=self._auth_headers(),
+            json={
+                "state_id": state_id,
+                "payload": {
+                    "model_hash": hash_val,
+                    "cid": cid,
+                    "round": state_round,
+                },
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+        logger.info(
+            f"{BLOCKCHAIN_LOG_TAG} Submitted state model state={state_id} round={state_round} "
+            f"data_id={result.get('data_id')}"
+        )
+        return result
+
+    def _fetch_control_data(self, data_id: str) -> Dict:
         try:
             response = self._client.get(
                 f"{self._base_url}/data/{data_id}",
@@ -788,20 +925,64 @@ class GatewayBlockchain(BlockchainInterface):
             logger.error(f"{BLOCKCHAIN_LOG_TAG} Failed to fetch data_id={data_id}: {exc}")
             raise
 
-    def anchor(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> Optional[str]:
-        payload = {
-            "cluster_id": cluster_id,
-            "round": round_num,
-            "cid": cid,
-            "hash": hash_val,
-        }
-        record = self._commit_payload(payload)
+    def _fetch_model_metadata(self, scope: AnchorScope, data_id: str) -> Dict:
+        endpoint = "/data"
+        if scope == AnchorScope.CLUSTER:
+            endpoint = "/cluster/models"
+        elif scope == AnchorScope.STATE:
+            endpoint = "/state/models"
+        try:
+            response = self._client.get(
+                f"{self._base_url}{endpoint}/{data_id}",
+                headers=self._auth_headers(),
+            )
+            response.raise_for_status()
+            data = response.json()
+            logger.info(
+                f"{BLOCKCHAIN_LOG_TAG} Retrieved {scope.value} record from gateway data_id={data_id}"
+            )
+            return data
+        except httpx.HTTPError as exc:
+            logger.error(f"{BLOCKCHAIN_LOG_TAG} Failed to fetch {scope.value} data_id={data_id}: {exc}")
+            raise
+
+    def anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        cid: str,
+        hash_val: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[str]:
+        if not isinstance(scope, AnchorScope):
+            scope = AnchorScope(scope)
+        if scope == AnchorScope.CLUSTER:
+            record = self._commit_cluster_model(cluster_id, round_num, cid, hash_val)
+        elif scope == AnchorScope.STATE:
+            record = self._commit_state_model(cluster_id, round_num, cid, hash_val)
+        else:
+            payload = {
+                "cluster_id": cluster_id,
+                "round": round_num,
+                "cid": cid,
+                "hash": hash_val,
+            }
+            record = self._commit_payload(payload)
         data_id = record.get("data_id")
         submitted_at = record.get("submitted_at")
         if data_id:
-            self._store.remember(cluster_id, round_num, data_id, cid, hash_val, submitted_at)
+            self._store.remember(
+                cluster_id,
+                round_num,
+                data_id,
+                cid,
+                hash_val,
+                submitted_at,
+                scope=scope,
+            )
             logger.info(
-                f"{BLOCKCHAIN_LOG_TAG} Anchored model cluster={cluster_id}, round={round_num}, data_id={data_id}"
+                f"{BLOCKCHAIN_LOG_TAG} Anchored {scope.value} model scope={cluster_id}, round={round_num}, data_id={data_id}"
             )
         return data_id
 
@@ -812,42 +993,71 @@ class GatewayBlockchain(BlockchainInterface):
         data_id: str,
         cid: Optional[str] = None,
         hash_val: Optional[str] = None,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
     ) -> None:
-        self._store.remember(cluster_id, round_num, data_id, cid, hash_val)
+        self._store.remember(cluster_id, round_num, data_id, cid, hash_val, scope=scope)
 
     @staticmethod
     def _is_control_cluster(cluster_id: str) -> bool:
         return cluster_id.startswith("__")
 
-    def _resolve_entry(self, cluster_id: str, round_num: int) -> Optional[ModelAnchor]:
-        entry = self._store.get_round(cluster_id, round_num)
+    def _resolve_entry(
+        self,
+        cluster_id: str,
+        round_num: int,
+        scope: AnchorScope,
+    ) -> Optional[ModelAnchor]:
+        entry = self._store.get_round(cluster_id, round_num, scope=scope)
         if entry is None:
             return None
         cid = entry.get("cid")
         hash_val = entry.get("hash")
         data_id = entry.get("data_id")
         submitted_at = entry.get("submitted_at")
-
+        entry_scope_value = entry.get("entity")
+        if entry_scope_value:
+            try:
+                scope = AnchorScope(entry_scope_value)
+            except ValueError:
+                scope = AnchorScope.CLUSTER
         if (cid is None or hash_val is None) and data_id:
             try:
-                record = self._fetch_data(data_id)
+                if scope in (AnchorScope.CLUSTER, AnchorScope.STATE):
+                    record = self._fetch_model_metadata(scope, data_id)
+                    payload = record.get("payload", {})
+                    if scope == AnchorScope.CLUSTER:
+                        cid = payload.get("cid") or payload.get("model_cid")
+                        hash_val = payload.get("model_hash")
+                    else:
+                        cid = payload.get("cid") or payload.get("model_cid")
+                        hash_val = payload.get("model_hash")
+                else:
+                    record = self._fetch_control_data(data_id)
+                    payload = record.get("payload", {})
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except json.JSONDecodeError:
+                            payload = {}
+                    cid = payload.get("cid")
+                    hash_val = payload.get("hash")
             except httpx.HTTPError:
                 return None
-            payload = record.get("payload", {})
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except json.JSONDecodeError:
-                    logger.warning(f"{BLOCKCHAIN_LOG_TAG} Failed to parse payload for data_id={data_id}")
-                    payload = {}
-            cid = payload.get("cid")
-            hash_val = payload.get("hash")
             submitted_at = record.get("submitted_at")
             if cid and hash_val:
-                self._store.remember(cluster_id, round_num, data_id, cid, hash_val, submitted_at)
+                self._store.remember(
+                    cluster_id,
+                    round_num,
+                    data_id,
+                    cid,
+                    hash_val,
+                    submitted_at,
+                    scope=scope,
+                )
             else:
                 logger.warning(
-                    f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash when fetching data_id={data_id} cluster={cluster_id}"
+                    f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash when fetching data_id={data_id} scope={cluster_id}"
                 )
 
         if not cid or not hash_val:
@@ -861,10 +1071,16 @@ class GatewayBlockchain(BlockchainInterface):
             submitted_at=submitted_at,
         )
 
-    def get_anchor(self, cluster_id: str, round_num: int) -> Optional[Tuple[str, str]]:
-        anchor = self._resolve_entry(cluster_id, round_num)
+    def get_anchor(
+        self,
+        cluster_id: str,
+        round_num: int,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[Tuple[str, str]]:
+        anchor = self._resolve_entry(cluster_id, round_num, scope)
         if anchor is None:
-            if self._is_control_cluster(cluster_id):
+            if scope == AnchorScope.CONTROL or self._is_control_cluster(cluster_id):
                 logger.debug(
                     f"{BLOCKCHAIN_LOG_TAG} No anchor found for control cluster={cluster_id}, round={round_num}"
                 )
@@ -878,16 +1094,21 @@ class GatewayBlockchain(BlockchainInterface):
         )
         return (anchor.cid, anchor.hash)
 
-    def get_latest_anchor(self, cluster_id: str) -> Optional[ModelAnchor]:
-        latest = self._store.get_latest(cluster_id)
+    def get_latest_anchor(
+        self,
+        cluster_id: str,
+        *,
+        scope: AnchorScope = AnchorScope.CLUSTER,
+    ) -> Optional[ModelAnchor]:
+        latest = self._store.get_latest(cluster_id, scope=scope)
         if latest is None:
-            if self._is_control_cluster(cluster_id):
+            if scope == AnchorScope.CONTROL or self._is_control_cluster(cluster_id):
                 logger.debug(f"{BLOCKCHAIN_LOG_TAG} No latest anchor for control cluster={cluster_id}")
             else:
                 logger.warning(f"{BLOCKCHAIN_LOG_TAG} No latest anchor for cluster={cluster_id}")
             return None
         round_num, _ = latest
-        anchor = self._resolve_entry(cluster_id, round_num)
+        anchor = self._resolve_entry(cluster_id, round_num, scope)
         if anchor:
             logger.info(
                 f"{BLOCKCHAIN_LOG_TAG} Latest anchor cluster={cluster_id}, round={anchor.round_num}, cid={anchor.cid[:16]}..."
@@ -913,6 +1134,6 @@ class GatewayBlockchain(BlockchainInterface):
 
     def fetch_data(self, data_id: str) -> Optional[Dict]:
         try:
-            return self._fetch_data(data_id)
+            return self._fetch_control_data(data_id)
         except httpx.HTTPError:
             return None

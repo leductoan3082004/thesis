@@ -9,11 +9,6 @@
       "state_id": "state_beta",
       "count": 6,
       "nodes": ["trainer-node-007", "trainer-node-008", "trainer-node-009", "trainer-node-010", "trainer-node-011", "trainer-node-012"]
-    },
-    {
-      "state_id": "state_gamma",
-      "count": 6,
-      "nodes": ["trainer-node-013", "trainer-node-014", "trainer-node-015", "trainer-node-016", "trainer-node-017", "trainer-node-018"]
     }
   ]
 }

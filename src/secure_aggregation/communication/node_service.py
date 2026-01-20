@@ -3,6 +3,7 @@
 import argparse
 import copy
 import json
+import math
 import os
 import re
 import time
@@ -44,6 +45,7 @@ from secure_aggregation.state import (
     parse_state_digest_signal,
 )
 from secure_aggregation.storage.model_store import (
+    AnchorScope,
     BlockchainInterface,
     GatewayBlockchain,
     IPFSInterface,
@@ -123,6 +125,12 @@ class NodeService:
         self.role = NodeRole(self.config["role"])
         self.ttp_address = self.config["ttp_address"]
         self.port = self.config["port"]
+        self.network_host = (
+            self.config.get("network_host")
+            or os.environ.get("NODE_HOSTNAME")
+            or os.environ.get("HOSTNAME")
+            or self.node_id
+        )
         self.dataset_config = self.config["dataset"]
         self.training_config = self.config["training"]
         self.secagg_config = self.config["secure_agg"]
@@ -192,11 +200,16 @@ class NodeService:
         self._state_committed_rounds: Set[int] = set()
         self._state_round_to_cluster_round: Dict[int, int] = {}
         self._pending_state_rounds: Set[int] = set()
+        self._state_rounds_logged: Set[int] = set()
+        self._last_applied_state_round: int = 0
         self._pending_nation_rounds: Set[int] = set()
         self._nation_round_to_state_round: Dict[int, int] = {}
 
         # Convergence state
         self.convergence_config = self._load_convergence_config()
+        self._convergence_runtime_enabled = self._should_enable_convergence_runtime()
+        if not self._convergence_runtime_enabled:
+            self.convergence_config.enabled = False
         self.convergence_tracker: Optional[ConvergenceTracker] = None
         self._latest_cluster_converged: bool = False
         self._latest_delta_norm: float = 0.0
@@ -253,6 +266,31 @@ class NodeService:
             )
             return ConvergenceConfig.from_dict(node_convergence)
         return ConvergenceConfig()
+
+    def _should_enable_convergence_runtime(self) -> bool:
+        """Determine if convergence detection runtime should be active."""
+        env_toggle = os.getenv("ENABLE_CLUSTER_CONVERGENCE")
+        if env_toggle is not None:
+            return env_toggle.lower() in {"1", "true", "yes", "on"}
+
+        def _resolve_runtime_flag(source: Optional[Dict[str, Any]]) -> Optional[bool]:
+            if not source or not isinstance(source, dict):
+                return None
+            if "runtime_enabled" in source:
+                return bool(source["runtime_enabled"])
+            return None
+
+        system_flag = _resolve_runtime_flag((self.system_config or {}).get("convergence"))
+        if system_flag is not None:
+            return system_flag
+        node_flag = _resolve_runtime_flag(self.config.get("convergence"))
+        if node_flag is not None:
+            return node_flag
+        return False
+
+    def _is_convergence_runtime_enabled(self) -> bool:
+        """Helper to check if convergence runtime is active."""
+        return bool(self._convergence_runtime_enabled)
 
     def _load_state_config(self) -> StateAggregationConfig:
         """Load state aggregation configuration and apply training defaults."""
@@ -353,6 +391,8 @@ class NodeService:
             first_check: Attempt number to trigger the first convergence check.
             interval: Attempt interval for subsequent checks.
         """
+        if not self._is_convergence_runtime_enabled():
+            return
         if attempt_idx < first_check:
             return
         if attempt_idx == first_check or ((attempt_idx - first_check) % interval == 0):
@@ -414,7 +454,7 @@ class NodeService:
 
                 request = secureagg_pb2.RegisterRequest(
                     node_id=self.node_id,
-                    address=f"{self.node_id}:{self.port}"
+                    address=f"{self.network_host}:{self.port}"
                 )
                 response = stub.RegisterNode(request, timeout=5)
 
@@ -671,6 +711,9 @@ class NodeService:
         signing_public_keys: Dict[str, bytes] = {}
         if self.participants:
             signing_public_keys = {p.node_id: bytes(p.signing_public_key) for p in self.participants}
+        convergence_handler = (
+            self._handle_convergence_signal_from_peer if self._is_convergence_runtime_enabled() else None
+        )
         self.aggregator_server, self.aggregator_servicer = serve_aggregator(
             self.node_id,
             self.port + 1000,
@@ -678,7 +721,7 @@ class NodeService:
             participant_ids,
             signing_public_keys=signing_public_keys or None,
             ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
-            convergence_signal_handler=self._handle_convergence_signal_from_peer,
+            convergence_signal_handler=convergence_handler,
         )
         logger.info(f"Started aggregator server on port {self.port + 1000} for {len(participant_ids)} clique members")
 
@@ -1021,6 +1064,81 @@ class NodeService:
     def _nation_layer_enabled(self) -> bool:
         return bool(self.nation_config.enabled and self.nation_config.rounds_per_nation > 0)
 
+    def _state_round_budget(self) -> Optional[int]:
+        """Estimate how many state rounds can occur over the training horizon."""
+        if not self._state_layer_enabled():
+            return None
+        interval = max(1, self.state_config.rounds_per_state)
+        cluster_total = self.training_config.get("rounds")
+        try:
+            cluster_total = int(cluster_total)
+        except (TypeError, ValueError):
+            cluster_total = None
+        if not cluster_total or cluster_total <= 0:
+            cluster_total = self.max_training_rounds
+        if cluster_total <= 0:
+            return None
+        return max(1, math.ceil(cluster_total / interval))
+
+    def _maybe_apply_state_model(self, round_idx: int) -> None:
+        """Fetch and apply anchored state models as the new baseline."""
+        if (
+            not self._state_layer_enabled()
+            or not self.blockchain
+            or not self.ipfs
+            or not self.state_config.state_id
+            or not self.model
+        ):
+            return
+        interval = max(1, self.state_config.rounds_per_state)
+        completed_rounds = (round_idx + 1) // interval
+        while self._last_applied_state_round < completed_rounds:
+            target_round = self._last_applied_state_round + 1
+            try:
+                anchor = self.blockchain.get_anchor(
+                    self.state_config.state_id,
+                    target_round,
+                    scope=AnchorScope.STATE,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to fetch state anchor for round %d: %s",
+                    target_round,
+                    exc,
+                )
+                return
+            if anchor is None:
+                logger.debug(
+                    "State model round %d not yet available; will retry later",
+                    target_round,
+                )
+                return
+            cid, expected_hash = anchor
+            state_model = self.ipfs.get(cid)
+            if state_model is None:
+                logger.warning(
+                    "State model round %d unavailable on IPFS (cid=%s...)",
+                    target_round,
+                    cid[:16],
+                )
+                return
+            if not verify_model_hash(state_model, expected_hash):
+                logger.warning(
+                    "State model round %d hash mismatch (cid=%s...)", target_round, cid[:16]
+                )
+                return
+            load_params(self.model, state_model.flatten().tolist())
+            self._last_model_cid = cid
+            self._last_model_data_id = None
+            self._last_applied_state_round = target_round
+            logger.info(
+                "Applied STATE ROUND %d model for state %s (cid=%s...)",
+                target_round,
+                self.state_config.state_id,
+                cid[:12],
+            )
+            self._prime_convergence_tracker_state()
+
     def _maybe_start_state_round(self, round_idx: int) -> None:
         """Trigger state aggregation when the configured interval elapses."""
         if not (self._state_layer_enabled() and self.is_state_candidate):
@@ -1047,6 +1165,16 @@ class NodeService:
             or not self.central_metadata
         ):
             return False
+        if state_round not in self._state_rounds_logged:
+            total_state_rounds = self._state_round_budget()
+            label = f"/{total_state_rounds}" if total_state_rounds else ""
+            logger.info(
+                "\n----- STATE ROUND %d%s (triggered after cluster round %d) -----",
+                state_round,
+                label,
+                cluster_round + 1,
+            )
+            self._state_rounds_logged.add(state_round)
         if state_round in self._state_round_cache:
             return True
         deadline = time.time() + max(1.0, float(self.state_config.collection_timeout_seconds))
@@ -1092,7 +1220,7 @@ class NodeService:
         if not self.blockchain:
             return None
         try:
-            return self.blockchain.get_anchor(cluster_id, round_idx)
+            return self.blockchain.get_anchor(cluster_id, round_idx, scope=AnchorScope.CLUSTER)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Failed to fetch anchor for cluster %s round %s: %s",
@@ -1315,6 +1443,9 @@ class NodeService:
 
     def _maybe_init_central_checker(self) -> None:
         """Instantiate central checker if this node is a candidate."""
+        if not self._is_convergence_runtime_enabled():
+            self.central_checker = None
+            return
         if not self.central_metadata:
             self.central_checker = None
             return
@@ -1759,9 +1890,16 @@ class NodeService:
         convergence_warmup = max(0, self.convergence_config.warmup_rounds)
 
         # Initialize convergence tracker
-        self.convergence_tracker = ConvergenceTracker(
-            self.convergence_config, f"cluster_{self.clique_id}"
-        )
+        if self._is_convergence_runtime_enabled():
+            self.convergence_tracker = ConvergenceTracker(
+                self.convergence_config, f"cluster_{self.clique_id}"
+            )
+        else:
+            self.convergence_tracker = None
+            logger.info(
+                "Cluster convergence runtime disabled; training will run fixed %d rounds",
+                max_rounds,
+            )
         self._refresh_central_metadata()
 
         # Initialize Prometheus metrics and start HTTP server for scraping
@@ -2068,6 +2206,7 @@ class NodeService:
                 break
 
             self._maybe_start_state_round(round_idx)
+            self._maybe_apply_state_model(round_idx)
 
             # Record round total time
             round_total_time = time.monotonic() - round_start_time
@@ -2186,6 +2325,8 @@ class NodeService:
         delta_norm: float,
     ) -> None:
         """Send convergence-only signal to central checkers."""
+        if not self._is_convergence_runtime_enabled():
+            return
         if not self.central_neighbor_addresses:
             return
 
@@ -2240,7 +2381,12 @@ class NodeService:
         targets: Optional[List[str]] = None,
     ) -> None:
         """Broadcast convergence confirmation to bridge neighbors."""
-        if not data_id or not self.bridge_client or not self.inter_cluster_enabled:
+        if (
+            not self._is_convergence_runtime_enabled()
+            or not data_id
+            or not self.bridge_client
+            or not self.inter_cluster_enabled
+        ):
             return
         addresses = targets or self.neighbor_bridge_addresses
         if not addresses:
@@ -2267,7 +2413,12 @@ class NodeService:
 
     def _broadcast_convergence_data_id_to_clique(self, data_id: str, round_idx: int) -> None:
         """Broadcast convergence confirmation to non-bridge clique members."""
-        if not data_id or not self.bridge_client or not self.inter_cluster_enabled:
+        if (
+            not self._is_convergence_runtime_enabled()
+            or not data_id
+            or not self.bridge_client
+            or not self.inter_cluster_enabled
+        ):
             return
         if not self._clique_signal_addresses:
             return
@@ -2299,7 +2450,7 @@ class NodeService:
 
     def _register_convergence_data_id(self, data_id: Optional[str], round_idx: Optional[int] = None) -> bool:
         """Cache convergence data_id for later verification."""
-        if not data_id:
+        if not self._is_convergence_runtime_enabled() or not data_id:
             return False
         if data_id in self._known_convergence_data_ids:
             return False
@@ -2316,6 +2467,8 @@ class NodeService:
 
     def _handle_convergence_signal_from_peer(self, data_id: str, round_idx: int) -> None:
         """Receive convergence notification from clique peers via aggregator RPC."""
+        if not self._is_convergence_runtime_enabled():
+            return
         logger.info(
             "Aggregator %s received convergence signal via RPC data_id=%s round=%s",
             self.node_id,
@@ -2329,7 +2482,8 @@ class NodeService:
     def _send_convergence_signal_to_aggregator(self, data_id: str, round_idx: Optional[int]) -> None:
         """Notify the current aggregator about convergence confirmation."""
         if (
-            not data_id
+            not self._is_convergence_runtime_enabled()
+            or not data_id
             or self.aggregator_id is None
             or self.aggregator_id == self.node_id
             or not self.aggregator_address
@@ -2373,6 +2527,8 @@ class NodeService:
         payload: Optional[Dict],
     ) -> None:
         """Callback executed when central checker finalizes convergence."""
+        if not self._is_convergence_runtime_enabled():
+            return
         if not data_id:
             logger.warning("Central checker declared convergence but no data_id was returned")
             return
@@ -2390,6 +2546,8 @@ class NodeService:
             digest = parse_state_digest_signal(ecm)
             if digest:
                 self._record_state_digest(digest)
+                continue
+            if not self._is_convergence_runtime_enabled():
                 continue
             if ecm.convergence_data_id:
                 is_new = self._register_convergence_data_id(ecm.convergence_data_id, ecm.round_idx)
@@ -2409,7 +2567,11 @@ class NodeService:
                 )
 
     def _check_cached_convergence_data(self) -> None:
-        if not self.blockchain or not self._pending_convergence_data_ids:
+        if (
+            not self._is_convergence_runtime_enabled()
+            or not self.blockchain
+            or not self._pending_convergence_data_ids
+        ):
             return
         for data_id in list(self._pending_convergence_data_ids):
             record: Optional[Dict[str, Any]]
@@ -2441,6 +2603,8 @@ class NodeService:
     def _refresh_convergence_state(self, should_stop: bool, stop_reason: str) -> Tuple[bool, str]:
         """Process buffered signals, fetch payloads, and align stop flags."""
         self._process_incoming_signals()
+        if not self._is_convergence_runtime_enabled():
+            return should_stop, stop_reason
         self._check_cached_convergence_data()
         return self._sync_stop_state_from_tracker(should_stop, stop_reason)
 
@@ -2473,6 +2637,8 @@ class NodeService:
             Tuple updated with the tracker decision if a central/global stop
             signal was received outside of the aggregator update flow.
         """
+        if not self._is_convergence_runtime_enabled():
+            return should_stop, stop_reason
         if not should_stop and self._confirmed_global_convergence_round is not None:
             reason = self._confirmed_global_convergence_reason or stop_reason or "global_convergence"
             logger.info(
@@ -2494,6 +2660,8 @@ class NodeService:
 
     def _abort_if_global_stop(self) -> None:
         """Raise if global convergence has already been confirmed."""
+        if not self._is_convergence_runtime_enabled():
+            return
         should_stop, _ = self._refresh_convergence_state(False, "")
         if should_stop:
             raise GlobalStopRequested()

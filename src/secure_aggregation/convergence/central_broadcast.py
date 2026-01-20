@@ -6,7 +6,7 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-from secure_aggregation.storage.model_store import BlockchainInterface, ModelAnchor
+from secure_aggregation.storage.model_store import AnchorScope, BlockchainInterface, ModelAnchor
 
 CENTRAL_METADATA_CLUSTER_ID = "__central_metadata__"
 CENTRAL_HEALTH_CLUSTER_ID = "__central_checker_health__"
@@ -65,6 +65,7 @@ def publish_central_metadata(blockchain: BlockchainInterface, metadata: CentralM
         metadata.version,
         cid=payload,
         hash_val=str(metadata.version),
+        scope=AnchorScope.CONTROL,
     )
 
 
@@ -72,7 +73,7 @@ def fetch_central_metadata(blockchain: Optional[BlockchainInterface]) -> Optiona
     """Retrieve the most recent central metadata."""
     if blockchain is None:
         return None
-    anchor = blockchain.get_latest_anchor(CENTRAL_METADATA_CLUSTER_ID)
+    anchor = blockchain.get_latest_anchor(CENTRAL_METADATA_CLUSTER_ID, scope=AnchorScope.CONTROL)
     if anchor is None:
         return None
     return CentralMetadata.from_payload(anchor.cid)
@@ -86,6 +87,7 @@ def publish_checker_health(blockchain: BlockchainInterface, health: CheckerHealt
         health.round_idx,
         cid=payload,
         hash_val=str(health.priority),
+        scope=AnchorScope.CONTROL,
     )
 
 
@@ -93,7 +95,7 @@ def fetch_checker_health(blockchain: Optional[BlockchainInterface]) -> list[Chec
     """Fetch all checker health anchors."""
     if blockchain is None:
         return []
-    latest = blockchain.get_latest_anchor(CENTRAL_HEALTH_CLUSTER_ID)
+    latest = blockchain.get_latest_anchor(CENTRAL_HEALTH_CLUSTER_ID, scope=AnchorScope.CONTROL)
     if latest is None:
         return []
     return [CheckerHealth.from_anchor(latest)]

@@ -15,6 +15,7 @@ import numpy as np
 from secure_aggregation.node import ECM, ECMBuffer
 from secure_aggregation.protocol import InterClusterMerger, MergeConfig
 from secure_aggregation.storage.model_store import (
+    AnchorScope,
     BlockchainInterface,
     IPFSInterface,
     compute_model_hash,
@@ -172,7 +173,13 @@ class InterClusterAggregator:
                     round_num,
                     cid[:16],
                 )
-                data_id = self.blockchain.anchor(self.cluster_id, round_num, cid, model_hash)
+                data_id = self.blockchain.anchor(
+                    self.cluster_id,
+                    round_num,
+                    cid,
+                    model_hash,
+                    scope=AnchorScope.CLUSTER,
+                )
                 logger.info(
                     "Anchored model on blockchain: cluster=%s round=%d data_id=%s (%.2fs)",
                     self.cluster_id,
@@ -207,7 +214,11 @@ class InterClusterAggregator:
         if self.blockchain is None or self.ipfs is None:
             return None
 
-        anchor = self.blockchain.get_anchor(neighbor_cluster_id, round_num)
+        anchor = self.blockchain.get_anchor(
+            neighbor_cluster_id,
+            round_num,
+            scope=AnchorScope.CLUSTER,
+        )
         if anchor is None:
             logger.debug(f"No anchor for {neighbor_cluster_id} round {round_num}")
             return None

@@ -12,6 +12,7 @@ import numpy as np
 from secure_aggregation.node import ECM
 from secure_aggregation.state.config import StateAggregationConfig
 from secure_aggregation.storage.model_store import (
+    AnchorScope,
     BlockchainInterface,
     IPFSInterface,
     compute_model_hash,
@@ -224,6 +225,7 @@ class StateAggregator:
                     state_round,
                     cid,
                     hash_val,
+                    scope=AnchorScope.STATE,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to anchor state model round=%s: %s", state_round, exc)
@@ -233,4 +235,4 @@ class StateAggregator:
         """Fetch the anchored state model reference if available."""
         if self.blockchain is None:
             return None
-        return self.blockchain.get_anchor(self.config.state_id, state_round)
+        return self.blockchain.get_anchor(self.config.state_id, state_round, scope=AnchorScope.STATE)

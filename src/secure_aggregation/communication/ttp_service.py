@@ -1,9 +1,11 @@
 """Trusted Third Party (TTP) service for key distribution and topology management."""
 
+import json
 import logging
 import os
 from concurrent import futures
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import grpc
@@ -114,7 +116,8 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             alpha=config.alpha,
             seed=config.seed,
         )
-        partition = self._map_clients_to_node_ids(partition)
+        alias_map = self._load_node_alias_map(config.num_clients)
+        partition = self._map_clients_to_node_ids(partition, alias_map)
 
         node_labels = compute_node_labels_from_partition(partition, labels)
 
@@ -153,14 +156,38 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             f"inter_edges: {len(inter_edges)}"
         )
 
+    def _load_node_alias_map(self, expected_nodes: int) -> Dict[str, str]:
+        """Load mapping from canonical node_X identifiers to logical node IDs."""
+        nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+        if not nodes_dir.exists():
+            return {}
+        alias_map: Dict[str, str] = {}
+        for idx in range(expected_nodes):
+            node_file = nodes_dir / f"node_{idx}.json"
+            if not node_file.exists():
+                continue
+            try:
+                data = json.loads(node_file.read_text())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to parse node config %s: %s", node_file, exc)
+                continue
+            alias = data.get("node_id") or data.get("trainer_id")
+            if alias:
+                alias_map[f"node_{idx}"] = str(alias)
+        return alias_map
+
     @staticmethod
-    def _map_clients_to_node_ids(partition: Dict[str, List[int]]) -> Dict[str, List[int]]:
-        """Rename generic client IDs to match node_<idx> identifiers."""
+    def _map_clients_to_node_ids(
+        partition: Dict[str, List[int]],
+        alias_map: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, List[int]]:
+        """Rename generic client IDs to match runtime node identifiers."""
         remapped: Dict[str, List[int]] = {}
         for client_id, indices in partition.items():
             parts = client_id.split("_")
             suffix = parts[-1] if parts else client_id
-            node_id = f"node_{suffix}"
+            canonical_id = f"node_{suffix}"
+            node_id = alias_map.get(canonical_id, canonical_id) if alias_map else canonical_id
             remapped[node_id] = indices
         return remapped
 

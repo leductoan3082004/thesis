@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class CommitRequest(BaseModel):
-    """Request model for data commit."""
+    """Request model for generic data commit."""
 
     payload: Dict[str, Any]
 
@@ -44,6 +44,36 @@ class CommitResponse(BaseModel):
 class DataResponse(BaseModel):
     """Response model for data retrieval."""
 
+    payload: Dict[str, Any]
+    submitted_at: str
+
+
+class ClusterModelRequest(BaseModel):
+    """Request body for committing cluster-level models."""
+
+    cluster_id: str
+    payload: Dict[str, Any]
+
+
+class ClusterModelResponse(BaseModel):
+    """Response body for retrieving cluster-level models."""
+
+    cluster_id: str
+    payload: Dict[str, Any]
+    submitted_at: str
+
+
+class StateModelRequest(BaseModel):
+    """Request body for committing state-level models."""
+
+    state_id: str
+    payload: Dict[str, Any]
+
+
+class StateModelResponse(BaseModel):
+    """Response body for retrieving state-level models."""
+
+    state_id: str
     payload: Dict[str, Any]
     submitted_at: str
 
@@ -211,6 +241,74 @@ async def commit_data(
     """Commit data payload to the blockchain."""
     data_id, submitted_at = store.commit(request.payload)
     return CommitResponse(data_id=data_id, submitted_at=submitted_at)
+
+
+def _get_typed_payload(data_id: str, expected_type: str) -> tuple[Dict[str, Any], str]:
+    record = store.get(data_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Data not found")
+    payload = record.get("payload", {})
+    if payload.get("type") != expected_type:
+        raise HTTPException(status_code=404, detail="Data not found")
+    return payload, record["submitted_at"]
+
+
+@app.post("/cluster/models", response_model=CommitResponse)
+async def commit_cluster_model(
+    request: ClusterModelRequest,
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> CommitResponse:
+    """Commit cluster-level model metadata."""
+    payload = {
+        "type": "cluster_model",
+        "cluster_id": request.cluster_id,
+        "payload": request.payload,
+    }
+    data_id, submitted_at = store.commit(payload)
+    return CommitResponse(data_id=data_id, submitted_at=submitted_at)
+
+
+@app.get("/cluster/models/{data_id}", response_model=ClusterModelResponse)
+async def get_cluster_model(
+    data_id: str,
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> ClusterModelResponse:
+    """Retrieve cluster-level model metadata."""
+    payload, submitted_at = _get_typed_payload(data_id, "cluster_model")
+    return ClusterModelResponse(
+        cluster_id=payload["cluster_id"],
+        payload=payload["payload"],
+        submitted_at=submitted_at,
+    )
+
+
+@app.post("/state/models", response_model=CommitResponse)
+async def commit_state_model(
+    request: StateModelRequest,
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> CommitResponse:
+    """Commit state-level model metadata."""
+    payload = {
+        "type": "state_model",
+        "state_id": request.state_id,
+        "payload": request.payload,
+    }
+    data_id, submitted_at = store.commit(payload)
+    return CommitResponse(data_id=data_id, submitted_at=submitted_at)
+
+
+@app.get("/state/models/{data_id}", response_model=StateModelResponse)
+async def get_state_model(
+    data_id: str,
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> StateModelResponse:
+    """Retrieve state-level model metadata."""
+    payload, submitted_at = _get_typed_payload(data_id, "state_model")
+    return StateModelResponse(
+        state_id=payload["state_id"],
+        payload=payload["payload"],
+        submitted_at=submitted_at,
+    )
 
 
 @app.get("/data/{data_id}", response_model=DataResponse)

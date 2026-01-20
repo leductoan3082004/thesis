@@ -1540,6 +1540,7 @@ def main() -> None:
         config = deepcopy(template_config)
         config["node_id"] = trainer_id
         config["trainer_id"] = trainer_id
+        config["network_host"] = container_name
         if state_id:
             config["state_id"] = state_id
         ipfs_service = _select_ipfs_service(idx, ipfs_services)
