@@ -15,7 +15,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
 
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
 from secure_aggregation.communication.aggregator_service import AggregatorServicer, serve as serve_aggregator
@@ -30,7 +29,7 @@ from secure_aggregation.convergence.central_checker import CentralChecker
 from secure_aggregation.config.models import NodeRole
 from secure_aggregation.config.system import load_system_config
 from secure_aggregation.crypto.sign import SigningKeyPair
-from secure_aggregation.data import dirichlet_partition
+from secure_aggregation.data import dirichlet_partition, get_labels, load_dataset
 from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
@@ -510,19 +509,20 @@ class NodeService:
         raise RuntimeError("Failed to connect to TTP after max retries")
 
     def setup_data(self) -> None:
-        """Setup MNIST dataset using indices assigned by TTP or local partition."""
-        logger.info("Setting up MNIST dataset")
-        tform = transforms.Compose([transforms.ToTensor()])
-        train_ds = datasets.MNIST(root="/app/data", train=True, download=False, transform=tform)
-        test_ds = datasets.MNIST(root="/app/data", train=False, download=False, transform=tform)
+        """Setup dataset using config-driven loader with indices assigned by TTP or local partition."""
+        dataset_name = self.dataset_config.get("name", "mnist")
+        datasets_config_path = self.dataset_config.get("config_path", "/app/config/datasets.json")
+        logger.info(f"Setting up dataset: {dataset_name}")
 
-        # Use TTP-assigned indices if available, otherwise compute locally
+        train_ds = load_dataset(dataset_name, datasets_config_path, train=True)
+        test_ds = load_dataset(dataset_name, datasets_config_path, train=False)
+
+        # Use TTP-assigned indices if available, otherwise compute locally.
         if self.assigned_data_indices:
             indices = self.assigned_data_indices
             logger.info(f"Using {len(indices)} TTP-assigned data samples")
         else:
-            # Fallback: compute partition locally
-            labels = {i: int(train_ds[i][1]) for i in range(len(train_ds))}
+            labels = get_labels(train_ds)
             node_index = self._extract_node_index()
             num_clients = self.dataset_config["num_clients"]
             num_clients = max(num_clients, node_index + 1)
