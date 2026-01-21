@@ -26,6 +26,7 @@ test = [
 mnist = [
   "torch>=2.2.0",
   "torchvision>=0.17.0",
+  "pandas>=2.0.0",
 ]
 
 [tool.pytest.ini_options]

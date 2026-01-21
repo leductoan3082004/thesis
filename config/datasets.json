@@ -1,0 +1,23 @@
+{
+  "mnist": {
+    "type": "torchvision",
+    "class": "MNIST",
+    "root": "/app/data",
+    "num_classes": 10,
+    "input_shape": [1, 28, 28]
+  },
+  "fashion_mnist": {
+    "type": "torchvision",
+    "class": "FashionMNIST",
+    "root": "/app/data",
+    "num_classes": 10,
+    "input_shape": [1, 28, 28]
+  },
+  "cifar10": {
+    "type": "torchvision",
+    "class": "CIFAR10",
+    "root": "/app/data",
+    "num_classes": 10,
+    "input_shape": [3, 32, 32]
+  }
+}
