@@ -10,7 +10,7 @@
   "state_aggregation": {
     "enabled": false,
     "approach": "ring_star",
-    "rounds_per_state": 0,
+    "cluster_rounds": 0,
     "state_id": "state_0",
     "collection_timeout_seconds": 20.0,
     "digest_timeout_seconds": 5.0,
@@ -19,7 +19,7 @@
   },
   "nation_aggregation": {
     "enabled": false,
-    "rounds_per_nation": 0,
+    "state_rounds": 0,
     "nation_id": "nation_0"
   }
 }

@@ -7,6 +7,7 @@
 - **Aggregator Service** ([aggregator_service.py](src/secure_aggregation/communication/aggregator_service.py)): Coordinates 4-round protocol
 - **Node Service** ([node_service.py](src/secure_aggregation/communication/node_service.py)): Full training + aggregation logic
 - **Protocol Definitions** ([secureagg.proto](protos/secureagg.proto)): gRPC message definitions
+- **Large Payload Budget**: Aggregator servers/clients raise `grpc.max_{send,receive}_message_length` to 200 MB (configurable via `GRPC_MAX_MESSAGE_MB`) so CIFAR-scale masked models transfer safely
 
 ### 2. Secure Aggregation Protocol (Bonawitz et al. CCS'17)
 **Round 0 - Advertise Keys:**

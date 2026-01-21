@@ -26,6 +26,37 @@ def load_mnist_labels(data_dir: str = "/app/data") -> dict[int, int]:
     return labels
 
 
+def load_node_alias_map(num_clients: int) -> dict[str, str]:
+    """
+    Load mapping from canonical node_X identifiers to runtime node IDs.
+
+    This mirrors the logic in the TTP service so that auxiliary artifacts
+    (like the topology file) use the same identifiers that nodes expect.
+    """
+    nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+    if not nodes_dir.exists():
+        logger.warning("NODE_CONFIG_DIR %s does not exist; topology will use canonical IDs", nodes_dir)
+        return {}
+    alias_map: dict[str, str] = {}
+    for idx in range(num_clients):
+        node_file = nodes_dir / f"node_{idx}.json"
+        if not node_file.exists():
+            continue
+        try:
+            data = json.loads(node_file.read_text())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to parse node config %s: %s", node_file, exc)
+            continue
+        alias = data.get("node_id") or data.get("trainer_id")
+        if alias:
+            alias_map[f"node_{idx}"] = str(alias)
+    if alias_map:
+        logger.info("Loaded %d node aliases for topology remapping", len(alias_map))
+    else:
+        logger.warning("No node aliases found; topology will use canonical node_X identifiers")
+    return alias_map
+
+
 def write_topology_file(
     labels: dict[int, int],
     num_clients: int,
@@ -57,11 +88,20 @@ def write_topology_file(
         seed=seed,
     )
 
+    alias_map = load_node_alias_map(num_clients)
+
+    def _remap(node_id: str) -> str:
+        return alias_map.get(node_id, node_id)
+
+    remapped_cliques = [sorted(_remap(node) for node in clique) for clique in cliques]
+    remapped_edges = [(_remap(a), _remap(b)) for a, b in inter_edges]
+    remapped_edge_counts = {_remap(node): count for node, count in edge_counts.items()}
+
     topology_data = {
-        "num_cliques": len(cliques),
-        "cliques": [sorted(list(c)) for c in cliques],
-        "inter_edges": [[e[0], e[1]] for e in inter_edges],
-        "edge_counts": edge_counts,
+        "num_cliques": len(remapped_cliques),
+        "cliques": remapped_cliques,
+        "inter_edges": [[a, b] for a, b in remapped_edges],
+        "edge_counts": remapped_edge_counts,
     }
 
     output_file = Path(output_path)

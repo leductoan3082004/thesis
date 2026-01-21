@@ -48,6 +48,7 @@ class StateAggregationConfig:
         for key in (
             "enabled",
             "rounds_per_state",
+            "cluster_rounds",
             "approach",
             "state_id",
             "collection_timeout_seconds",
@@ -62,8 +63,9 @@ class StateAggregationConfig:
                 kwargs[key] = StateAggregationApproach(str(value))
             elif key == "enabled":
                 kwargs[key] = bool(value)
-            elif key in ("rounds_per_state",):
-                kwargs[key] = max(0, int(value))
+            elif key in ("rounds_per_state", "cluster_rounds"):
+                # Accept both legacy and new field names.
+                kwargs["rounds_per_state"] = max(0, int(value))
             elif key.endswith("_seconds"):
                 kwargs[key] = max(0.0, float(value))
             else:
@@ -96,14 +98,15 @@ class NationAggregationConfig:
         if not data:
             return cls()
         kwargs: dict[str, Any] = {}
-        for key in ("enabled", "rounds_per_nation", "nation_id"):
+        for key in ("enabled", "rounds_per_nation", "state_rounds", "nation_id"):
             if key not in data:
                 continue
             value = data[key]
             if key == "enabled":
                 kwargs[key] = bool(value)
-            elif key == "rounds_per_nation":
-                kwargs[key] = max(0, int(value))
+            elif key in ("rounds_per_nation", "state_rounds"):
+                # Accept new schema naming.
+                kwargs["rounds_per_nation"] = max(0, int(value))
             else:
                 kwargs[key] = str(value)
         return cls(**kwargs)

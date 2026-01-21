@@ -12,7 +12,7 @@ A complete implementation of privacy-preserving federated learning using the sec
 - **Blockchain Integration**: Hyperledger Fabric for trainer identity and model registry
 - **Docker Deployment**: One-command launch of entire federated network
 - **Monitoring**: Prometheus metrics and Grafana dashboards
-- **gRPC Communication**: Efficient, type-safe distributed protocol
+- **gRPC Communication**: Efficient, type-safe distributed protocol with 200MB message budgets (override via `GRPC_MAX_MESSAGE_MB`) so large model updates flow without truncation
 - **MNIST Demonstration**: Complete end-to-end training example
 
 ## Prerequisites
@@ -350,6 +350,10 @@ If you see `ModuleNotFoundError: No module named 'secureagg_pb2'`:
 sed -i '' 's/^import secureagg_pb2/from . import secureagg_pb2/' \
     src/secure_aggregation/communication/secureagg_pb2_grpc.py
 ```
+
+### gRPC Message Size Configuration
+
+Aggregator RPC servers and clients now set `grpc.max_send_message_length` and `grpc.max_receive_message_length` to 200 MB so CIFAR-scale models fit inside SAP Round 2 payloads. Export `GRPC_MAX_MESSAGE_MB=<megabytes>` before starting services to customize this ceiling.
 
 ### Port Conflicts
 

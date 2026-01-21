@@ -8,7 +8,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import grpc
 import numpy as np
@@ -17,7 +17,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
-from secure_aggregation.communication.aggregator_service import AggregatorServicer, serve as serve_aggregator
+from secure_aggregation.communication.aggregator_service import (
+    AggregatorServicer,
+    grpc_message_options,
+    serve as serve_aggregator,
+)
 from secure_aggregation.communication.bridge_service import BridgeClient, serve_bridge
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
 from secure_aggregation.convergence import ConvergenceConfig, ConvergenceState, ConvergenceTracker
@@ -67,15 +71,49 @@ logger = get_logger("node_service")
 
 
 class MnistLinear(nn.Module):
-    """Simple linear classifier for MNIST."""
+    """Simple linear classifier for vectorized image inputs (e.g., MNIST)."""
 
-    def __init__(self) -> None:
+    def __init__(self, input_shape: Tuple[int, ...] = (1, 28, 28), num_classes: int = 10) -> None:
         super().__init__()
-        self.fc = nn.Linear(28 * 28, 10)
+        features = 1
+        for dim in input_shape:
+            features *= dim
+        self.fc = nn.Linear(features, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(x.size(0), -1)
         return self.fc(x)
+
+
+class CifarConvNet(nn.Module):
+    """Compact convolutional network for CIFAR-sized RGB images."""
+
+    def __init__(self, num_classes: int = 10) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(128 * 8 * 8, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
 
 
 def flatten_params(model: nn.Module) -> List[float]:
@@ -131,6 +169,9 @@ class NodeService:
             or self.node_id
         )
         self.dataset_config = self.config["dataset"]
+        self.dataset_name: str = self.dataset_config.get("name", "mnist")
+        self.dataset_input_shape: Optional[Tuple[int, ...]] = None
+        self.dataset_num_classes: Optional[int] = None
         self.training_config = self.config["training"]
         self.secagg_config = self.config["secure_agg"]
         self.threshold = self.secagg_config["threshold"]
@@ -187,6 +228,13 @@ class NodeService:
 
         # State-level aggregation (hierarchy) state
         self.state_config = self._load_state_config()
+        logger.info(
+            "State aggregation config: enabled=%s, rounds_per_state=%s, state_id=%s, approach=%s",
+            self.state_config.enabled,
+            self.state_config.rounds_per_state,
+            self.state_config.state_id,
+            self.state_config.approach.value if hasattr(self.state_config.approach, "value") else self.state_config.approach,
+        )
         self.nation_config = self._load_nation_config()
         self.state_candidates: List[str] = []
         self.is_state_candidate = False
@@ -197,8 +245,6 @@ class NodeService:
         self._state_round_hashes: Dict[int, str] = {}
         self._state_digest_records: Dict[int, Dict[str, StateDigest]] = {}
         self._state_committed_rounds: Set[int] = set()
-        self._state_round_to_cluster_round: Dict[int, int] = {}
-        self._pending_state_rounds: Set[int] = set()
         self._state_rounds_logged: Set[int] = set()
         self._last_applied_state_round: int = 0
         self._pending_nation_rounds: Set[int] = set()
@@ -218,7 +264,9 @@ class NodeService:
         self.central_metadata = None
         self.central_checker: Optional[CentralChecker] = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
-        self._bootstrap_anchors: List[Tuple[str, int, str, Optional[str], Optional[str]]] = []
+        self._bootstrap_anchors: List[
+            Tuple[str, int, str, Optional[str], Optional[str], AnchorScope]
+        ] = []
         self._logged_central_addresses = False
         self._clique_signal_addresses: Dict[str, str] = {}
         self._known_convergence_data_ids: Set[str] = set()
@@ -295,17 +343,7 @@ class NodeService:
         """Load state aggregation configuration and apply training defaults."""
         state_section = (self.system_config or {}).get("state_aggregation")
         config = StateAggregationConfig.from_mapping(state_section)
-        rounds_hint = None
-        training_rounds = self.training_config.get("state_round_interval") or self.training_config.get("rounds")
-        if training_rounds is not None:
-            try:
-                rounds_hint = int(training_rounds)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Invalid training state_round hint=%s; ignoring for state config",
-                    training_rounds,
-                )
-        config.apply_training_defaults(rounds_hint)
+        config.apply_training_defaults(None)
         return config
 
     def _load_nation_config(self) -> NationAggregationConfig:
@@ -437,8 +475,15 @@ class NodeService:
         """Persist bootstrap anchor references once blockchain client is ready."""
         if not self.blockchain or not self._bootstrap_anchors:
             return
-        for cluster_id, round_num, data_id, cid, hash_val in self._bootstrap_anchors:
-            self.blockchain.remember_anchor(cluster_id, round_num, data_id, cid, hash_val)
+        for cluster_id, round_num, data_id, cid, hash_val, scope in self._bootstrap_anchors:
+            self.blockchain.remember_anchor(
+                cluster_id,
+                round_num,
+                data_id,
+                cid,
+                hash_val,
+                scope=scope or AnchorScope.CLUSTER,
+            )
         self._bootstrap_anchors.clear()
 
     def register_with_ttp(self) -> None:
@@ -488,6 +533,7 @@ class NodeService:
                             metadata_data_id,
                             None,
                             None,
+                            AnchorScope.CONTROL,
                         )
                     )
                 else:
@@ -511,23 +557,29 @@ class NodeService:
     def setup_data(self) -> None:
         """Setup dataset using config-driven loader with indices assigned by TTP or local partition."""
         dataset_name = self.dataset_config.get("name", "mnist")
+        self.dataset_name = dataset_name
         datasets_config_path = self.dataset_config.get("config_path", "/app/config/datasets.json")
         logger.info(f"Setting up dataset: {dataset_name}")
 
         train_ds = load_dataset(dataset_name, datasets_config_path, train=True)
         test_ds = load_dataset(dataset_name, datasets_config_path, train=False)
+        self._capture_dataset_metadata(train_ds)
+
+        node_index = self._extract_node_index()
+        num_clients = self.dataset_config["num_clients"]
+        num_clients = max(num_clients, node_index + 1)
+        if self.participants:
+            num_clients = max(num_clients, len(self.participants))
 
         # Use TTP-assigned indices if available, otherwise compute locally.
+        dataset_size = len(train_ds)
+        indices_source = "TTP-assigned"
+
         if self.assigned_data_indices:
-            indices = self.assigned_data_indices
-            logger.info(f"Using {len(indices)} TTP-assigned data samples")
+            indices = self._sanitize_indices(self.assigned_data_indices, dataset_size)
+            logger.info(f"Using {len(indices)} {indices_source} data samples")
         else:
             labels = get_labels(train_ds)
-            node_index = self._extract_node_index()
-            num_clients = self.dataset_config["num_clients"]
-            num_clients = max(num_clients, node_index + 1)
-            if self.participants:
-                num_clients = max(num_clients, len(self.participants))
             alpha = self.dataset_config["alpha"]
             seed = self.dataset_config.get("seed", 42)
 
@@ -544,7 +596,19 @@ class NodeService:
                     node_index,
                 )
                 indices = self._deterministic_partition(len(train_ds), num_clients, node_index)
-            logger.info(f"Using {len(indices)} locally-computed data samples")
+            indices = self._sanitize_indices(indices, dataset_size)
+            indices_source = "locally-computed"
+            logger.info(f"Using {len(indices)} {indices_source} data samples")
+
+        if not indices:
+            fallback = self._deterministic_partition(dataset_size, num_clients, node_index)
+            logger.warning(
+                "No valid %s data indices for %s; falling back to deterministic partition of %d samples",
+                indices_source,
+                self.node_id,
+                len(fallback),
+            )
+            indices = fallback
 
         # Split indices into train (80%) and validation (20%) for metrics tracking
         import random
@@ -583,10 +647,81 @@ class NodeService:
             return [dataset_size - 1]
         return list(range(start, end))
 
+    @staticmethod
+    def _sanitize_indices(indices: Sequence[int], dataset_size: int) -> List[int]:
+        """Drop invalid/duplicate indices to avoid dataset bounds issues."""
+        valid: List[int] = []
+        seen: Set[int] = set()
+        dropped = 0
+        for idx in indices:
+            if not isinstance(idx, int) or idx < 0 or idx >= dataset_size:
+                dropped += 1
+                continue
+            if idx in seen:
+                continue
+            seen.add(idx)
+            valid.append(idx)
+        if dropped:
+            logger.warning(
+                "Dropped %d invalid data indices outside dataset bounds (size=%d)",
+                dropped,
+                dataset_size,
+            )
+        if not valid and dataset_size:
+            logger.error("No valid data indices remain after sanitization (dataset size=%d)", dataset_size)
+        return valid
+
+    def _capture_dataset_metadata(self, dataset: Any) -> None:
+        """Capture dataset shape/num_classes for downstream model selection."""
+        if self.dataset_input_shape is None:
+            try:
+                first_item = dataset[0]
+                sample = first_item[0] if isinstance(first_item, (tuple, list)) else first_item
+                if hasattr(sample, "shape"):
+                    shape = tuple(int(dim) for dim in sample.shape)  # type: ignore[attr-defined]
+                    self.dataset_input_shape = shape
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Unable to capture dataset input shape: %s", exc)
+
+        if self.dataset_num_classes is None:
+            num_classes: Optional[int] = None
+            if hasattr(dataset, "classes"):
+                classes = getattr(dataset, "classes")
+                if isinstance(classes, Sequence):
+                    num_classes = len(classes)
+            elif hasattr(dataset, "class_to_idx"):
+                mapping = getattr(dataset, "class_to_idx")
+                if isinstance(mapping, Mapping):
+                    num_classes = len(mapping)
+            elif hasattr(dataset, "targets"):
+                targets = getattr(dataset, "targets")
+                if isinstance(targets, Sequence) and targets:
+                    try:
+                        num_classes = len(set(int(t) for t in targets))
+                    except Exception:  # noqa: BLE001
+                        num_classes = None
+            if num_classes:
+                self.dataset_num_classes = num_classes
+
     def setup_model(self) -> None:
-        """Initialize model."""
-        self.model = MnistLinear()
-        logger.info("Model initialized")
+        """Initialize model matching dataset characteristics."""
+        dataset_name = (self.dataset_name or "mnist").lower()
+        num_classes = self.dataset_num_classes or 10
+        input_shape = self.dataset_input_shape or (1, 28, 28)
+
+        if dataset_name.startswith("cifar"):
+            self.model = CifarConvNet(num_classes=num_classes)
+            model_name = "CifarConvNet"
+        else:
+            self.model = MnistLinear(input_shape=input_shape, num_classes=num_classes)
+            model_name = "MnistLinear"
+
+        logger.info(
+            "Model initialized (%s, num_classes=%d, input_shape=%s)",
+            model_name,
+            num_classes,
+            input_shape,
+        )
 
     def train_local(self, epochs: int) -> Tuple[int, int]:
         """Train model locally for specified epochs.
@@ -1141,19 +1276,32 @@ class NodeService:
 
     def _maybe_start_state_round(self, round_idx: int) -> None:
         """Trigger state aggregation when the configured interval elapses."""
-        if not (self._state_layer_enabled() and self.is_state_candidate):
+        if not self._state_layer_enabled():
+            logger.debug("Skipping state round scheduling: state layer disabled")
+            return
+        if not self.is_state_candidate:
+            logger.debug("Skipping state round scheduling: node %s is not a state candidate", self.node_id)
             return
         interval = self.state_config.rounds_per_state
-        if interval > 0 and (round_idx + 1) % interval == 0:
-            state_round = (round_idx + 1) // interval
-            if state_round not in self._state_round_to_cluster_round:
-                self._state_round_to_cluster_round[state_round] = round_idx
-                self._pending_state_rounds.add(state_round)
-        for state_round in sorted(self._pending_state_rounds):
-            cluster_round = self._state_round_to_cluster_round.get(state_round, round_idx)
-            if self._execute_state_round(state_round, cluster_round):
-                self._pending_state_rounds.discard(state_round)
-                self._maybe_start_nation_round(state_round)
+        if interval <= 0:
+            return
+        due = (round_idx + 1) % interval == 0
+        logger.debug(
+            "State round scheduler invoked for cluster round %d (interval=%d, due=%s)",
+            round_idx + 1,
+            interval,
+            due,
+        )
+        if not due:
+            return
+        state_round = (round_idx + 1) // interval
+        logger.info(
+            "Launching state round %d after cluster round %d",
+            state_round,
+            round_idx + 1,
+        )
+        if self._execute_state_round(state_round, round_idx):
+            self._maybe_start_nation_round(state_round)
 
     def _execute_state_round(self, state_round: int, cluster_round: int) -> bool:
         """Collect ECMs, merge models, and broadcast digest for a state round."""
@@ -1211,7 +1359,6 @@ class NodeService:
         model_hash = compute_model_hash(merged_model)
         self._state_round_cache[state_round] = merged_model
         self._state_round_hashes[state_round] = model_hash
-        self._state_round_to_cluster_round[state_round] = cluster_round
         self._broadcast_state_digest(state_round, cluster_round, model_hash)
         self._record_local_state_digest(state_round, cluster_round, model_hash)
         return True
@@ -1386,8 +1533,6 @@ class NodeService:
         self._state_digest_records.pop(state_round, None)
         self._state_round_cache.pop(state_round, None)
         self._state_round_hashes.pop(state_round, None)
-        self._pending_state_rounds.discard(state_round)
-        self._state_round_to_cluster_round.pop(state_round, None)
 
     def _maybe_start_nation_round(self, completed_state_round: int) -> None:
         """Schedule a nation-level round after enough state rounds have finished."""
@@ -1524,7 +1669,7 @@ class NodeService:
         agg_addr = f"{agg_host}:{agg_port}"
 
         try:
-            channel = grpc.insecure_channel(agg_addr)
+            channel = self._create_aggregator_channel(agg_addr)
             stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
             ecm_messages = [
@@ -1616,6 +1761,10 @@ class NodeService:
             fatal=False,
         )
 
+    def _create_aggregator_channel(self, address: str) -> grpc.Channel:
+        """Create an aggregator gRPC channel with increased message limits."""
+        return grpc.insecure_channel(address, options=grpc_message_options())
+
     def run_secure_aggregation_round(self) -> List[float]:
         """Run one round of secure aggregation protocol."""
         self._abort_if_global_stop()
@@ -1632,7 +1781,7 @@ class NodeService:
         agg_host = self.aggregator_address.split(":")[0]
         agg_addr = f"{agg_host}:{agg_port}"
 
-        channel = grpc.insecure_channel(agg_addr)
+        channel = self._create_aggregator_channel(agg_addr)
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
         # SAP Round 0: Advertise keys
@@ -1925,7 +2074,7 @@ class NodeService:
             self.prom_metrics.set_round(round_idx)
 
             logger.info(f"\n{'='*60}")
-            logger.info(f"Round {round_idx + 1}/{max_rounds}")
+            logger.info(f"Cluster Round {round_idx + 1}/{max_rounds}")
             logger.info(f"{'='*60}")
             should_stop, stop_reason = self._refresh_convergence_state(should_stop, stop_reason)
             if should_stop:
@@ -2219,7 +2368,9 @@ class NodeService:
             self.prom_metrics.add_messages_sent(comm_stats["messages_sent"])
             self.prom_metrics.add_messages_received(comm_stats["messages_received"])
 
-            logger.info(f"Training Round {round_idx + 1} complete. Waiting before next round...")
+            logger.info(
+                f"Training Cluster Round {round_idx + 1} complete. Waiting before next round..."
+            )
             time.sleep(5)
             self.current_round += 1
 
@@ -2246,7 +2397,7 @@ class NodeService:
             agg_host = self.aggregator_address.split(":")[0]
             agg_addr = f"{agg_host}:{agg_port}"
 
-            channel = grpc.insecure_channel(agg_addr)
+            channel = self._create_aggregator_channel(agg_addr)
             stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
             delay = 2
@@ -2500,7 +2651,7 @@ class NodeService:
             )
             return
         agg_addr = f"{host}:{agg_port}"
-        channel = grpc.insecure_channel(agg_addr)
+        channel = self._create_aggregator_channel(agg_addr)
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
         try:
             stub.NotifyConvergenceSignal(

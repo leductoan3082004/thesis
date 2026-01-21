@@ -1,6 +1,7 @@
 """Aggregator service that coordinates secure aggregation protocol."""
 
 import logging
+import os
 from concurrent import futures
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -22,6 +23,22 @@ from secure_aggregation.node import ECM, ECMBuffer
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("aggregator_service")
+
+DEFAULT_GRPC_MAX_MESSAGE_MB = 200
+_grpc_max_env = os.environ.get("GRPC_MAX_MESSAGE_MB")
+try:
+    _grpc_max_mb = int(_grpc_max_env) if _grpc_max_env else DEFAULT_GRPC_MAX_MESSAGE_MB
+except ValueError:
+    _grpc_max_mb = DEFAULT_GRPC_MAX_MESSAGE_MB
+GRPC_MAX_MESSAGE_LENGTH_BYTES = max(1, _grpc_max_mb) * 1024 * 1024
+
+
+def grpc_message_options(max_length: int = GRPC_MAX_MESSAGE_LENGTH_BYTES) -> List[Tuple[str, int]]:
+    """Return gRPC channel/server options enforcing a higher message size limit."""
+    return [
+        ("grpc.max_send_message_length", max_length),
+        ("grpc.max_receive_message_length", max_length),
+    ]
 
 
 def _decode_round1_ciphertexts(requests: Sequence[secureagg_pb2.Round1Ciphertext]) -> List[Round1CiphertextModel]:
@@ -438,7 +455,10 @@ def serve(
         ecm_buffer=ecm_buffer,
         convergence_signal_handler=convergence_signal_handler,
     )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=grpc_message_options(),
+    )
     secureagg_pb2_grpc.add_AggregatorServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")
     server.start()
