@@ -12,7 +12,7 @@
     "approach": "ring_star",
     "cluster_rounds": 0,
     "state_id": "state_0",
-    "collection_timeout_seconds": 20.0,
+    "collection_timeout_seconds": 30.0,
     "digest_timeout_seconds": 5.0,
     "consensus_timeout_seconds": 30.0,
     "commit_timeout_seconds": 10.0

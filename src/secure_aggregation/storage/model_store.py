@@ -111,6 +111,7 @@ class BlockchainInterface(ABC):
         round_num: int,
         *,
         scope: AnchorScope = AnchorScope.CLUSTER,
+        suppress_not_found_log: bool = False,
     ) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash) for cluster/round."""
         pass
@@ -320,6 +321,7 @@ class MockBlockchain(BlockchainInterface):
         round_num: int,
         *,
         scope: AnchorScope = AnchorScope.CLUSTER,
+        suppress_not_found_log: bool = False,
     ) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash)."""
         with self._registry_lock:
@@ -335,6 +337,10 @@ class MockBlockchain(BlockchainInterface):
                     f"{BLOCKCHAIN_LOG_TAG} MockBlockchain get_anchor cluster={cluster_id}, round={round_num}, cid={anchor.cid[:16]}..."
                 )
                 return (anchor.cid, anchor.hash)
+            if not suppress_not_found_log:
+                logger.warning(
+                    f"{BLOCKCHAIN_LOG_TAG} MockBlockchain missing anchor cluster={cluster_id}, round={round_num}"
+                )
             return None
 
     def get_latest_anchor(
@@ -1077,17 +1083,19 @@ class GatewayBlockchain(BlockchainInterface):
         round_num: int,
         *,
         scope: AnchorScope = AnchorScope.CLUSTER,
+        suppress_not_found_log: bool = False,
     ) -> Optional[Tuple[str, str]]:
         anchor = self._resolve_entry(cluster_id, round_num, scope)
         if anchor is None:
-            if scope == AnchorScope.CONTROL or self._is_control_cluster(cluster_id):
-                logger.debug(
-                    f"{BLOCKCHAIN_LOG_TAG} No anchor found for control cluster={cluster_id}, round={round_num}"
-                )
-            else:
-                logger.warning(
-                    f"{BLOCKCHAIN_LOG_TAG} No anchor found for cluster={cluster_id}, round={round_num}"
-                )
+            if not suppress_not_found_log:
+                if scope == AnchorScope.CONTROL or self._is_control_cluster(cluster_id):
+                    logger.debug(
+                        f"{BLOCKCHAIN_LOG_TAG} No anchor found for control cluster={cluster_id}, round={round_num}"
+                    )
+                else:
+                    logger.warning(
+                        f"{BLOCKCHAIN_LOG_TAG} No anchor found for cluster={cluster_id}, round={round_num}"
+                    )
             return None
         logger.info(
             f"{BLOCKCHAIN_LOG_TAG} Resolved anchor for cluster={cluster_id}, round={round_num}, cid={anchor.cid[:16]}..."

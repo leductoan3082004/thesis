@@ -260,6 +260,7 @@ class NodeService:
         self._latest_delta_norm: float = 0.0
         self._latest_convergence_streak: int = 0
         self._last_model_cid: Optional[str] = None
+        self._last_model_hash: Optional[str] = None
         self._last_model_data_id: Optional[str] = None
         self.central_metadata = None
         self.central_checker: Optional[CentralChecker] = None
@@ -1122,7 +1123,21 @@ class NodeService:
             return
         for node_id in self.central_metadata.central_nodes:
             base_address = self.participant_map.get(node_id)
+            attempts = 0
+            while not base_address and attempts < 5:
+                logger.info(
+                    "Central neighbor %s not registered in map yet; refreshing participant map",
+                    node_id,
+                )
+                time.sleep(1)
+                self.register_with_ttp()
+                base_address = self.participant_map.get(node_id)
+                attempts += 1
             if not base_address:
+                logger.warning(
+                    "Could not resolve address for central node %s; excluding from state routing",
+                    node_id,
+                )
                 continue
             try:
                 host, port_str = base_address.split(":")
@@ -1264,6 +1279,7 @@ class NodeService:
                 return
             load_params(self.model, state_model.flatten().tolist())
             self._last_model_cid = cid
+            self._last_model_hash = expected_hash
             self._last_model_data_id = None
             self._last_applied_state_round = target_round
             logger.info(
@@ -1278,9 +1294,6 @@ class NodeService:
         """Trigger state aggregation when the configured interval elapses."""
         if not self._state_layer_enabled():
             logger.debug("Skipping state round scheduling: state layer disabled")
-            return
-        if not self.is_state_candidate:
-            logger.debug("Skipping state round scheduling: node %s is not a state candidate", self.node_id)
             return
         interval = self.state_config.rounds_per_state
         if interval <= 0:
@@ -1300,18 +1313,13 @@ class NodeService:
             state_round,
             round_idx + 1,
         )
-        if self._execute_state_round(state_round, round_idx):
+        self._dispatch_state_ecm_to_central(state_round, round_idx)
+        if self._execute_state_round(state_round, round_idx) and self.is_state_candidate:
             self._maybe_start_nation_round(state_round)
 
     def _execute_state_round(self, state_round: int, cluster_round: int) -> bool:
         """Collect ECMs, merge models, and broadcast digest for a state round."""
-        if (
-            not self._state_layer_enabled()
-            or not self.is_state_candidate
-            or not self.state_aggregator
-            or not self.state_ecm_buffer
-            or not self.central_metadata
-        ):
+        if not self._state_layer_enabled():
             return False
         if state_round not in self._state_rounds_logged:
             total_state_rounds = self._state_round_budget()
@@ -1323,6 +1331,13 @@ class NodeService:
                 cluster_round + 1,
             )
             self._state_rounds_logged.add(state_round)
+        can_aggregate = (
+            self.state_aggregator is not None
+            and self.state_ecm_buffer is not None
+            and self.central_metadata is not None
+        )
+        if not can_aggregate:
+            return self._wait_for_state_anchor_observer(state_round)
         if state_round in self._state_round_cache:
             return True
         deadline = time.time() + max(1.0, float(self.state_config.collection_timeout_seconds))
@@ -1363,6 +1378,94 @@ class NodeService:
         self._record_local_state_digest(state_round, cluster_round, model_hash)
         return True
 
+    def _dispatch_state_ecm_to_central(self, state_round: int, cluster_round: int) -> None:
+        """Have bridge nodes forward their latest ECM to state aggregators when a round starts."""
+        if not self._state_layer_enabled():
+            return
+        target_addresses: Dict[str, str] = {}
+        if not self.central_neighbor_addresses:
+            logger.debug("No central neighbor addresses available for state ECM dispatch")
+        else:
+            target_addresses.update(self.central_neighbor_addresses)
+        if not target_addresses and self.participant_map:
+            for node_id in self.central_metadata.central_nodes if self.central_metadata else []:
+                addr = self.participant_map.get(node_id)
+                if not addr:
+                    continue
+                try:
+                    host, port_str = addr.split(":")
+                    target_addresses[node_id] = f"{host}:{int(port_str) + 2000}"
+                except ValueError:
+                    continue
+        if not target_addresses:
+            logger.warning("State ECM dispatch skipped for round %d: no central targets resolved", state_round)
+            return
+        target_list = ", ".join(f"{node}@{addr}" for node, addr in sorted(target_addresses.items()))
+        logger.info("State ECM dispatch targets for round %d: %s", state_round, target_list)
+        if not self._last_model_cid or not self._last_model_hash:
+            logger.info(
+                "Skipping state ECM dispatch for round %d: missing latest model reference (cid=%s, hash=%s)",
+                state_round,
+                self._last_model_cid or "N/A",
+                self._last_model_hash or "N/A",
+            )
+            return
+        targets = [
+            addr
+            for node_id, addr in target_addresses.items()
+            if node_id != self.node_id
+        ]
+        if not targets:
+            return
+        if not self._ensure_bridge_client(allow_state_layer=True):
+            logger.warning(
+                "Cannot dispatch state ECM for round %d: bridge client unavailable",
+                state_round,
+            )
+            return
+        accepted = self.bridge_client.broadcast_ecm_with_convergence(
+            targets,
+            f"cluster_{self.clique_id}",
+            cluster_round,
+            self._last_model_cid,
+            self._last_model_hash,
+            True,
+            0.0,
+        )
+        logger.info(
+            "Dispatched state ECM for state round %d to %d/%d candidates",
+            state_round,
+            accepted,
+            len(targets),
+        )
+
+    def _wait_for_state_anchor_observer(self, state_round: int) -> bool:
+        """Wait for another node to commit the state round before continuing."""
+        timeout = (
+            float(self.state_config.collection_timeout_seconds)
+            + float(self.state_config.consensus_timeout_seconds)
+            + float(self.state_config.commit_timeout_seconds)
+        )
+        logger.info(
+            "Waiting up to %.0fs for state round %d anchor to appear",
+            timeout,
+            state_round,
+        )
+        anchor = self._wait_for_state_anchor(state_round, timeout)
+        if anchor:
+            logger.info(
+                "Observed state round %d anchor committed elsewhere (cid=%s...)",
+                state_round,
+                anchor[0][:8],
+            )
+            return True
+        logger.warning(
+            "State round %d anchor not observed after waiting %.0fs; continuing cluster training",
+            state_round,
+            timeout,
+        )
+        return False
+
     def _lookup_cluster_anchor(self, cluster_id: str, round_idx: int) -> Optional[Tuple[str, str]]:
         if not self.blockchain:
             return None
@@ -1379,11 +1482,13 @@ class NodeService:
 
     def _broadcast_state_digest(self, state_round: int, cluster_round: int, model_hash: str) -> None:
         """Share this node's state digest with other central candidates."""
-        if (
-            not self.bridge_client
-            or not self.central_neighbor_addresses
-            or not self._state_layer_enabled()
-        ):
+        if not self._state_layer_enabled() or not self.central_neighbor_addresses:
+            return
+        if not self._ensure_bridge_client(allow_state_layer=True):
+            logger.warning(
+                "Cannot broadcast state digest for round %d: bridge client unavailable",
+                state_round,
+            )
             return
         payload = json.dumps(
             {
@@ -1518,11 +1623,31 @@ class NodeService:
         logger.warning("State round %d not anchored after iterating all candidates", state_round)
 
     def _wait_for_state_anchor(self, state_round: int, timeout: float) -> Optional[Tuple[str, str]]:
-        if not self.state_aggregator:
+        if self.state_aggregator is None and (self.blockchain is None or not self.state_config.state_id):
             return None
         deadline = time.time() + max(0.0, timeout)
         while time.time() < deadline:
-            anchor = self.state_aggregator.get_anchor(state_round)
+            anchor: Optional[Tuple[str, str]] = None
+            try:
+                if self.state_aggregator is not None:
+                    anchor = self.state_aggregator.get_anchor(
+                        state_round,
+                        suppress_not_found_log=True,
+                    )
+                elif self.blockchain is not None and self.state_config.state_id:
+                    anchor = self.blockchain.get_anchor(
+                        self.state_config.state_id,
+                        state_round,
+                        scope=AnchorScope.STATE,
+                        suppress_not_found_log=True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to poll state anchor round %d: %s",
+                    state_round,
+                    exc,
+                )
+                return None
             if anchor:
                 return anchor
             time.sleep(1.0)
@@ -1735,31 +1860,45 @@ class NodeService:
             int(self.ecm_forward_wait),
         )
 
-    def _ensure_bridge_client(self) -> bool:
-        """Ensure bridge infrastructure is running; restart if necessary."""
-        if not self.is_bridge_node or not self.inter_cluster_enabled:
-            return False
+    def _ensure_bridge_client(self, allow_state_layer: bool = False) -> bool:
+        """
+        Ensure bridge infrastructure is running; restart if necessary.
+
+        Args:
+            allow_state_layer: When True, permit a lightweight client to be created
+                for state-level dispatch even if this node is not configured as a bridge.
+        """
         if self.bridge_client:
             return True
-        if not self.inter_edges:
+        state_layer_requested = allow_state_layer and self._state_layer_enabled()
+        if self.is_bridge_node and self.inter_cluster_enabled:
+            if not self.inter_edges:
+                logger.warning(
+                    "Bridge client unavailable for %s and no inter_edges configured",
+                    self.node_id,
+                )
+                return False
             logger.warning(
-                "Bridge client unavailable for %s and no inter_edges configured",
+                "Bridge client missing for %s; restarting bridge server on port %d",
+                self.node_id,
+                self.port + 2000,
+            )
+            # Tear down any existing server before reconfiguring.
+            self.stop_bridge_server()
+            return self._init_bridge_with_retries(
+                self.inter_edges,
+                max_attempts=3,
+                delay=1.0,
+                fatal=False,
+            )
+        if state_layer_requested:
+            logger.debug(
+                "State layer requested bridge client for %s; creating lightweight client",
                 self.node_id,
             )
-            return False
-        logger.warning(
-            "Bridge client missing for %s; restarting bridge server on port %d",
-            self.node_id,
-            self.port + 2000,
-        )
-        # Tear down any existing server before reconfiguring.
-        self.stop_bridge_server()
-        return self._init_bridge_with_retries(
-            self.inter_edges,
-            max_attempts=3,
-            delay=1.0,
-            fatal=False,
-        )
+            self.bridge_client = BridgeClient(self.node_id)
+            return True
+        return False
 
     def _create_aggregator_channel(self, address: str) -> grpc.Channel:
         """Create an aggregator gRPC channel with increased message limits."""
@@ -2238,6 +2377,7 @@ class NodeService:
                             stop_reason = conv_state.stop_reason
 
                     self._last_model_cid = final_cid
+                    self._last_model_hash = final_hash
                     self._last_model_data_id = final_data_id
 
                 if not self.is_aggregator:
@@ -2263,6 +2403,7 @@ class NodeService:
                     response_hash = model_response.model_hash or ""
                     response_data_id = getattr(model_response, "model_data_id", "") or ""
                     self._last_model_cid = response_cid or None
+                    self._last_model_hash = response_hash or None
                     self._last_model_data_id = response_data_id or None
 
                     quantized_final = [int(w) for w in model_response.model_weights]
@@ -2455,6 +2596,9 @@ class NodeService:
             return
 
         cluster_id = f"cluster_{self.clique_id}"
+        if not self.neighbor_bridge_addresses:
+            logger.debug("No neighbor bridges available for ECM gossip")
+            return
         accepted = self.bridge_client.broadcast_ecm_with_convergence(
             self.neighbor_bridge_addresses,
             cluster_id,

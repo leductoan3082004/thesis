@@ -231,8 +231,18 @@ class StateAggregator:
                 logger.error("Failed to anchor state model round=%s: %s", state_round, exc)
         return cid, hash_val, data_id
 
-    def get_anchor(self, state_round: int) -> Optional[Tuple[str, str]]:
+    def get_anchor(
+        self,
+        state_round: int,
+        *,
+        suppress_not_found_log: bool = False,
+    ) -> Optional[Tuple[str, str]]:
         """Fetch the anchored state model reference if available."""
         if self.blockchain is None:
             return None
-        return self.blockchain.get_anchor(self.config.state_id, state_round, scope=AnchorScope.STATE)
+        return self.blockchain.get_anchor(
+            self.config.state_id,
+            state_round,
+            scope=AnchorScope.STATE,
+            suppress_not_found_log=suppress_not_found_log,
+        )

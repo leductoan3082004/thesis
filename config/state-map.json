@@ -2,13 +2,8 @@
   "states": [
     {
       "state_id": "state_alpha",
-      "count": 6,
-      "nodes": ["trainer-node-001", "trainer-node-002", "trainer-node-003", "trainer-node-004", "trainer-node-005", "trainer-node-006"]
-    },
-    {
-      "state_id": "state_beta",
-      "count": 6,
-      "nodes": ["trainer-node-007", "trainer-node-008", "trainer-node-009", "trainer-node-010", "trainer-node-011", "trainer-node-012"]
+      "count": 12,
+      "nodes": ["trainer-node-001", "trainer-node-002", "trainer-node-003", "trainer-node-004", "trainer-node-005", "trainer-node-006", "trainer-node-007", "trainer-node-008", "trainer-node-009", "trainer-node-010", "trainer-node-011", "trainer-node-012"]
     }
   ]
 }
