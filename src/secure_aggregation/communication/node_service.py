@@ -7,8 +7,9 @@ import math
 import os
 import re
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import grpc
 import numpy as np
@@ -240,6 +241,7 @@ class NodeService:
         self.is_state_candidate = False
         self.state_ecm_buffer: Optional[ECMBuffer] = None
         self.state_aggregator: Optional[StateAggregator] = None
+        self._state_round_queue: Deque[Tuple[int, int]] = deque()
         self._bridge_ecm_hooks: List[Callable[[ECM], None]] = []
         self._state_round_cache: Dict[int, np.ndarray] = {}
         self._state_round_hashes: Dict[int, str] = {}
@@ -1308,14 +1310,34 @@ class NodeService:
         if not due:
             return
         state_round = (round_idx + 1) // interval
+        if any(sr == state_round for sr, _ in self._state_round_queue):
+            logger.debug("State round %d already scheduled; skipping duplicate", state_round)
+            return
         logger.info(
-            "Launching state round %d after cluster round %d",
+            "Scheduling state round %d to run after completion of cluster round %d",
             state_round,
             round_idx + 1,
         )
-        self._dispatch_state_ecm_to_central(state_round, round_idx)
-        if self._execute_state_round(state_round, round_idx) and self.is_state_candidate:
+        self._state_round_queue.append((state_round, round_idx))
+
+    def _run_next_state_round(self) -> Optional[int]:
+        """Execute the next scheduled state round if available."""
+        if not self._state_layer_enabled():
+            self._state_round_queue.clear()
+            return None
+        if not self._state_round_queue:
+            return None
+        state_round, cluster_round = self._state_round_queue.popleft()
+        total_state_rounds = self._state_round_budget()
+        label = f"State Round {state_round}/{total_state_rounds or '?'}"
+        logger.info("\n" + "=" * 60)
+        logger.info("%s (triggered after cluster round %d)", label, cluster_round + 1)
+        logger.info("=" * 60)
+        self._dispatch_state_ecm_to_central(state_round, cluster_round)
+        completed = self._execute_state_round(state_round, cluster_round)
+        if completed and self.is_state_candidate:
             self._maybe_start_nation_round(state_round)
+        return cluster_round
 
     def _execute_state_round(self, state_round: int, cluster_round: int) -> bool:
         """Collect ECMs, merge models, and broadcast digest for a state round."""
@@ -1324,12 +1346,6 @@ class NodeService:
         if state_round not in self._state_rounds_logged:
             total_state_rounds = self._state_round_budget()
             label = f"/{total_state_rounds}" if total_state_rounds else ""
-            logger.info(
-                "\n----- STATE ROUND %d%s (triggered after cluster round %d) -----",
-                state_round,
-                label,
-                cluster_round + 1,
-            )
             self._state_rounds_logged.add(state_round)
         can_aggregate = (
             self.state_aggregator is not None
@@ -1566,6 +1582,13 @@ class NodeService:
                 ", ".join(sorted(hashes)),
             )
             return
+        agreed_hash = next(iter(hashes))
+        logger.info(
+            "State round %d digest consensus reached across %d candidates (hash=%s...)",
+            state_round,
+            len(records),
+            agreed_hash[:8],
+        )
         self._try_state_commit(state_round)
 
     def _try_state_commit(self, state_round: int) -> None:
@@ -2207,6 +2230,10 @@ class NodeService:
         stop_reason = ""
 
         while self.current_round < max_rounds and not should_stop:
+            state_parent_round = self._run_next_state_round()
+            if state_parent_round is not None:
+                self._maybe_apply_state_model(state_parent_round)
+                continue
             round_idx = self.current_round
             round_start_time = time.monotonic()
             self.comm_tracker.set_round(round_idx)
@@ -2495,9 +2522,6 @@ class NodeService:
                 self._check_cached_convergence_data()
                 break
 
-            self._maybe_start_state_round(round_idx)
-            self._maybe_apply_state_model(round_idx)
-
             # Record round total time
             round_total_time = time.monotonic() - round_start_time
             self.prom_metrics.observe_round_total(round_total_time)
@@ -2509,13 +2533,20 @@ class NodeService:
             self.prom_metrics.add_messages_sent(comm_stats["messages_sent"])
             self.prom_metrics.add_messages_received(comm_stats["messages_received"])
 
-            logger.info(
-                f"Training Cluster Round {round_idx + 1} complete. Waiting before next round..."
-            )
+            logger.info(f"Training Cluster Round {round_idx + 1} complete.")
+            logger.info("Waiting before next cluster round...")
+
+            self._maybe_start_state_round(round_idx)
+
             time.sleep(5)
             self.current_round += 1
 
         self._log_final_model_status()
+        while True:
+            state_parent_round = self._run_next_state_round()
+            if state_parent_round is None:
+                break
+            self._maybe_apply_state_model(state_parent_round)
         logger.info("\n" + "="*60)
         logger.info(f"Training completed after {self.current_round + 1} rounds (reason: {stop_reason or 'max_rounds'})")
         logger.info("="*60)

@@ -3,18 +3,18 @@
   "cliques": [
     [
       "node_11",
-      "node_2",
-      "node_9"
-    ],
-    [
-      "node_1",
       "node_3",
       "node_7"
     ],
     [
+      "node_2",
       "node_4",
-      "node_5",
-      "node_8"
+      "node_5"
+    ],
+    [
+      "node_1",
+      "node_8",
+      "node_9"
     ],
     [
       "node_0",
@@ -25,51 +25,51 @@
   "inter_edges": [
     [
       "node_11",
-      "node_1"
+      "node_2"
     ],
     [
-      "node_2",
-      "node_4"
+      "node_3",
+      "node_1"
     ],
     [
       "node_11",
       "node_0"
     ],
     [
-      "node_3",
-      "node_5"
+      "node_4",
+      "node_8"
     ],
     [
-      "node_7",
+      "node_5",
       "node_10"
     ],
     [
-      "node_8",
+      "node_9",
       "node_6"
     ],
     [
-      "node_2",
-      "node_1"
+      "node_3",
+      "node_2"
     ],
     [
       "node_11",
-      "node_4"
+      "node_1"
     ],
     [
-      "node_2",
+      "node_3",
       "node_0"
     ]
   ],
   "edge_counts": {
+    "node_7": 2,
     "node_11": 5,
-    "node_2": 5,
-    "node_9": 2,
-    "node_3": 3,
-    "node_7": 3,
-    "node_1": 4,
+    "node_3": 5,
+    "node_2": 4,
     "node_5": 3,
-    "node_4": 4,
+    "node_4": 3,
+    "node_9": 3,
     "node_8": 3,
+    "node_1": 4,
     "node_10": 3,
     "node_0": 4,
     "node_6": 3
