@@ -6,7 +6,10 @@ from secure_aggregation.topology import (
     build_d_cliques,
     build_full_topology,
     build_interclique_edges,
+    compute_average_degree,
     compute_label_distribution,
+    compute_max_degree,
+    compute_node_degrees,
     compute_skew,
     metropolis_hastings_weights,
 )
@@ -149,3 +152,82 @@ def test_build_full_topology_edges_connect_correct_nodes() -> None:
 
     for n1, n2 in inter_edges:
         assert node_to_clique[n1] != node_to_clique[n2], "Inter-edge connects same clique"
+
+
+def test_compute_node_degrees_simple_topology() -> None:
+    cliques = [{"n0", "n1", "n2"}, {"n3", "n4", "n5"}]
+    inter_edges = [("n0", "n3"), ("n1", "n4")]
+
+    degrees = compute_node_degrees(cliques, inter_edges)
+
+    assert degrees["n0"] == 3
+    assert degrees["n1"] == 3
+    assert degrees["n2"] == 2
+    assert degrees["n3"] == 3
+    assert degrees["n4"] == 3
+    assert degrees["n5"] == 2
+
+
+def test_compute_node_degrees_no_inter_edges() -> None:
+    cliques = [{"n0", "n1", "n2"}, {"n3", "n4"}]
+    inter_edges = []
+
+    degrees = compute_node_degrees(cliques, inter_edges)
+
+    assert degrees["n0"] == 2
+    assert degrees["n1"] == 2
+    assert degrees["n2"] == 2
+    assert degrees["n3"] == 1
+    assert degrees["n4"] == 1
+
+
+def test_compute_max_degree() -> None:
+    cliques = [{"n0", "n1", "n2"}, {"n3", "n4", "n5"}]
+    inter_edges = [("n0", "n3"), ("n0", "n4"), ("n1", "n3")]
+
+    max_degree = compute_max_degree(cliques, inter_edges)
+
+    assert max_degree == 4
+
+
+def test_compute_max_degree_single_clique() -> None:
+    cliques = [{"n0", "n1", "n2", "n3"}]
+    inter_edges = []
+
+    max_degree = compute_max_degree(cliques, inter_edges)
+
+    assert max_degree == 3
+
+
+def test_compute_average_degree() -> None:
+    cliques = [{"n0", "n1", "n2"}, {"n3", "n4", "n5"}]
+    inter_edges = [("n0", "n3")]
+
+    avg_degree = compute_average_degree(cliques, inter_edges)
+
+    assert abs(avg_degree - 2.333) < 0.01
+
+
+def test_compute_average_degree_fully_connected_cliques() -> None:
+    cliques = [{"n0", "n1"}, {"n2", "n3"}]
+    inter_edges = [("n0", "n2"), ("n0", "n3"), ("n1", "n2"), ("n1", "n3")]
+
+    avg_degree = compute_average_degree(cliques, inter_edges)
+
+    assert avg_degree == 3.0
+
+
+def test_degree_calculation_with_real_topology() -> None:
+    node_labels = {f"n{i}": {"A": 0.5, "B": 0.5} for i in range(12)}
+    cliques, _, inter_edges, _ = build_full_topology(
+        node_labels, clique_size=3, iterations=10, edge_mode="ring", seed=42
+    )
+
+    degrees = compute_node_degrees(cliques, inter_edges)
+    max_degree = compute_max_degree(cliques, inter_edges)
+    avg_degree = compute_average_degree(cliques, inter_edges)
+
+    assert len(degrees) == 12
+    assert max_degree >= 2
+    assert 2.0 <= avg_degree <= 11.0
+    assert max_degree == max(degrees.values())

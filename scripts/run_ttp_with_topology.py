@@ -62,6 +62,7 @@ def write_topology_file(
         "cliques": [sorted(list(c)) for c in cliques],
         "inter_edges": [[e[0], e[1]] for e in inter_edges],
         "edge_counts": edge_counts,
+        "topology_type": "d_cliques",
     }
 
     output_file = Path(output_path)
