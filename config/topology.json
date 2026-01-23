@@ -89,5 +89,6 @@
     "node_13": 5,
     "node_3": 5,
     "node_8": 5
-  }
+  },
+  "topology_type": "d_cliques"
 }
