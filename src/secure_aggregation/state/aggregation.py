@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from secure_aggregation.node import ECM
 from secure_aggregation.state.config import StateAggregationConfig
 from secure_aggregation.storage.model_store import (
     AnchorScope,
@@ -21,9 +19,6 @@ from secure_aggregation.storage.model_store import (
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("state_aggregation")
-
-STATE_SIGNAL_PREFIX = "signal::state::"
-
 
 class StateAggregationError(RuntimeError):
     """Raised when a state round cannot be completed."""
@@ -39,63 +34,6 @@ class StateClusterModel:
     round_idx: int
     received_at: float
     source_node: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class StateDigest:
-    """Digest advertised by a central node after merging ECMs."""
-
-    node_id: str
-    state_id: str
-    state_round: int
-    cluster_round: Optional[int]
-    model_hash: str
-    model_cid: Optional[str]
-    received_at: float
-
-
-def build_state_signal_cid(state_id: str, state_round: int, node_id: str) -> str:
-    """Construct the CID prefix used for state digest signals."""
-    return f"{STATE_SIGNAL_PREFIX}{state_id}::{state_round}::{node_id}"
-
-
-def parse_state_digest_signal(ecm: ECM) -> Optional[StateDigest]:
-    """Parse a bridge ECM signal into a structured state digest."""
-    if not ecm.is_signal or not ecm.cid.startswith(STATE_SIGNAL_PREFIX):
-        return None
-    parts = ecm.cid.split("::")
-    if len(parts) < 5:
-        return None
-    state_id = parts[2]
-    try:
-        state_round = int(parts[3])
-    except ValueError:
-        return None
-    node_id = parts[4]
-    cluster_round: Optional[int] = None
-    model_cid: Optional[str] = None
-    if ecm.convergence_data_id:
-        try:
-            payload = json.loads(ecm.convergence_data_id)
-        except json.JSONDecodeError:
-            payload = {}
-        cluster_round_val = payload.get("cluster_round")
-        if cluster_round_val is not None:
-            try:
-                cluster_round = int(cluster_round_val)
-            except (TypeError, ValueError):
-                cluster_round = None
-        if payload.get("model_cid"):
-            model_cid = str(payload["model_cid"])
-    return StateDigest(
-        node_id=node_id,
-        state_id=state_id,
-        state_round=state_round,
-        cluster_round=cluster_round,
-        model_hash=ecm.hash,
-        model_cid=model_cid,
-        received_at=ecm.received_at,
-    )
 
 
 class StateAggregator:

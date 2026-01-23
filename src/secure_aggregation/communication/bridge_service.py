@@ -16,6 +16,7 @@ from secure_aggregation.node import ECM, ECMBuffer
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("bridge_service")
+STATE_SIGNAL_PREFIX = "state::"
 
 
 class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
@@ -65,9 +66,10 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
         request: secureagg_pb2.ECMBroadcast,
         context,
     ) -> secureagg_pb2.ECMSubmitResponse:
-        """Receive ECM broadcast from neighbor cluster with convergence status."""
+        """Receive ECM broadcast from neighbor cluster."""
         cid = request.cid or f"signal::{request.cluster_id}::{request.round}"
-        if request.convergence_data_id and not request.cid:
+        is_state_signal = request.cluster_id.startswith(STATE_SIGNAL_PREFIX)
+        if request.convergence_data_id and not request.cid and not is_state_signal:
             cid = f"signal::convergence::{request.convergence_data_id}"
         is_signal = cid.startswith("signal::")
         ecm = ECM(
@@ -82,11 +84,16 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
         )
         self.ecm_buffer.add(ecm)
         self._emit_hooks(ecm)
-        logger.info(
-            f"Received ECM from cluster {request.cluster_id} "
-            f"round {request.round}: cid={request.cid[:8]}... "
-            f"(converged={request.cluster_converged}, data_id={request.convergence_data_id or 'N/A'})"
-        )
+        if is_state_signal:
+            logger.info(
+                f"Received state digest from {request.cluster_id} round {request.round}: "
+                f"cid={request.cid[:8]}..."
+            )
+        else:
+            logger.info(
+                f"Received ECM from cluster {request.cluster_id} "
+                f"round {request.round}: cid={request.cid[:8]}..."
+            )
 
         return secureagg_pb2.ECMSubmitResponse(
             accepted=True,
@@ -166,10 +173,16 @@ class BridgeClient:
             if self.send_ecm(addr, cluster_id, round_num, cid, model_hash):
                 accepted += 1
 
-        logger.info(
-            f"Broadcast ECM to {accepted}/{len(neighbor_addresses)} neighbors "
-            f"(cluster={cluster_id}, round={round_num})"
-        )
+        if cluster_id.startswith(STATE_SIGNAL_PREFIX):
+            logger.info(
+                f"Broadcast state digest to {accepted}/{len(neighbor_addresses)} neighbors "
+                f"(state={cluster_id}, round={round_num})"
+            )
+        else:
+            logger.info(
+                f"Broadcast ECM to {accepted}/{len(neighbor_addresses)} neighbors "
+                f"(cluster={cluster_id}, round={round_num})"
+            )
         return accepted
 
     def send_ecm_with_convergence(
@@ -197,7 +210,7 @@ class BridgeClient:
             )
             response = stub.ReceiveECM(request, timeout=10)
             if response.accepted:
-                logger.debug(f"ECM with convergence sent to {neighbor_address}")
+                logger.debug(f"ECM with metadata sent to {neighbor_address}")
             return response.accepted
         except grpc.RpcError as e:
             logger.warning(f"Failed to send ECM to {neighbor_address}: {e}")
@@ -215,7 +228,7 @@ class BridgeClient:
         convergence_data_id: Optional[str] = None,
     ) -> int:
         """
-        Broadcast ECM with convergence status to all neighbor cluster bridge nodes.
+        Broadcast ECM with convergence/metadata information to all neighbor bridge nodes.
 
         Returns:
             Number of neighbors that accepted the ECM.
@@ -234,10 +247,6 @@ class BridgeClient:
             ):
                 accepted += 1
 
-        logger.info(
-            f"Broadcast ECM with convergence to {accepted}/{len(neighbor_addresses)} neighbors "
-            f"(cluster={cluster_id}, round={round_num}, converged={cluster_converged})"
-        )
         return accepted
 
     def close(self) -> None:

@@ -8,6 +8,7 @@ import os
 import re
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -23,7 +24,11 @@ from secure_aggregation.communication.aggregator_service import (
     grpc_message_options,
     serve as serve_aggregator,
 )
-from secure_aggregation.communication.bridge_service import BridgeClient, serve_bridge
+from secure_aggregation.communication.bridge_service import (
+    BridgeClient,
+    STATE_SIGNAL_PREFIX,
+    serve_bridge,
+)
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
 from secure_aggregation.convergence import ConvergenceConfig, ConvergenceState, ConvergenceTracker
 from secure_aggregation.convergence.central_broadcast import (
@@ -44,9 +49,6 @@ from secure_aggregation.state import (
     StateAggregationConfig,
     StateAggregationError,
     StateAggregator,
-    StateDigest,
-    build_state_signal_cid,
-    parse_state_digest_signal,
 )
 from secure_aggregation.storage.model_store import (
     AnchorScope,
@@ -142,6 +144,72 @@ def dequantize_vector(ints: List[int], scale: float) -> List[float]:
 def _encode_share(x: int, share: int) -> bytes:
     """Pack (x, share) tuple for transport."""
     return _int_to_bytes(x, 2) + _int_to_bytes(share, SHARE_BYTES)
+
+
+STATE_SIGNAL_CID_PREFIX = "signal::state::"
+
+
+@dataclass
+class StateDigest:
+    """State-level model digest shared between central candidates."""
+
+    node_id: str
+    state_id: str
+    state_round: int
+    cluster_round: int
+    model_hash: str
+    model_cid: Optional[str]
+    received_at: float
+
+
+def build_state_signal_cid(state_id: Optional[str], state_round: int, node_id: str) -> str:
+    """Create a recognizable CID for state digest signaling over the bridge."""
+    safe_state_id = state_id or "unknown"
+    return f"{STATE_SIGNAL_CID_PREFIX}{safe_state_id}::{state_round}::{node_id}"
+
+
+def parse_state_digest_signal(ecm: ECM) -> Optional[StateDigest]:
+    """Convert a bridge ECM carrying a state digest signal into a StateDigest."""
+    if not ecm.is_signal or not ecm.source_cluster:
+        return None
+    if not ecm.source_cluster.startswith(STATE_SIGNAL_PREFIX):
+        return None
+    state_id = ecm.source_cluster[len(STATE_SIGNAL_PREFIX):]
+    if not state_id:
+        return None
+    state_round = ecm.round_idx
+    if state_round < 0:
+        return None
+    cluster_round = state_round
+    origin_node: Optional[str] = None
+    if ecm.convergence_data_id:
+        try:
+            payload = json.loads(ecm.convergence_data_id)
+            origin_node = payload.get("node_id") or None
+            payload_round = payload.get("cluster_round")
+            if payload_round is not None:
+                try:
+                    cluster_round = int(payload_round)
+                except (TypeError, ValueError):
+                    pass
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.debug("Malformed state digest payload: %s", ecm.convergence_data_id)
+    if not origin_node and ecm.cid.startswith(STATE_SIGNAL_CID_PREFIX):
+        parts = ecm.cid.split("::")
+        if len(parts) >= 5:
+            origin_node = parts[-1]
+    if not origin_node:
+        logger.debug("Unable to determine origin node for state digest cid=%s", ecm.cid)
+        return None
+    return StateDigest(
+        node_id=origin_node,
+        state_id=state_id,
+        state_round=state_round,
+        cluster_round=cluster_round,
+        model_hash=ecm.hash,
+        model_cid=None,
+        received_at=ecm.received_at,
+    )
 
 
 class GlobalStopRequested(Exception):
@@ -243,14 +311,14 @@ class NodeService:
         self.state_aggregator: Optional[StateAggregator] = None
         self._state_round_queue: Deque[Tuple[int, int]] = deque()
         self._bridge_ecm_hooks: List[Callable[[ECM], None]] = []
-        self._state_round_cache: Dict[int, np.ndarray] = {}
-        self._state_round_hashes: Dict[int, str] = {}
-        self._state_digest_records: Dict[int, Dict[str, StateDigest]] = {}
-        self._state_committed_rounds: Set[int] = set()
         self._state_rounds_logged: Set[int] = set()
         self._last_applied_state_round: int = 0
         self._pending_nation_rounds: Set[int] = set()
         self._nation_round_to_state_round: Dict[int, int] = {}
+        self._state_round_cache: Dict[int, Any] = {}
+        self._state_round_hashes: Dict[int, str] = {}
+        self._state_digest_records: Dict[int, Dict[str, StateDigest]] = {}
+        self._state_committed_rounds: Set[int] = set()
 
         # Convergence state
         self.convergence_config = self._load_convergence_config()
@@ -1391,7 +1459,18 @@ class NodeService:
         self._state_round_cache[state_round] = merged_model
         self._state_round_hashes[state_round] = model_hash
         self._broadcast_state_digest(state_round, cluster_round, model_hash)
-        self._record_local_state_digest(state_round, cluster_round, model_hash)
+        local_digest = StateDigest(
+            node_id=self.node_id,
+            state_id=self.state_config.state_id,
+            state_round=state_round,
+            cluster_round=cluster_round,
+            model_hash=model_hash,
+            model_cid=None,
+            received_at=time.time(),
+        )
+        self._record_state_digest(local_digest, local=True)
+        self._await_state_digest_consensus(state_round)
+        self._verify_state_digest_consensus(state_round, model_hash)
         return True
 
     def _dispatch_state_ecm_to_central(self, state_round: int, cluster_round: int) -> None:
@@ -1498,7 +1577,14 @@ class NodeService:
 
     def _broadcast_state_digest(self, state_round: int, cluster_round: int, model_hash: str) -> None:
         """Share this node's state digest with other central candidates."""
-        if not self._state_layer_enabled() or not self.central_neighbor_addresses:
+        logger.info(
+            "Broadcasting state digest round=%d to other central nodes",
+            state_round,
+        )
+        if not self._state_layer_enabled():
+            return
+        if not self.central_neighbor_addresses:
+            logger.debug("No central neighbor addresses available for state digest broadcast")
             return
         if not self._ensure_bridge_client(allow_state_layer=True):
             logger.warning(
@@ -1513,9 +1599,7 @@ class NodeService:
             }
         )
         cid = build_state_signal_cid(self.state_config.state_id, state_round, self.node_id)
-        targets = [
-            addr for node_id, addr in self.central_neighbor_addresses.items() if node_id != self.node_id
-        ]
+        targets = [addr for node_id, addr in self.central_neighbor_addresses.items() if node_id != self.node_id]
         if not targets:
             return
         accepted = self.bridge_client.broadcast_ecm_with_convergence(
@@ -1524,31 +1608,21 @@ class NodeService:
             state_round,
             cid,
             model_hash,
-            True,
+            False,
             0.0,
             convergence_data_id=payload,
         )
+        detail_targets = targets.copy()
         logger.info(
-            "Broadcast state digest round=%d hash=%s... to %d/%d central nodes",
+            "Broadcasted state digest round=%d hash=%s... to %d/%d central nodes (%s)",
             state_round,
             model_hash[:8],
             accepted,
             len(targets),
+            ", ".join(detail_targets) if detail_targets else "none",
         )
 
-    def _record_local_state_digest(self, state_round: int, cluster_round: int, model_hash: str) -> None:
-        digest = StateDigest(
-            node_id=self.node_id,
-            state_id=self.state_config.state_id,
-            state_round=state_round,
-            cluster_round=cluster_round,
-            model_hash=model_hash,
-            model_cid=None,
-            received_at=time.time(),
-        )
-        self._record_state_digest(digest)
-
-    def _record_state_digest(self, digest: StateDigest) -> None:
+    def _record_state_digest(self, digest: StateDigest, local: bool = False) -> None:
         if not self._state_layer_enabled():
             return
         records = self._state_digest_records.setdefault(digest.state_round, {})
@@ -1556,13 +1630,85 @@ class NodeService:
         if prev and prev.model_hash == digest.model_hash:
             return
         records[digest.node_id] = digest
-        logger.info(
-            "Observed state digest round=%d from %s hash=%s...",
-            digest.state_round,
-            digest.node_id,
-            digest.model_hash[:8],
-        )
+        if local:
+            logger.info(
+                "Recorded local state digest round=%d hash=%s...",
+                digest.state_round,
+                digest.model_hash[:8],
+            )
+        else:
+            logger.info(
+                "Observed state digest round=%d from %s hash=%s...",
+                digest.state_round,
+                digest.node_id,
+                digest.model_hash[:8],
+            )
         self._maybe_finalize_state_round(digest.state_round)
+
+    def _await_state_digest_consensus(self, state_round: int) -> None:
+        """Block until digests from all central candidates are observed or timeout elapses."""
+        if (
+            not self._state_layer_enabled()
+            or not self.state_candidates
+            or len(self.state_candidates) <= 1
+        ):
+            return
+        timeout = float(self.state_config.digest_timeout_seconds or 0.0)
+        if timeout <= 0:
+            return
+        deadline = time.time() + timeout
+        logger.info(
+            "Waiting up to %.0fs for peer state digests (round %d)",
+            timeout,
+            state_round,
+        )
+        last_log = 0.0
+        while time.time() < deadline:
+            self._process_incoming_signals()
+            records = self._state_digest_records.get(state_round, {})
+            if len(records) >= len(self.state_candidates):
+                logger.info(
+                    "Received all %d state digests for round %d",
+                    len(records),
+                    state_round,
+                )
+                return
+            missing = sorted(set(self.state_candidates) - set(records.keys()))
+            now = time.time()
+            if missing and now - last_log >= 3.0:
+                logger.debug(
+                    "State round %d waiting for digests from: %s",
+                    state_round,
+                    ", ".join(missing),
+                )
+                last_log = now
+            time.sleep(1.0)
+        remaining = sorted(
+            set(self.state_candidates)
+            - set((self._state_digest_records.get(state_round) or {}).keys())
+        )
+        if remaining:
+            logger.warning(
+                "State round %d timed out waiting for digests from: %s",
+                state_round,
+                ", ".join(remaining),
+            )
+
+    def _verify_state_digest_consensus(self, state_round: int, local_hash: str) -> None:
+        """Ensure all digests agree with the local hash before committing."""
+        records = self._state_digest_records.get(state_round, {})
+        if not records:
+            return
+        hashes = {digest.model_hash for digest in records.values()}
+        if len(hashes) == 1 and local_hash in hashes:
+            logger.info("State round %d digests are consistent (hash=%s...)", state_round, local_hash[:8])
+            return
+        logger.warning(
+            "State round %d digest mismatch detected. Local hash=%s..., peers=%s",
+            state_round,
+            local_hash[:8],
+            ", ".join(h[:8] for h in sorted(hashes)),
+        )
 
     def _maybe_finalize_state_round(self, state_round: int) -> None:
         if (
