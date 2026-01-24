@@ -185,18 +185,16 @@ class BridgeClient:
             )
         return accepted
 
-    def send_ecm_with_convergence(
+    def send_ecm_with_metadata(
         self,
         neighbor_address: str,
         cluster_id: str,
         round_num: int,
         cid: str,
         model_hash: str,
-        cluster_converged: bool,
-        cluster_delta_norm: float,
-        convergence_data_id: Optional[str] = None,
+        metadata: Optional[str] = None,
     ) -> bool:
-        """Send ECM with convergence status to a neighbor cluster bridge node."""
+        """Send ECM with auxiliary metadata (used for state digests)."""
         try:
             stub = self._get_stub(neighbor_address)
             request = secureagg_pb2.ECMBroadcast(
@@ -204,9 +202,7 @@ class BridgeClient:
                 round=round_num,
                 cid=cid,
                 hash=model_hash,
-                cluster_converged=cluster_converged,
-                cluster_delta_norm=cluster_delta_norm,
-                convergence_data_id=convergence_data_id or "",
+                convergence_data_id=metadata or "",
             )
             response = stub.ReceiveECM(request, timeout=10)
             if response.accepted:
@@ -216,37 +212,27 @@ class BridgeClient:
             logger.warning(f"Failed to send ECM to {neighbor_address}: {e}")
             return False
 
-    def broadcast_ecm_with_convergence(
+    def broadcast_ecm_with_metadata(
         self,
         neighbor_addresses: List[str],
         cluster_id: str,
         round_num: int,
         cid: str,
         model_hash: str,
-        cluster_converged: bool,
-        cluster_delta_norm: float,
-        convergence_data_id: Optional[str] = None,
+        metadata: Optional[str] = None,
     ) -> int:
-        """
-        Broadcast ECM with convergence/metadata information to all neighbor bridge nodes.
-
-        Returns:
-            Number of neighbors that accepted the ECM.
-        """
+        """Broadcast ECM with optional metadata to all neighbor bridge nodes."""
         accepted = 0
         for addr in neighbor_addresses:
-            if self.send_ecm_with_convergence(
+            if self.send_ecm_with_metadata(
                 addr,
                 cluster_id,
                 round_num,
                 cid,
                 model_hash,
-                cluster_converged,
-                cluster_delta_norm,
-                convergence_data_id=convergence_data_id,
+                metadata=metadata,
             ):
                 accepted += 1
-
         return accepted
 
     def close(self) -> None:

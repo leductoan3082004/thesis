@@ -35,7 +35,6 @@ from secure_aggregation.convergence.central_broadcast import (
     CENTRAL_METADATA_CLUSTER_ID,
     fetch_central_metadata,
 )
-from secure_aggregation.convergence.central_checker import CentralChecker
 from secure_aggregation.config.models import NodeRole
 from secure_aggregation.config.system import load_system_config
 from secure_aggregation.crypto.sign import SigningKeyPair
@@ -333,19 +332,11 @@ class NodeService:
         self._last_model_hash: Optional[str] = None
         self._last_model_data_id: Optional[str] = None
         self.central_metadata = None
-        self.central_checker: Optional[CentralChecker] = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
         self._bootstrap_anchors: List[
             Tuple[str, int, str, Optional[str], Optional[str], AnchorScope]
         ] = []
         self._logged_central_addresses = False
-        self._clique_signal_addresses: Dict[str, str] = {}
-        self._known_convergence_data_ids: Set[str] = set()
-        self._pending_convergence_data_ids: Set[str] = set()
-        self._acknowledged_convergence_data_ids: Set[str] = set()
-        self._convergence_payload_cache: Dict[str, Dict[str, Any]] = {}
-        self._confirmed_global_convergence_round: Optional[int] = None
-        self._confirmed_global_convergence_reason: str = ""
         max_failures = self.secagg_config.get("max_aggregator_failure_rounds", 2)
         try:
             self._max_aggregator_failure_rounds = max(1, int(max_failures))
@@ -917,9 +908,7 @@ class NodeService:
         signing_public_keys: Dict[str, bytes] = {}
         if self.participants:
             signing_public_keys = {p.node_id: bytes(p.signing_public_key) for p in self.participants}
-        convergence_handler = (
-            self._handle_convergence_signal_from_peer if self._is_convergence_runtime_enabled() else None
-        )
+        convergence_handler = None
         self.aggregator_server, self.aggregator_servicer = serve_aggregator(
             self.node_id,
             self.port + 1000,
@@ -1177,14 +1166,6 @@ class NodeService:
                 f"central nodes={metadata.central_nodes}, checker candidates={metadata.checker_candidates}"
             )
             self._update_central_neighbor_addresses()
-            if (
-                self.convergence_tracker
-                and metadata.checker_candidates
-                and not self.convergence_config.central_checker_id
-            ):
-                self.convergence_config.central_checker_id = metadata.checker_candidates[0]
-                self.convergence_tracker.config.central_checker_id = metadata.checker_candidates[0]
-            self._maybe_init_central_checker()
 
     def _update_central_neighbor_addresses(self) -> None:
         """Build mapping to central neighbor bridge addresses when metadata is available."""
@@ -1525,14 +1506,12 @@ class NodeService:
                 state_round,
             )
             return
-        accepted = self.bridge_client.broadcast_ecm_with_convergence(
+        accepted = self.bridge_client.broadcast_ecm(
             targets,
             f"cluster_{self.clique_id}",
             cluster_round,
             self._last_model_cid,
             self._last_model_hash,
-            True,
-            0.0,
         )
         logger.info(
             "Dispatched state ECM for state round %d to %d/%d candidates",
@@ -1609,15 +1588,13 @@ class NodeService:
         targets = [addr for node_id, addr in self.central_neighbor_addresses.items() if node_id != self.node_id]
         if not targets:
             return
-        accepted = self.bridge_client.broadcast_ecm_with_convergence(
+        accepted = self.bridge_client.broadcast_ecm_with_metadata(
             targets,
             f"state::{self.state_config.state_id}",
             state_round,
             cid,
             model_hash,
-            False,
-            0.0,
-            convergence_data_id=payload,
+            metadata=payload,
         )
         detail_targets = targets.copy()
         logger.info(
@@ -1873,41 +1850,6 @@ class NodeService:
             source_state_round,
             self.nation_config.nation_id,
         )
-
-    def _update_clique_signal_addresses(self) -> None:
-        """Precompute bridge endpoints for clique peers to receive convergence broadcasts."""
-        self._clique_signal_addresses = {}
-        candidates = self.clique_members if self.clique_members else list(self.participant_map.keys())
-        for member in candidates:
-            base_address = self.participant_map.get(member)
-            if not base_address:
-                continue
-            try:
-                host, port_str = base_address.split(":")
-                bridge_port = int(port_str) + 2000
-            except ValueError:
-                logger.warning("Invalid address format for clique member %s: %s", member, base_address)
-                continue
-            self._clique_signal_addresses[member] = f"{host}:{bridge_port}"
-
-    def _maybe_init_central_checker(self) -> None:
-        """Instantiate central checker if this node is a candidate."""
-        if not self._is_convergence_runtime_enabled():
-            self.central_checker = None
-            return
-        if not self.central_metadata:
-            self.central_checker = None
-            return
-        if self.node_id in self.central_metadata.checker_candidates:
-            if self.central_checker is None:
-                self.central_checker = CentralChecker(
-                    self.blockchain,
-                    total_cliques=self.central_metadata.total_cliques,
-                    cluster_ids=self.central_metadata.cluster_ids,
-                    on_announcement=self._handle_global_convergence_announcement,
-                )
-        else:
-            self.central_checker = None
 
     def gossip_ecm(self, cid: str, model_hash: str, round_num: int) -> None:
         """Gossip ECM to neighbor cluster bridge nodes."""
@@ -2522,7 +2464,11 @@ class NodeService:
                             for ecm in consumed_ecms:
                                 self.inter_cluster_aggregator.receive_ecms(self.node_id, [ecm])
                                 # Update neighbor convergence status from ECM
-                                if hasattr(ecm, "cluster_converged"):
+                                if (
+                                    hasattr(ecm, "cluster_converged")
+                                    and self.convergence_tracker is not None
+                                    and self._is_convergence_runtime_enabled()
+                                ):
                                     self.convergence_tracker.receive_neighbor_convergence(
                                         ecm.source_cluster, ecm.cluster_converged
                                     )
@@ -2667,15 +2613,11 @@ class NodeService:
             # Phase 6: ECM gossip with convergence status (bridge nodes only)
             if cid and model_hash and self.is_bridge_node:
                 logger.info("Phase 6: ECM gossip to neighbor clusters")
-                cluster_converged = self._latest_cluster_converged
-                delta_norm = self._latest_delta_norm
-                self.gossip_ecm_with_convergence(cid, model_hash, round_idx, cluster_converged, delta_norm)
-                self._broadcast_central_signal(round_idx, cluster_converged, delta_norm)
+                self.gossip_ecm(cid, model_hash, round_idx)
 
             should_stop, stop_reason = self._sync_stop_state_from_tracker(should_stop, stop_reason)
             if should_stop:
                 logger.info(f"Stopping training: {stop_reason}")
-                self._check_cached_convergence_data()
                 break
 
             # Record round total time
@@ -2771,255 +2713,6 @@ class NodeService:
             if channel:
                 channel.close()
 
-    def gossip_ecm_with_convergence(
-        self, cid: str, model_hash: str, round_num: int,
-        cluster_converged: bool, delta_norm: float
-    ) -> None:
-        """Gossip ECM with convergence status to neighbor cluster bridge nodes."""
-        if not self.is_bridge_node:
-            return
-        if not self._ensure_bridge_client():
-            logger.warning("Cannot gossip ECM (node %s): bridge client unavailable", self.node_id)
-            return
-
-        cluster_id = f"cluster_{self.clique_id}"
-        if not self.neighbor_bridge_addresses:
-            logger.debug("No neighbor bridges available for ECM gossip")
-            return
-        accepted = self.bridge_client.broadcast_ecm_with_convergence(
-            self.neighbor_bridge_addresses,
-            cluster_id,
-            round_num,
-            cid,
-            model_hash,
-            cluster_converged,
-            delta_norm,
-        )
-        logger.info(
-            f"Gossiped ECM with convergence (converged={cluster_converged}) to "
-            f"{accepted}/{len(self.neighbor_bridge_addresses)} neighbors"
-        )
-
-    def _broadcast_central_signal(
-        self,
-        round_idx: int,
-        cluster_converged: bool,
-        delta_norm: float,
-    ) -> None:
-        """Send convergence-only signal to central checkers."""
-        if not self._is_convergence_runtime_enabled():
-            return
-        if not self.central_neighbor_addresses:
-            return
-
-        delivered = 0
-        total_targets = len(self.central_neighbor_addresses)
-
-        if self.node_id in self.central_neighbor_addresses and self.central_checker:
-            self.central_checker.record_signal(
-                f"cluster_{self.clique_id}",
-                round_idx,
-                cluster_converged,
-                delta_norm,
-            )
-            delivered += 1
-
-        remote_addresses = [
-            addr
-            for checker_id, addr in self.central_neighbor_addresses.items()
-            if checker_id != self.node_id
-        ]
-        if remote_addresses:
-            if not self.is_bridge_node or not self.bridge_client:
-                logger.warning(
-                    "Cannot dispatch convergence signal to remote central nodes: bridge client unavailable"
-                )
-            else:
-                cid = f"signal::cluster_{self.clique_id}::{round_idx}"
-                accepted = self.bridge_client.broadcast_ecm_with_convergence(
-                    remote_addresses,
-                    f"cluster_{self.clique_id}",
-                    round_idx,
-                    cid,
-                    "signal",
-                    cluster_converged,
-                    delta_norm,
-                    convergence_data_id=None,
-                )
-                delivered += accepted
-
-        if delivered > 0:
-            logger.info(
-                "Dispatched convergence signal (converged=%s) to %d/%d central targets",
-                cluster_converged,
-                delivered,
-                total_targets,
-            )
-
-    def _broadcast_convergence_data_id_to_neighbors(
-        self,
-        data_id: str,
-        round_idx: int,
-        targets: Optional[List[str]] = None,
-    ) -> None:
-        """Broadcast convergence confirmation to bridge neighbors."""
-        if (
-            not self._is_convergence_runtime_enabled()
-            or not data_id
-            or not self.bridge_client
-            or not self.inter_cluster_enabled
-        ):
-            return
-        addresses = targets or self.neighbor_bridge_addresses
-        if not addresses:
-            logger.debug("No neighbor bridges available for convergence data broadcast")
-            return
-        cluster_id = f"cluster_{self.clique_id}"
-        cid = f"signal::convergence::{data_id}"
-        accepted = self.bridge_client.broadcast_ecm_with_convergence(
-            addresses,
-            cluster_id,
-            round_idx,
-            cid,
-            "signal",
-            True,
-            0.0,
-            convergence_data_id=data_id,
-        )
-        logger.info(
-            "Broadcast convergence data_id=%s to %d/%d bridge targets",
-            data_id,
-            accepted,
-            len(addresses),
-        )
-
-    def _broadcast_convergence_data_id_to_clique(self, data_id: str, round_idx: int) -> None:
-        """Broadcast convergence confirmation to non-bridge clique members."""
-        if (
-            not self._is_convergence_runtime_enabled()
-            or not data_id
-            or not self.bridge_client
-            or not self.inter_cluster_enabled
-        ):
-            return
-        if not self._clique_signal_addresses:
-            return
-        targets: List[str] = []
-        for member, address in self._clique_signal_addresses.items():
-            if member == self.node_id:
-                continue
-            targets.append(address)
-        if not targets:
-            return
-        cluster_id = f"cluster_{self.clique_id}"
-        cid = f"signal::convergence::{data_id}"
-        accepted = self.bridge_client.broadcast_ecm_with_convergence(
-            targets,
-            cluster_id,
-            round_idx,
-            cid,
-            "signal",
-            True,
-            0.0,
-            convergence_data_id=data_id,
-        )
-        logger.info(
-            "Propagated convergence data_id=%s to %d/%d clique peers",
-            data_id,
-            accepted,
-            len(targets),
-        )
-
-    def _register_convergence_data_id(self, data_id: Optional[str], round_idx: Optional[int] = None) -> bool:
-        """Cache convergence data_id for later verification."""
-        if not self._is_convergence_runtime_enabled() or not data_id:
-            return False
-        if data_id in self._known_convergence_data_ids:
-            return False
-        self._known_convergence_data_ids.add(data_id)
-        if data_id not in self._acknowledged_convergence_data_ids:
-            self._pending_convergence_data_ids.add(data_id)
-        logger.info(
-            "Cached convergence confirmation data_id=%s%s",
-            data_id,
-            f" (round={round_idx})" if round_idx is not None else "",
-        )
-        self._send_convergence_signal_to_aggregator(data_id, round_idx)
-        return True
-
-    def _handle_convergence_signal_from_peer(self, data_id: str, round_idx: int) -> None:
-        """Receive convergence notification from clique peers via aggregator RPC."""
-        if not self._is_convergence_runtime_enabled():
-            return
-        logger.info(
-            "Aggregator %s received convergence signal via RPC data_id=%s round=%s",
-            self.node_id,
-            data_id,
-            round_idx,
-        )
-        if self._register_convergence_data_id(data_id, round_idx):
-            self._broadcast_convergence_data_id_to_neighbors(data_id, round_idx)
-            self._broadcast_convergence_data_id_to_clique(data_id, round_idx)
-
-    def _send_convergence_signal_to_aggregator(self, data_id: str, round_idx: Optional[int]) -> None:
-        """Notify the current aggregator about convergence confirmation."""
-        if (
-            not self._is_convergence_runtime_enabled()
-            or not data_id
-            or self.aggregator_id is None
-            or self.aggregator_id == self.node_id
-            or not self.aggregator_address
-        ):
-            return
-        try:
-            host, port_str = self.aggregator_address.split(":")
-            agg_port = int(port_str) + 1000
-        except ValueError:
-            logger.debug(
-                "Cannot notify aggregator %s about convergence: invalid address %s",
-                self.aggregator_id,
-                self.aggregator_address,
-            )
-            return
-        agg_addr = f"{host}:{agg_port}"
-        channel = self._create_aggregator_channel(agg_addr)
-        stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
-        try:
-            stub.NotifyConvergenceSignal(
-                secureagg_pb2.ConvergenceSignal(
-                    data_id=data_id,
-                    round=round_idx if round_idx is not None else self.current_round,
-                ),
-                timeout=5,
-            )
-        except grpc.RpcError as exc:
-            logger.debug(
-                "Failed to notify aggregator %s about convergence data_id=%s: %s",
-                self.aggregator_id,
-                data_id,
-                exc,
-            )
-        finally:
-            channel.close()
-
-    def _handle_global_convergence_announcement(
-        self,
-        round_idx: int,
-        data_id: Optional[str],
-        payload: Optional[Dict],
-    ) -> None:
-        """Callback executed when central checker finalizes convergence."""
-        if not self._is_convergence_runtime_enabled():
-            return
-        if not data_id:
-            logger.warning("Central checker declared convergence but no data_id was returned")
-            return
-        if payload:
-            self._convergence_payload_cache[data_id] = payload
-        if self._register_convergence_data_id(data_id, round_idx):
-            self._broadcast_convergence_data_id_to_neighbors(data_id, round_idx)
-            self._broadcast_convergence_data_id_to_clique(data_id, round_idx)
-
     def _process_incoming_signals(self) -> None:
         if not self.ecm_buffer:
             return
@@ -3028,88 +2721,11 @@ class NodeService:
             digest = parse_state_digest_signal(ecm)
             if digest:
                 self._record_state_digest(digest)
-                continue
-            if not self._is_convergence_runtime_enabled():
-                continue
-            if ecm.convergence_data_id:
-                is_new = self._register_convergence_data_id(ecm.convergence_data_id, ecm.round_idx)
-                if is_new and self.is_bridge_node:
-                    self._broadcast_convergence_data_id_to_clique(ecm.convergence_data_id, ecm.round_idx)
-            if (
-                self.central_checker
-                and ecm.source_cluster
-                and ecm.round_idx >= 0
-                and ecm.cluster_delta_norm is not None
-            ):
-                self.central_checker.record_signal(
-                    ecm.source_cluster,
-                    ecm.round_idx,
-                    ecm.cluster_converged,
-                    ecm.cluster_delta_norm,
-                )
-
-    def _check_cached_convergence_data(self) -> None:
-        if (
-            not self._is_convergence_runtime_enabled()
-            or not self.blockchain
-            or not self._pending_convergence_data_ids
-        ):
-            return
-        for data_id in list(self._pending_convergence_data_ids):
-            record: Optional[Dict[str, Any]]
-            try:
-                record = self.blockchain.fetch_data(data_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to fetch convergence payload data_id=%s: %s", data_id, exc)
-                continue
-            metadata = self._extract_convergence_metadata(record)
-            if not metadata:
-                continue
-            round_idx = metadata.get("round")
-            if round_idx is None:
-                logger.warning("Convergence payload %s missing round field", data_id)
-                continue
-            self._pending_convergence_data_ids.discard(data_id)
-            self._acknowledged_convergence_data_ids.add(data_id)
-            self._convergence_payload_cache[data_id] = metadata
-            if self.convergence_tracker:
-                self.convergence_tracker.receive_global_convergence(int(round_idx))
-            self._confirmed_global_convergence_round = int(round_idx)
-            self._confirmed_global_convergence_reason = "global_convergence"
-            logger.info(
-                "Verified convergence payload data_id=%s (round=%s); stopping after confirmation",
-                data_id,
-                round_idx,
-            )
 
     def _refresh_convergence_state(self, should_stop: bool, stop_reason: str) -> Tuple[bool, str]:
-        """Process buffered signals, fetch payloads, and align stop flags."""
+        """Process buffered signals and align stop flags."""
         self._process_incoming_signals()
-        if not self._is_convergence_runtime_enabled():
-            return should_stop, stop_reason
-        self._check_cached_convergence_data()
         return self._sync_stop_state_from_tracker(should_stop, stop_reason)
-
-    def _extract_convergence_metadata(self, record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not record:
-            return None
-        payload = record.get("payload")
-        if payload is None:
-            return None
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                logger.warning("Failed to parse convergence payload string")
-                return None
-        metadata = payload.get("metadata")
-        if metadata is None:
-            metadata = payload
-        if not isinstance(metadata, dict):
-            return None
-        if metadata.get("type") != "global_convergence":
-            return None
-        return metadata
 
     def _sync_stop_state_from_tracker(self, should_stop: bool, stop_reason: str) -> Tuple[bool, str]:
         """
@@ -3121,13 +2737,6 @@ class NodeService:
         """
         if not self._is_convergence_runtime_enabled():
             return should_stop, stop_reason
-        if not should_stop and self._confirmed_global_convergence_round is not None:
-            reason = self._confirmed_global_convergence_reason or stop_reason or "global_convergence"
-            logger.info(
-                "Global convergence confirmed on-chain at round %s; halting",
-                self._confirmed_global_convergence_round,
-            )
-            return True, reason
         if self.convergence_tracker and not should_stop:
             tracker_state = self.convergence_tracker.state
             if tracker_state.should_stop:
@@ -3190,8 +2799,6 @@ class NodeService:
                 time.sleep(2)
                 self.register_with_ttp()
             logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
-
-        self._update_clique_signal_addresses()
 
         if inter_edges:
             bridge_ready = self._init_bridge_with_retries(inter_edges, fatal=False)
