@@ -1334,6 +1334,13 @@ class NodeService:
                 )
                 return
             cid, expected_hash = anchor
+            logger.info(
+                "State model round %d detected on blockchain for state %s (cid=%s..., hash=%s...)",
+                target_round,
+                self.state_config.state_id,
+                cid[:12],
+                expected_hash[:12],
+            )
             state_model = self.ipfs.get(cid)
             if state_model is None:
                 logger.warning(
@@ -1353,7 +1360,7 @@ class NodeService:
             self._last_model_data_id = None
             self._last_applied_state_round = target_round
             logger.info(
-                "Applied STATE ROUND %d model for state %s (cid=%s...)",
+                "Applied STATE ROUND %d model for state %s (cid=%s...); next cluster rounds will start from this baseline",
                 target_round,
                 self.state_config.state_id,
                 cid[:12],
@@ -1819,7 +1826,10 @@ class NodeService:
                 return None
             if anchor:
                 return anchor
-            time.sleep(1.0)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(5.0, remaining))
         return None
 
     def _mark_state_round_committed(self, state_round: int) -> None:

@@ -897,10 +897,10 @@ class GatewayBlockchain(BlockchainInterface):
             headers=self._auth_headers(),
             json={
                 "state_id": state_id,
+                "state_round": state_round,
                 "payload": {
                     "model_hash": hash_val,
                     "cid": cid,
-                    "round": state_round,
                 },
             },
         )
@@ -1062,15 +1062,82 @@ class GatewayBlockchain(BlockchainInterface):
                     scope=scope,
                 )
             else:
-                logger.warning(
-                    f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash when fetching data_id={data_id} scope={cluster_id}"
-                )
+                    logger.warning(
+                        f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash when fetching data_id={data_id} scope={cluster_id}"
+                    )
 
         if not cid or not hash_val:
             return None
         return ModelAnchor(
             cluster_id=cluster_id,
             round_num=round_num,
+            cid=cid,
+            hash=hash_val,
+            data_id=data_id,
+            submitted_at=submitted_at,
+        )
+
+    def _query_state_model(self, state_id: str, state_round: int) -> Optional[ModelAnchor]:
+        try:
+            response = self._client.get(
+                f"{self._base_url}/state/models",
+                headers=self._auth_headers(),
+                params={"state": state_id, "round": state_round},
+            )
+            if response.status_code == 404:
+                logger.debug(
+                    f"{BLOCKCHAIN_LOG_TAG} No state model yet for state={state_id} round={state_round}"
+                )
+                return None
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            logger.error(
+                f"{BLOCKCHAIN_LOG_TAG} Gateway returned {exc.response.status_code} querying state={state_id} round={state_round}"
+            )
+            raise
+        except httpx.HTTPError as exc:
+            logger.error(
+                f"{BLOCKCHAIN_LOG_TAG} Failed to query state model state={state_id} round={state_round}: {exc}"
+            )
+            raise
+        record = response.json()
+        payload = record.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"{BLOCKCHAIN_LOG_TAG} Invalid payload when querying state model state={state_id} round={state_round}"
+                )
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        cid = payload.get("cid") or payload.get("model_cid")
+        hash_val = payload.get("model_hash")
+        if not cid or not hash_val:
+            logger.warning(
+                f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash in state response state={state_id} round={state_round}"
+            )
+            return None
+        data_id = record.get("data_id") or f"state::{state_id}::{state_round}"
+        submitted_at = record.get("submitted_at")
+        self._store.remember(
+            state_id,
+            state_round,
+            data_id,
+            cid,
+            hash_val,
+            submitted_at,
+            scope=AnchorScope.STATE,
+        )
+        logger.info(
+            f"{BLOCKCHAIN_LOG_TAG} Discovered state model state={state_id} round={state_round} cid={cid[:16]}..."
+        )
+        return ModelAnchor(
+            cluster_id=state_id,
+            round_num=state_round,
             cid=cid,
             hash=hash_val,
             data_id=data_id,
@@ -1086,6 +1153,15 @@ class GatewayBlockchain(BlockchainInterface):
         suppress_not_found_log: bool = False,
     ) -> Optional[Tuple[str, str]]:
         anchor = self._resolve_entry(cluster_id, round_num, scope)
+        if anchor is None and scope == AnchorScope.STATE:
+            try:
+                anchor = self._query_state_model(cluster_id, round_num)
+            except httpx.HTTPError:
+                if not suppress_not_found_log:
+                    logger.warning(
+                        f"{BLOCKCHAIN_LOG_TAG} Failed querying state model for state={cluster_id} round={round_num}"
+                    )
+                return None
         if anchor is None:
             if not suppress_not_found_log:
                 if scope == AnchorScope.CONTROL or self._is_control_cluster(cluster_id):
