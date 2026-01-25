@@ -1,25 +1,24 @@
 {
-  "number_of_nodes": 20,
-  "convergence": {
-    "warmup_rounds": 3,
-    "enabled": true,
-    "tol_abs": 1e-05,
-    "tol_rel": 0.001,
-    "patience": 3
-  },
-  "state_aggregation": {
-    "enabled": false,
-    "approach": "ring_star",
-    "cluster_rounds": 0,
-    "state_id": "state_0",
+  "hierarchy_defaults": {
     "collection_timeout_seconds": 30.0,
     "digest_timeout_seconds": 5.0,
     "consensus_timeout_seconds": 30.0,
     "commit_timeout_seconds": 10.0
   },
+  "state_aggregation": {
+    "enabled": true,
+    "approach": "ring_star",
+    "rounds_per_state": 3,
+    "max_aggregators": 3,
+    "fanout_per_cluster": 2,
+    "apply_policy": "replace"
+  },
   "nation_aggregation": {
-    "enabled": false,
-    "state_rounds": 0,
-    "nation_id": "nation_0"
+    "enabled": true,
+    "rounds_per_nation": 2,
+    "max_aggregators": 2,
+    "fanout_per_state": 3,
+    "apply_policy": "interpolate",
+    "apply_alpha": 0.2
   }
 }
