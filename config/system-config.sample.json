@@ -7,14 +7,17 @@
   },
   "state_aggregation": {
     "enabled": true,
+    "scope_name": "state",
     "approach": "ring_star",
     "rounds_per_state": 3,
     "max_aggregators": 3,
-    "fanout_per_cluster": 2,
+    "fanout_per_group": 2,
     "apply_policy": "replace"
+
   },
   "nation_aggregation": {
     "enabled": true,
+    "scope_name": "nation",
     "rounds_per_nation": 2,
     "max_aggregators": 2,
     "fanout_per_state": 3,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Optional
 
@@ -34,10 +34,14 @@ class StateAggregationConfig:
     rounds_per_state: int = 0
     approach: StateAggregationApproach = StateAggregationApproach.RING_STAR
     state_id: str = "state_0"
+    scope_name: str = "state"
     collection_timeout_seconds: float = 15.0
     digest_timeout_seconds: float = 5.0
     consensus_timeout_seconds: float = 30.0
     commit_timeout_seconds: float = 10.0
+    apply_policy: str = "replace"
+    apply_alpha: float = 0.0
+    apply_layer_mask: list[str] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "StateAggregationConfig":
@@ -51,10 +55,14 @@ class StateAggregationConfig:
             "cluster_rounds",
             "approach",
             "state_id",
+            "scope_name",
             "collection_timeout_seconds",
             "digest_timeout_seconds",
             "consensus_timeout_seconds",
             "commit_timeout_seconds",
+            "apply_policy",
+            "apply_alpha",
+            "apply_layer_mask",
         ):
             if key not in data:
                 continue
@@ -68,6 +76,12 @@ class StateAggregationConfig:
                 kwargs["rounds_per_state"] = max(0, int(value))
             elif key.endswith("_seconds"):
                 kwargs[key] = max(0.0, float(value))
+            elif key == "apply_policy":
+                kwargs[key] = str(value)
+            elif key == "apply_alpha":
+                kwargs[key] = float(value)
+            elif key == "apply_layer_mask":
+                kwargs[key] = list(value) if isinstance(value, (list, tuple)) else [str(value)]
             else:
                 kwargs[key] = str(value)
         return cls(**kwargs)
@@ -92,13 +106,24 @@ class NationAggregationConfig:
     enabled: bool = False
     rounds_per_nation: int = 0
     nation_id: str = "nation_0"
+    scope_name: str = "nation"
+    apply_policy: str = "interpolate"
+    apply_alpha: float = 0.2
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "NationAggregationConfig":
         if not data:
             return cls()
         kwargs: dict[str, Any] = {}
-        for key in ("enabled", "rounds_per_nation", "state_rounds", "nation_id"):
+        for key in (
+            "enabled",
+            "rounds_per_nation",
+            "state_rounds",
+            "nation_id",
+            "scope_name",
+            "apply_policy",
+            "apply_alpha",
+        ):
             if key not in data:
                 continue
             value = data[key]
@@ -107,6 +132,12 @@ class NationAggregationConfig:
             elif key in ("rounds_per_nation", "state_rounds"):
                 # Accept new schema naming.
                 kwargs["rounds_per_nation"] = max(0, int(value))
+            elif key == "scope_name":
+                kwargs[key] = str(value)
+            elif key == "apply_policy":
+                kwargs[key] = str(value)
+            elif key == "apply_alpha":
+                kwargs[key] = float(value)
             else:
                 kwargs[key] = str(value)
         return cls(**kwargs)

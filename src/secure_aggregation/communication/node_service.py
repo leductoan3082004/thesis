@@ -47,7 +47,7 @@ from secure_aggregation.data import dirichlet_partition, get_labels, load_datase
 from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
-from secure_aggregation.state import StateAggregator
+from secure_aggregation.state import NationAggregationConfig, StateAggregator
 from secure_aggregation.storage.model_store import (
     AnchorScope,
     BlockchainInterface,
@@ -228,15 +228,30 @@ class NodeService(HierarchyMixin):
         self.ecm_forward_wait = float(self.inter_cluster_config.get("ecm_forward_wait_seconds", 5.0))
 
         # State-level aggregation (hierarchy) state
-        self.state_config = self._load_state_config()
+        self.scope_configs = self._load_scope_config()
+        (
+            self.scope_name,
+            self.scope_config,
+            self.higher_scope_name,
+            higher_scope_config,
+        ) = self._select_scope_roles(self.scope_configs)
+        self.higher_scope_config = higher_scope_config or NationAggregationConfig()
         logger.info(
-            "State aggregation config: enabled=%s, rounds_per_state=%s, state_id=%s, approach=%s",
-            self.state_config.enabled,
-            self.state_config.rounds_per_state,
-            self.state_config.state_id,
-            self.state_config.approach.value if hasattr(self.state_config.approach, "value") else self.state_config.approach,
+            "%s aggregation config: enabled=%s, rounds_per_parent=%s, scope_id=%s, approach=%s",
+            self._scope_label_upper(),
+            self.scope_config.enabled,
+            self.scope_config.rounds_per_state,
+            self.scope_config.state_id,
+            self.scope_config.approach.value if hasattr(self.scope_config.approach, "value") else self.scope_config.approach,
         )
-        self.nation_config = self._load_nation_config()
+        logger.info(
+            "%s scheduling config: enabled=%s, rounds_per_scope=%s, apply_policy=%s, apply_alpha=%.3f",
+            self._higher_scope_label_upper(),
+            self.higher_scope_config.enabled,
+            getattr(self.higher_scope_config, "rounds_per_nation", 0),
+            getattr(self.higher_scope_config, "apply_policy", "replace"),
+            float(getattr(self.higher_scope_config, "apply_alpha", 0.0) or 0.0),
+        )
         self.state_candidates: List[str] = []
         self.is_state_candidate = False
         self.state_ecm_buffer: Optional[ECMBuffer] = None
@@ -386,6 +401,13 @@ class NodeService(HierarchyMixin):
         if not self.model:
             return
         load_params(self.model, tensor.flatten().tolist())
+        self._prime_convergence_tracker_state()
+
+    def _export_local_model_vector(self) -> Optional[np.ndarray]:
+        """Return flattened local model parameters as numpy array."""
+        if not self.model:
+            return None
+        return np.array(flatten_params(self.model), dtype=np.float32)
 
     def _log_final_model_status(self) -> None:
         """Log the final model accuracy and identifiers before stopping."""
@@ -850,7 +872,9 @@ class NodeService(HierarchyMixin):
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
         if self.aggregator_server:
-            self.aggregator_server.stop(0)
+            stop_future = self.aggregator_server.stop(0)
+            if stop_future:
+                stop_future.wait()
             self.aggregator_server = None
             self.aggregator_servicer = None
             logger.info("Stopped aggregator server")
@@ -1134,7 +1158,7 @@ class NodeService(HierarchyMixin):
             logger.info(f"Central neighbor addresses: {details}")
             self._logged_central_addresses = True
 
-        if self.state_config.enabled:
+        if self.scope_config.enabled:
             self._configure_scope_layer()
 
     def gossip_ecm(self, cid: str, model_hash: str, round_num: int) -> None:
