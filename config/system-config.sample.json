@@ -3,25 +3,31 @@
     "collection_timeout_seconds": 30.0,
     "digest_timeout_seconds": 5.0,
     "consensus_timeout_seconds": 30.0,
-    "commit_timeout_seconds": 10.0
+    "commit_timeout_seconds": 10.0,
+    "rounds_per_scope": 3
   },
-  "state_aggregation": {
-    "enabled": true,
-    "scope_name": "state",
-    "approach": "ring_star",
-    "rounds_per_state": 3,
-    "max_aggregators": 3,
-    "fanout_per_group": 2,
-    "apply_policy": "replace"
-
-  },
-  "nation_aggregation": {
-    "enabled": true,
-    "scope_name": "nation",
-    "rounds_per_nation": 2,
-    "max_aggregators": 2,
-    "fanout_per_state": 3,
-    "apply_policy": "interpolate",
-    "apply_alpha": 0.2
-  }
+  "hierarchy_levels": [
+    {
+      "scope_index": 1,
+      "scope_name": "state",
+      "scope_id": "state_0",
+      "enabled": true,
+      "approach": "ring_star",
+      "rounds_per_scope": 2,
+      "max_aggregators": 2,
+      "fanout_per_group": 2,
+      "apply_policy": "replace"
+    },
+    {
+      "scope_index": 2,
+      "scope_name": "nation",
+      "scope_id": "nation_0",
+      "enabled": true,
+      "rounds_per_scope": 2,
+      "max_aggregators": 2,
+      "fanout_per_scope": 2,
+      "apply_policy": "interpolate",
+      "apply_alpha": 0.2
+    }
+  ]
 }

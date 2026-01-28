@@ -1,4 +1,4 @@
-"""Configuration helpers for hierarchical (state-level) aggregation."""
+"""Configuration helpers for hierarchical aggregation levels."""
 
 from __future__ import annotations
 
@@ -8,33 +8,42 @@ from typing import Any, Mapping, Optional
 
 
 class StateAggregationApproach(str, Enum):
-    """Enumerates how candidates for the state aggregator are selected."""
+    """Enumerates how candidates for a hierarchy aggregator are selected."""
 
     RING_STAR = "ring_star"
     CUSTOM = "custom"
 
 
 @dataclass
-class StateAggregationConfig:
+class HierarchyLevelConfig:
     """
-    Runtime configuration for state-level aggregation rounds.
+    Runtime configuration for a hierarchy level (state, nation, etc.).
 
     Attributes:
-        enabled: Whether the state layer is active.
-        rounds_per_state: Number of clique rounds before a state round fires.
-        approach: Candidate selection approach (ring_star promotes central nodes).
-        state_id: Identifier used when anchoring state models on-chain.
+        enabled: Whether this level participates in the hierarchy.
+        scope_index: Ordering above the cluster layer (1=closest to clusters).
+        scope_name: Human-readable name (used in logs and bridge channels).
+        scope_id: Identifier used when anchoring models on-chain.
+        rounds_per_scope: Number of lower-level rounds before this level fires.
+        approach: Candidate election approach for collection-enabled levels.
         collection_timeout_seconds: Max time to wait for ECM coverage.
         digest_timeout_seconds: How long to wait for peer digests per round.
         consensus_timeout_seconds: Overall timeout for digest alignment.
         commit_timeout_seconds: Per-candidate wait before trying to commit.
+        apply_policy: Policy for assimilating upstream checkpoints.
+        apply_alpha: Interpolation weight when apply_policy="interpolate".
+        apply_layer_mask: Optional layer masks for selective application.
+        max_aggregators: Optional bound on concurrent aggregators.
+        fanout_per_group: Optional fan-out hint for multi-hop topologies.
+        fanout_per_scope: Optional fan-out hint for higher scopes.
     """
 
     enabled: bool = False
-    rounds_per_state: int = 0
-    approach: StateAggregationApproach = StateAggregationApproach.RING_STAR
-    state_id: str = "state_0"
+    scope_index: int = 1
     scope_name: str = "state"
+    scope_id: str = "scope_0"
+    rounds_per_scope: int = 0
+    approach: StateAggregationApproach = StateAggregationApproach.RING_STAR
     collection_timeout_seconds: float = 15.0
     digest_timeout_seconds: float = 5.0
     consensus_timeout_seconds: float = 30.0
@@ -42,46 +51,46 @@ class StateAggregationConfig:
     apply_policy: str = "replace"
     apply_alpha: float = 0.0
     apply_layer_mask: list[str] = field(default_factory=list)
+    max_aggregators: Optional[int] = None
+    fanout_per_group: Optional[int] = None
+    fanout_per_scope: Optional[int] = None
 
     @classmethod
-    def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "StateAggregationConfig":
+    def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "HierarchyLevelConfig":
         """Create a config instance from a mapping."""
         if not data:
             return cls()
+        aliases = {
+            "state_id": "scope_id",
+            "rounds_per_state": "rounds_per_scope",
+            "cluster_rounds": "rounds_per_scope",
+            "rounds_per_nation": "rounds_per_scope",
+            "state_rounds": "rounds_per_scope",
+            "rounds_per_parent": "rounds_per_scope",
+            "fanout_per_state": "fanout_per_scope",
+        }
         kwargs: dict[str, Any] = {}
-        for key in (
-            "enabled",
-            "rounds_per_state",
-            "cluster_rounds",
-            "approach",
-            "state_id",
-            "scope_name",
-            "collection_timeout_seconds",
-            "digest_timeout_seconds",
-            "consensus_timeout_seconds",
-            "commit_timeout_seconds",
-            "apply_policy",
-            "apply_alpha",
-            "apply_layer_mask",
-        ):
-            if key not in data:
-                continue
-            value = data[key]
-            if key == "approach":
-                kwargs[key] = StateAggregationApproach(str(value))
-            elif key == "enabled":
+        for raw_key, value in data.items():
+            key = aliases.get(raw_key, raw_key)
+            if key == "enabled":
                 kwargs[key] = bool(value)
-            elif key in ("rounds_per_state", "cluster_rounds"):
-                # Accept both legacy and new field names.
-                kwargs["rounds_per_state"] = max(0, int(value))
+            elif key == "scope_index":
+                kwargs[key] = max(1, int(value))
+            elif key == "rounds_per_scope":
+                kwargs[key] = max(0, int(value))
+            elif key == "approach":
+                kwargs[key] = StateAggregationApproach(str(value))
             elif key.endswith("_seconds"):
                 kwargs[key] = max(0.0, float(value))
-            elif key == "apply_policy":
-                kwargs[key] = str(value)
             elif key == "apply_alpha":
                 kwargs[key] = float(value)
             elif key == "apply_layer_mask":
-                kwargs[key] = list(value) if isinstance(value, (list, tuple)) else [str(value)]
+                if isinstance(value, (list, tuple)):
+                    kwargs[key] = [str(v) for v in value]
+                else:
+                    kwargs[key] = [str(value)]
+            elif key in ("max_aggregators", "fanout_per_group", "fanout_per_scope"):
+                kwargs[key] = int(value) if value is not None else None
             else:
                 kwargs[key] = str(value)
         return cls(**kwargs)
@@ -93,51 +102,13 @@ class StateAggregationConfig:
         Args:
             rounds_hint: Value taken from the training config (if any).
         """
-        if self.rounds_per_state <= 0 and rounds_hint:
-            self.rounds_per_state = max(1, int(rounds_hint))
-        if self.rounds_per_state > 0 and not self.enabled:
+        if self.rounds_per_scope <= 0 and rounds_hint:
+            self.rounds_per_scope = max(1, int(rounds_hint))
+        if self.rounds_per_scope > 0 and not self.enabled:
             self.enabled = True
 
+    @property
+    def collects_lower_scope(self) -> bool:
+        """Return True if this level runs collection/aggregation logic."""
+        return bool(self.collection_timeout_seconds > 0)
 
-@dataclass
-class NationAggregationConfig:
-    """Configuration for scheduling nation-level rounds (built atop state rounds)."""
-
-    enabled: bool = False
-    rounds_per_nation: int = 0
-    nation_id: str = "nation_0"
-    scope_name: str = "nation"
-    apply_policy: str = "interpolate"
-    apply_alpha: float = 0.2
-
-    @classmethod
-    def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "NationAggregationConfig":
-        if not data:
-            return cls()
-        kwargs: dict[str, Any] = {}
-        for key in (
-            "enabled",
-            "rounds_per_nation",
-            "state_rounds",
-            "nation_id",
-            "scope_name",
-            "apply_policy",
-            "apply_alpha",
-        ):
-            if key not in data:
-                continue
-            value = data[key]
-            if key == "enabled":
-                kwargs[key] = bool(value)
-            elif key in ("rounds_per_nation", "state_rounds"):
-                # Accept new schema naming.
-                kwargs["rounds_per_nation"] = max(0, int(value))
-            elif key == "scope_name":
-                kwargs[key] = str(value)
-            elif key == "apply_policy":
-                kwargs[key] = str(value)
-            elif key == "apply_alpha":
-                kwargs[key] = float(value)
-            else:
-                kwargs[key] = str(value)
-        return cls(**kwargs)

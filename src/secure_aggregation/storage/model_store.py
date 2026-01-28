@@ -21,7 +21,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import httpx
 import numpy as np
@@ -40,6 +40,19 @@ class AnchorScope(str, Enum):
     CLUSTER = "cluster"
     STATE = "state"
     CONTROL = "control"
+
+
+ScopeArg = Union["AnchorScope", str]
+
+
+def normalize_scope(scope: ScopeArg) -> str:
+    """Normalize scope identifiers (enum or string) to a lowercase string."""
+    if isinstance(scope, AnchorScope):
+        return scope.value
+    if scope is None:
+        return AnchorScope.CLUSTER.value
+    text = str(scope).strip().lower()
+    return text or AnchorScope.CLUSTER.value
 
 
 def compute_model_hash(model: np.ndarray) -> str:
@@ -94,7 +107,7 @@ class BlockchainInterface(ABC):
         cid: str,
         hash_val: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[str]:
         """Record model reference on-chain."""
         pass
@@ -110,7 +123,7 @@ class BlockchainInterface(ABC):
         scope_id: str,
         round_num: int,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
         suppress_not_found_log: bool = False,
     ) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash) for cluster/round."""
@@ -121,7 +134,7 @@ class BlockchainInterface(ABC):
         self,
         scope_id: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[ModelAnchor]:
         """Get most recent anchor for a cluster."""
         pass
@@ -135,7 +148,7 @@ class BlockchainInterface(ABC):
         cid: Optional[str] = None,
         hash_val: Optional[str] = None,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> None:
         """Persist a reference that was anchored elsewhere."""
         pass
@@ -293,7 +306,7 @@ class MockBlockchain(BlockchainInterface):
         cid: str,
         hash_val: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[str]:
         """Record model reference."""
         anchor = ModelAnchor(cluster_id=cluster_id, round_num=round_num, cid=cid, hash=hash_val)
@@ -320,7 +333,7 @@ class MockBlockchain(BlockchainInterface):
         cluster_id: str,
         round_num: int,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
         suppress_not_found_log: bool = False,
     ) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash)."""
@@ -347,7 +360,7 @@ class MockBlockchain(BlockchainInterface):
         self,
         cluster_id: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[ModelAnchor]:
         """Get most recent anchor for a cluster."""
         with self._registry_lock:
@@ -621,7 +634,7 @@ class RegistryBlockchain(BlockchainInterface):
         cid: str,
         hash_val: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> None:
         """Record model reference in registry."""
         try:
@@ -645,7 +658,7 @@ class RegistryBlockchain(BlockchainInterface):
         cluster_id: str,
         round_num: int,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[Tuple[str, str]]:
         """Retrieve anchored reference (cid, hash) from registry."""
         try:
@@ -665,7 +678,7 @@ class RegistryBlockchain(BlockchainInterface):
         self,
         cluster_id: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[ModelAnchor]:
         """Get most recent anchor for a cluster from registry."""
         try:
@@ -717,12 +730,13 @@ class LocalAnchorStore:
             return
         self._path.write_text(json.dumps(self._data, indent=2))
 
-    def _bucket_for_scope(self, scope: AnchorScope) -> str:
-        if scope == AnchorScope.STATE:
+    def _bucket_for_scope(self, scope: ScopeArg) -> str:
+        scope_key = normalize_scope(scope)
+        if scope_key == AnchorScope.STATE.value:
             return "states"
-        if scope == AnchorScope.CLUSTER:
+        if scope_key == AnchorScope.CLUSTER.value:
             return "clusters"
-        return f"scopes::{scope.value}"
+        return f"scopes::{scope_key}"
 
     def remember(
         self,
@@ -733,10 +747,11 @@ class LocalAnchorStore:
         hash_val: Optional[str],
         submitted_at: Optional[str] = None,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> None:
         with self._lock:
-            bucket_name = self._bucket_for_scope(scope)
+            scope_key = normalize_scope(scope)
+            bucket_name = self._bucket_for_scope(scope_key)
             clusters = self._data.setdefault(bucket_name, {})
             cluster_entry = clusters.setdefault(cluster_id, {"rounds": {}, "latest_round": -1})
             cluster_entry["rounds"][str(round_num)] = {
@@ -744,7 +759,7 @@ class LocalAnchorStore:
                 "cid": cid,
                 "hash": hash_val,
                 "submitted_at": submitted_at,
-                "entity": scope.value,
+                "entity": scope_key,
             }
             latest = cluster_entry.get("latest_round", -1)
             if round_num >= latest:
@@ -756,7 +771,7 @@ class LocalAnchorStore:
         cluster_id: str,
         round_num: int,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[Dict]:
         with self._lock:
             bucket_name = self._bucket_for_scope(scope)
@@ -771,7 +786,7 @@ class LocalAnchorStore:
         self,
         cluster_id: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[Tuple[int, Dict]]:
         with self._lock:
             bucket_name = self._bucket_for_scope(scope)
@@ -876,10 +891,10 @@ class GatewayBlockchain(BlockchainInterface):
             headers=self._auth_headers(),
             json={
                 "cluster_id": cluster_id,
+                "round": round_num,
                 "payload": {
                     "model_hash": hash_val,
                     "cid": cid,
-                    "round": round_num,
                 },
             },
         )
@@ -891,13 +906,17 @@ class GatewayBlockchain(BlockchainInterface):
         )
         return result
 
-    def _commit_state_model(self, state_id: str, state_round: int, cid: str, hash_val: str) -> Dict:
+    def _commit_scope_model(self, scope_key: str, scope_id: str, scope_round: int, cid: str, hash_val: str) -> Dict:
+        scope_key = scope_key.lower()
+        if scope_key == AnchorScope.CLUSTER.value:
+            return self._commit_cluster_model(scope_id, scope_round, cid, hash_val)
+        identifier_field = f"{scope_key}_id"
         response = self._client.post(
-            f"{self._base_url}/state/models",
+            f"{self._base_url}/{scope_key}/models",
             headers=self._auth_headers(),
             json={
-                "state_id": state_id,
-                "state_round": state_round,
+                identifier_field: scope_id,
+                "round": scope_round,
                 "payload": {
                     "model_hash": hash_val,
                     "cid": cid,
@@ -907,8 +926,11 @@ class GatewayBlockchain(BlockchainInterface):
         response.raise_for_status()
         result = response.json()
         logger.info(
-            f"{BLOCKCHAIN_LOG_TAG} Submitted state model state={state_id} round={state_round} "
-            f"data_id={result.get('data_id')}"
+            f"{BLOCKCHAIN_LOG_TAG} Submitted %s model id=%s round=%s data_id=%s",
+            scope_key,
+            scope_id,
+            scope_round,
+            result.get("data_id"),
         )
         return result
 
@@ -931,12 +953,15 @@ class GatewayBlockchain(BlockchainInterface):
             logger.error(f"{BLOCKCHAIN_LOG_TAG} Failed to fetch data_id={data_id}: {exc}")
             raise
 
-    def _fetch_model_metadata(self, scope: AnchorScope, data_id: str) -> Dict:
+    def _fetch_model_metadata(self, scope: ScopeArg, data_id: str) -> Dict:
+        scope_key = normalize_scope(scope)
         endpoint = "/data"
-        if scope == AnchorScope.CLUSTER:
+        if scope_key == AnchorScope.CLUSTER.value:
             endpoint = "/cluster/models"
-        elif scope == AnchorScope.STATE:
+        elif scope_key == AnchorScope.STATE.value:
             endpoint = "/state/models"
+        elif scope_key not in (AnchorScope.CONTROL.value,):
+            endpoint = f"/{scope_key}/models"
         try:
             response = self._client.get(
                 f"{self._base_url}{endpoint}/{data_id}",
@@ -945,12 +970,24 @@ class GatewayBlockchain(BlockchainInterface):
             response.raise_for_status()
             data = response.json()
             logger.info(
-                f"{BLOCKCHAIN_LOG_TAG} Retrieved {scope.value} record from gateway data_id={data_id}"
+                f"{BLOCKCHAIN_LOG_TAG} Retrieved %s record from gateway data_id=%s",
+                scope_key,
+                data_id,
             )
             return data
         except httpx.HTTPError as exc:
-            logger.error(f"{BLOCKCHAIN_LOG_TAG} Failed to fetch {scope.value} data_id={data_id}: {exc}")
+            logger.error(f"{BLOCKCHAIN_LOG_TAG} Failed to fetch %s data_id=%s: %s", scope_key, data_id, exc)
             raise
+
+    @staticmethod
+    def _encode_round_for_scope(scope_key: str, round_num: int) -> int:
+        """Convert 0-indexed rounds into the 1-indexed representation required on-chain."""
+        normalized = max(0, int(round_num))
+        if scope_key == AnchorScope.CLUSTER.value:
+            normalized += 1
+        if normalized < 1:
+            normalized = 1
+        return normalized
 
     def anchor(
         self,
@@ -959,22 +996,20 @@ class GatewayBlockchain(BlockchainInterface):
         cid: str,
         hash_val: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[str]:
-        if not isinstance(scope, AnchorScope):
-            scope = AnchorScope(scope)
-        if scope == AnchorScope.CLUSTER:
-            record = self._commit_cluster_model(cluster_id, round_num, cid, hash_val)
-        elif scope == AnchorScope.STATE:
-            record = self._commit_state_model(cluster_id, round_num, cid, hash_val)
-        else:
+        scope_key = normalize_scope(scope)
+        chain_round = self._encode_round_for_scope(scope_key, round_num)
+        if scope_key == AnchorScope.CONTROL.value:
             payload = {
                 "cluster_id": cluster_id,
-                "round": round_num,
+                "round": chain_round,
                 "cid": cid,
                 "hash": hash_val,
             }
             record = self._commit_payload(payload)
+        else:
+            record = self._commit_scope_model(scope_key, cluster_id, chain_round, cid, hash_val)
         data_id = record.get("data_id")
         submitted_at = record.get("submitted_at")
         if data_id:
@@ -985,10 +1020,15 @@ class GatewayBlockchain(BlockchainInterface):
                 cid,
                 hash_val,
                 submitted_at,
-                scope=scope,
+                scope=scope_key,
             )
             logger.info(
-                f"{BLOCKCHAIN_LOG_TAG} Anchored {scope.value} model scope={cluster_id}, round={round_num}, data_id={data_id}"
+                "%s Anchored %s model scope=%s, round=%s, data_id=%s",
+                BLOCKCHAIN_LOG_TAG,
+                scope_key,
+                cluster_id,
+                round_num,
+                data_id,
             )
         return data_id
 
@@ -1000,9 +1040,10 @@ class GatewayBlockchain(BlockchainInterface):
         cid: Optional[str] = None,
         hash_val: Optional[str] = None,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> None:
-        self._store.remember(cluster_id, round_num, data_id, cid, hash_val, scope=scope)
+        scope_key = normalize_scope(scope)
+        self._store.remember(cluster_id, round_num, data_id, cid, hash_val, scope=scope_key)
 
     @staticmethod
     def _is_control_cluster(cluster_id: str) -> bool:
@@ -1012,32 +1053,24 @@ class GatewayBlockchain(BlockchainInterface):
         self,
         cluster_id: str,
         round_num: int,
-        scope: AnchorScope,
+        scope: ScopeArg,
     ) -> Optional[ModelAnchor]:
-        entry = self._store.get_round(cluster_id, round_num, scope=scope)
+        scope_key = normalize_scope(scope)
+        entry = self._store.get_round(cluster_id, round_num, scope=scope_key)
         if entry is None:
             return None
         cid = entry.get("cid")
         hash_val = entry.get("hash")
         data_id = entry.get("data_id")
         submitted_at = entry.get("submitted_at")
-        entry_scope_value = entry.get("entity")
-        if entry_scope_value:
-            try:
-                scope = AnchorScope(entry_scope_value)
-            except ValueError:
-                scope = AnchorScope.CLUSTER
+        entry_scope_value = normalize_scope(entry.get("entity") or scope_key)
         if (cid is None or hash_val is None) and data_id:
             try:
-                if scope in (AnchorScope.CLUSTER, AnchorScope.STATE):
-                    record = self._fetch_model_metadata(scope, data_id)
+                if entry_scope_value in (AnchorScope.CLUSTER.value, AnchorScope.STATE.value):
+                    record = self._fetch_model_metadata(entry_scope_value, data_id)
                     payload = record.get("payload", {})
-                    if scope == AnchorScope.CLUSTER:
-                        cid = payload.get("cid") or payload.get("model_cid")
-                        hash_val = payload.get("model_hash")
-                    else:
-                        cid = payload.get("cid") or payload.get("model_cid")
-                        hash_val = payload.get("model_hash")
+                    cid = payload.get("cid") or payload.get("model_cid")
+                    hash_val = payload.get("model_hash")
                 else:
                     record = self._fetch_control_data(data_id)
                     payload = record.get("payload", {})
@@ -1059,12 +1092,12 @@ class GatewayBlockchain(BlockchainInterface):
                     cid,
                     hash_val,
                     submitted_at,
-                    scope=scope,
+                    scope=entry_scope_value,
                 )
             else:
-                    logger.warning(
-                        f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash when fetching data_id={data_id} scope={cluster_id}"
-                    )
+                logger.warning(
+                    f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash when fetching data_id={data_id} scope={cluster_id}"
+                )
 
         if not cid or not hash_val:
             return None
@@ -1077,16 +1110,23 @@ class GatewayBlockchain(BlockchainInterface):
             submitted_at=submitted_at,
         )
 
-    def _query_state_model(self, state_id: str, state_round: int) -> Optional[ModelAnchor]:
+    def _query_scope_model(self, scope_key: str, scope_id: str, scope_round: int) -> Optional[ModelAnchor]:
+        scope_key = normalize_scope(scope_key)
+        identifier_field = f"{scope_key}_id"
+        chain_round = self._encode_round_for_scope(scope_key, scope_round)
         try:
             response = self._client.get(
-                f"{self._base_url}/state/models",
+                f"{self._base_url}/{scope_key}/models",
                 headers=self._auth_headers(),
-                params={"state": state_id, "round": state_round},
+                params={identifier_field: scope_id, "round": chain_round},
             )
             if response.status_code == 404:
                 logger.debug(
-                    f"{BLOCKCHAIN_LOG_TAG} No state model yet for state={state_id} round={state_round}"
+                    "%s No %s model yet for scope=%s round=%s",
+                    BLOCKCHAIN_LOG_TAG,
+                    scope_key,
+                    scope_id,
+                    scope_round,
                 )
                 return None
             response.raise_for_status()
@@ -1099,7 +1139,11 @@ class GatewayBlockchain(BlockchainInterface):
             raise
         except httpx.HTTPError as exc:
             logger.error(
-                f"{BLOCKCHAIN_LOG_TAG} Failed to query state model state={state_id} round={state_round}: {exc}"
+                f"{BLOCKCHAIN_LOG_TAG} Failed to query %s model scope=%s round=%s: %s",
+                scope_key,
+                scope_id,
+                scope_round,
+                exc,
             )
             raise
         record = response.json()
@@ -1118,26 +1162,33 @@ class GatewayBlockchain(BlockchainInterface):
         hash_val = payload.get("model_hash")
         if not cid or not hash_val:
             logger.warning(
-                f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash in state response state={state_id} round={state_round}"
+                f"{BLOCKCHAIN_LOG_TAG} Missing CID/hash in %s response scope=%s round=%s",
+                scope_key,
+                scope_id,
+                scope_round,
             )
             return None
-        data_id = record.get("data_id") or f"state::{state_id}::{state_round}"
+        data_id = record.get("data_id") or f"{scope_key}::{scope_id}::{scope_round}"
         submitted_at = record.get("submitted_at")
         self._store.remember(
-            state_id,
-            state_round,
+            scope_id,
+            scope_round,
             data_id,
             cid,
             hash_val,
             submitted_at,
-            scope=AnchorScope.STATE,
+            scope=scope_key,
         )
         logger.info(
-            f"{BLOCKCHAIN_LOG_TAG} Discovered state model state={state_id} round={state_round} cid={cid[:16]}..."
+            f"{BLOCKCHAIN_LOG_TAG} Discovered %s model scope=%s round=%s cid=%s...",
+            scope_key,
+            scope_id,
+            scope_round,
+            cid[:16],
         )
         return ModelAnchor(
-            cluster_id=state_id,
-            round_num=state_round,
+            cluster_id=scope_id,
+            round_num=scope_round,
             cid=cid,
             hash=hash_val,
             data_id=data_id,
@@ -1149,22 +1200,26 @@ class GatewayBlockchain(BlockchainInterface):
         cluster_id: str,
         round_num: int,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
         suppress_not_found_log: bool = False,
     ) -> Optional[Tuple[str, str]]:
-        anchor = self._resolve_entry(cluster_id, round_num, scope)
-        if anchor is None and scope == AnchorScope.STATE:
+        scope_key = normalize_scope(scope)
+        anchor = self._resolve_entry(cluster_id, round_num, scope_key)
+        if anchor is None and scope_key not in (AnchorScope.CLUSTER.value, AnchorScope.CONTROL.value):
             try:
-                anchor = self._query_state_model(cluster_id, round_num)
+                anchor = self._query_scope_model(scope_key, cluster_id, round_num)
             except httpx.HTTPError:
                 if not suppress_not_found_log:
                     logger.warning(
-                        f"{BLOCKCHAIN_LOG_TAG} Failed querying state model for state={cluster_id} round={round_num}"
+                        f"{BLOCKCHAIN_LOG_TAG} Failed querying %s model for scope=%s round=%s",
+                        scope_key,
+                        cluster_id,
+                        round_num,
                     )
                 return None
         if anchor is None:
             if not suppress_not_found_log:
-                if scope == AnchorScope.CONTROL or self._is_control_cluster(cluster_id):
+                if scope_key == AnchorScope.CONTROL.value or self._is_control_cluster(cluster_id):
                     logger.debug(
                         f"{BLOCKCHAIN_LOG_TAG} No anchor found for control cluster={cluster_id}, round={round_num}"
                     )
@@ -1182,17 +1237,18 @@ class GatewayBlockchain(BlockchainInterface):
         self,
         cluster_id: str,
         *,
-        scope: AnchorScope = AnchorScope.CLUSTER,
+        scope: ScopeArg = AnchorScope.CLUSTER,
     ) -> Optional[ModelAnchor]:
-        latest = self._store.get_latest(cluster_id, scope=scope)
+        scope_key = normalize_scope(scope)
+        latest = self._store.get_latest(cluster_id, scope=scope_key)
         if latest is None:
-            if scope == AnchorScope.CONTROL or self._is_control_cluster(cluster_id):
+            if scope_key == AnchorScope.CONTROL.value or self._is_control_cluster(cluster_id):
                 logger.debug(f"{BLOCKCHAIN_LOG_TAG} No latest anchor for control cluster={cluster_id}")
             else:
                 logger.warning(f"{BLOCKCHAIN_LOG_TAG} No latest anchor for cluster={cluster_id}")
             return None
         round_num, _ = latest
-        anchor = self._resolve_entry(cluster_id, round_num, scope)
+        anchor = self._resolve_entry(cluster_id, round_num, scope_key)
         if anchor:
             logger.info(
                 f"{BLOCKCHAIN_LOG_TAG} Latest anchor cluster={cluster_id}, round={anchor.round_num}, cid={anchor.cid[:16]}..."

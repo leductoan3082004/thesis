@@ -8,9 +8,8 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from secure_aggregation.state.config import StateAggregationConfig
+from secure_aggregation.state.config import HierarchyLevelConfig
 from secure_aggregation.storage.model_store import (
-    AnchorScope,
     BlockchainInterface,
     IPFSInterface,
     compute_model_hash,
@@ -41,7 +40,7 @@ class StateAggregator:
 
     def __init__(
         self,
-        config: StateAggregationConfig,
+        config: HierarchyLevelConfig,
         ipfs: Optional[IPFSInterface],
         blockchain: Optional[BlockchainInterface],
     ) -> None:
@@ -157,16 +156,17 @@ class StateAggregator:
         hash_val = compute_model_hash(state_model)
         data_id: Optional[str] = None
         if self.blockchain is not None:
+            scope_key = getattr(self.config, "scope_name", "state").lower()
             try:
                 data_id = self.blockchain.anchor(
-                    self.config.state_id,
+                    self.config.scope_id,
                     state_round,
                     cid,
                     hash_val,
-                    scope=AnchorScope.STATE,
+                    scope=scope_key,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.error("Failed to anchor state model round=%s: %s", state_round, exc)
+                logger.error("Failed to anchor %s model round=%s: %s", scope_key, state_round, exc)
         return cid, hash_val, data_id
 
     def get_anchor(
@@ -178,9 +178,10 @@ class StateAggregator:
         """Fetch the anchored state model reference if available."""
         if self.blockchain is None:
             return None
+        scope_key = getattr(self.config, "scope_name", "state").lower()
         return self.blockchain.get_anchor(
-            self.config.state_id,
+            self.config.scope_id,
             state_round,
-            scope=AnchorScope.STATE,
+            scope=scope_key,
             suppress_not_found_log=suppress_not_found_log,
         )

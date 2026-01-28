@@ -15,13 +15,13 @@ All mechanics live primarily in `secure_aggregation.communication.node_service.N
    - TTP populates `central_nodes` (ring-star “hub” clique) and `cluster_ids`.  
    - All nodes can fetch the latest version from the blockchain registry; state aggregators use it to know which clusters must contribute ECMs.
 3. **System Configuration (`system-config.json`)**  
-   - Carries `state_aggregation` and `nation_aggregation` blocks.  
-   - Fields include `enabled`, scheduling interval (`rounds_per_state`/`rounds_per_nation`), consensus/collection timeouts, approach (`ring_star`), and identifiers used when anchoring models.
+   - Carries a `hierarchy_levels` array. Each entry declares `scope_index` (1 = closest to clusters), `scope_name`, `scope_id`, `rounds_per_scope`, and optional election/timeout knobs.  
+   - Shared defaults (timeouts, policies, etc.) live under `hierarchy_defaults` and are merged into every level.
 
 ## 3. State-Level Flow
 
 ### 3.1 Candidate Election
-1. Nodes parse `state_aggregation` at startup (`NodeService._load_state_config`).  
+1. Nodes parse the level-1 hierarchy config (scope_index=1) at startup (`NodeService._load_scope_config`).  
 2. When central metadata arrives, `_configure_state_layer()`:
    - Derives the candidate pool. For `ring_star`, candidates are `central_nodes`.  
    - Creates a dedicated `ECMBuffer` for candidates so state digests do not evict clique-level ECMs.  
@@ -52,7 +52,7 @@ All mechanics live primarily in `secure_aggregation.communication.node_service.N
 ### 3.6 Commit and Anchoring
 1. `_try_state_commit()` rotates the commit leader each round (`leader_index = state_round % len(candidates)`) to distribute blockchain usage.  
 2. The active leader:
-   - Calls `StateAggregator.publish_state_model()` to add the merged tensor to IPFS (`cid`) and anchor the CID/hash on-chain under `AnchorScope.STATE`.  
+   - Calls `StateAggregator.publish_state_model()` to add the merged tensor to IPFS (`cid`) and anchor the CID/hash on-chain under the state namespace ( `/state/models`).  
    - If anchoring fails, the next candidate waits for the public anchor; if none appears before `commit_timeout_seconds`, the function iterates to the next candidate.
 3. Non-leaders poll `_wait_for_state_anchor()` to observe the blockchain commit and mark the round as completed once seen.
 4. After anchoring, the merged model stays cached for downstream application, and the digest/ECM caches for that round are cleared.
@@ -105,7 +105,7 @@ With this pattern, adding “nation”, “federation”, or deeper layers is pu
 ## 5. Nation-Level Flow (Example)
 
 ### 5.1 Configuration and Scheduling
-- `NationAggregationConfig` adds `max_aggregators`, `fanout_per_state`, and `rounds_per_nation`.  
+- Higher-level `HierarchyLevelConfig` entries add knobs like `max_aggregators`, `fanout_per_scope`, and `rounds_per_scope`.  
 - The tier scheduler watches completed state rounds; whenever `(state_round % rounds_per_nation) == 0`, it enqueues a nation round with a pointer to the triggering state round.  
 - The active config defines the `nation::NATION_ID` digest channel and the anchor scope (either `STATE` or a dedicated `NATION` namespace).  
 
@@ -118,7 +118,7 @@ With this pattern, adding “nation”, “federation”, or deeper layers is pu
 1. **Scheduling** – After every `rounds_per_nation` state rounds, `_maybe_schedule_tier_round(nation_cfg)` enqueues a nation round with pointer to the triggering state round.  
 2. **Collection** – Aggregators fetch references from lower-tier nodes using the fan-out rules. They verify that every state group is represented, respecting per-group quorum thresholds.  
 3. **Merge & digest** – Aggregators download tensors from IPFS, merge into the nation model, and exchange digests on the `nation::NATION_ID` channel. Multiple aggregators cross-validate hash equality before proceeding.  
-4. **Commit** – A rotating leader anchors the nation model under `AnchorScope.STATE` (or a new `NATION` scope) and uploads to IPFS. Other aggregators observe the anchor and mark the round complete.  
+4. **Commit** – A rotating leader anchors the nation model under its namespace (e.g., `/nation/models`) and uploads to IPFS. Other aggregators observe the anchor and mark the round complete.  
 5. **Distribution** – Using the same temporary connections, aggregators notify at least one node per state that a new nation model is available. States then replay the anchor and push it down to their respective cliques.
 
 This example illustrates how higher tiers inherit the same primitives—only the selection policy, fan-out, and scope identifiers change.
@@ -146,7 +146,7 @@ Common `ApplyPolicy` strategies (configurable per tier):
   \[
   W_{t+1}^{(T-1)} = \alpha \, W_{t+1}^{(T)} + (1 - \alpha) \, W_{t}^{(T-1)}, \quad 0 < \alpha < 0.5
   \]
-  where \(W_{t}^{(T-1)}\) is the downstream baseline before the update, \(W_{t+1}^{(T)}\) is the freshly anchored upstream model, and \(\alpha\) is supplied via configuration (e.g., `state_aggregation.apply_alpha = 0.2`).  
+  where \(W_{t}^{(T-1)}\) is the downstream baseline before the update, \(W_{t+1}^{(T)}\) is the freshly anchored upstream model, and \(\alpha\) is supplied via configuration (e.g., the level-1 `apply_alpha = 0.2`).  
 - **Adaptive Trust** (inspired by FedProx/Elastic Averaging): dynamically set \(\alpha\) based on divergence or group reliability.  
 - **Layer-wise Injection**: only replace specific layers (e.g., classifier head) while leaving feature backbone untouched.
 
@@ -158,14 +158,14 @@ Propagation is triggered only when the system reaches a tier that has no higher-
    - If a higher tier (e.g., continent) is scheduled or running, nation nodes defer propagation until that tier completes. Otherwise, each state aggregator polls `AnchorScope.NATION`, retrieves `M_nation`, and applies the configured policy (default: interpolated merge) to produce `M_state'`.  
    - `M_state'` becomes the new baseline for state-level rounds and is cached as the reference when dispatching ECMs to nation aggregators during the next cycle.
 2. **State → Cluster**  
-   - State anchors already exist today; extend `_maybe_apply_state_model()` to support both full replace or interpolation (controlled via config `state_aggregation.apply_policy`). If the state tier still has pending state rounds for the same macro-cycle, propagation is postponed until the state round queue drains.  
+   - State anchors already exist today; `_maybe_apply_scope_model()` should obey each level's `apply_policy` from its hierarchy config. If the state tier still has pending rounds for the same macro-cycle, propagation is postponed until the scope round queue drains.  
    - After applying, call `_prime_convergence_tracker_state()` so delta metrics reset relative to the updated baseline.
 3. **Cluster → Node**  
    - When clusters finish secure aggregation and no more cluster-level windows remain before the next higher-tier trigger, nodes optionally perform a final blend with their local cache (useful for devices with personalization layers). This is already supported via `NodeEngine.merge_with_remote()`; exposing the same policy knobs keeps all tiers consistent.
 
 ### 7.3 Implementation Hooks
 - Introduce a shared utility `apply_tier_update(tier_cfg, upstream_tensor, local_tensor)` returning the blended tensor and metadata (`alpha_used`, `source_round`).  
-- Extend `StateAggregationConfig`/`NationAggregationConfig` with policy fields (including the interpolation weight \(\alpha\)):
+- Each `HierarchyLevelConfig` includes policy fields (including the interpolation weight \(\alpha\)):
   ```json
   {
     "apply_policy": "interpolate",

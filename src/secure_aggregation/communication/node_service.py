@@ -7,7 +7,7 @@ import math
 import os
 import re
 import time
-from collections import deque
+from collections import deque, defaultdict
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -25,15 +25,14 @@ from secure_aggregation.communication.aggregator_service import (
 )
 from secure_aggregation.communication.bridge_service import (
     BridgeClient,
-    STATE_SIGNAL_PREFIX,
     serve_bridge,
 )
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
 from secure_aggregation.communication.hierarchy_mixin import (
     HierarchyMixin,
-    StateDigest,
-    build_state_signal_cid,
-    parse_state_digest_signal,
+    ScopeDigest,
+    ScopeRoundHandler,
+    parse_scope_digest_signal,
 )
 from secure_aggregation.convergence import ConvergenceConfig, ConvergenceState, ConvergenceTracker
 from secure_aggregation.convergence.central_broadcast import (
@@ -47,7 +46,7 @@ from secure_aggregation.data import dirichlet_partition, get_labels, load_datase
 from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
-from secure_aggregation.state import NationAggregationConfig, StateAggregator
+from secure_aggregation.state import HierarchyLevelConfig, StateAggregator
 from secure_aggregation.storage.model_store import (
     AnchorScope,
     BlockchainInterface,
@@ -235,37 +234,78 @@ class NodeService(HierarchyMixin):
             self.higher_scope_name,
             higher_scope_config,
         ) = self._select_scope_roles(self.scope_configs)
-        self.higher_scope_config = higher_scope_config or NationAggregationConfig()
+        self.higher_scope_config = higher_scope_config or HierarchyLevelConfig(scope_index=self.scope_config.scope_index + 1)
         logger.info(
-            "%s aggregation config: enabled=%s, rounds_per_parent=%s, scope_id=%s, approach=%s",
+            "%s aggregation config: enabled=%s, rounds_per_scope=%s, scope_id=%s, approach=%s",
             self._scope_label_upper(),
             self.scope_config.enabled,
-            self.scope_config.rounds_per_state,
-            self.scope_config.state_id,
+            self.scope_config.rounds_per_scope,
+            self.scope_config.scope_id,
             self.scope_config.approach.value if hasattr(self.scope_config.approach, "value") else self.scope_config.approach,
         )
         logger.info(
             "%s scheduling config: enabled=%s, rounds_per_scope=%s, apply_policy=%s, apply_alpha=%.3f",
             self._higher_scope_label_upper(),
             self.higher_scope_config.enabled,
-            getattr(self.higher_scope_config, "rounds_per_nation", 0),
+            self.higher_scope_config.rounds_per_scope,
             getattr(self.higher_scope_config, "apply_policy", "replace"),
             float(getattr(self.higher_scope_config, "apply_alpha", 0.0) or 0.0),
         )
-        self.state_candidates: List[str] = []
-        self.is_state_candidate = False
-        self.state_ecm_buffer: Optional[ECMBuffer] = None
-        self.state_aggregator: Optional[StateAggregator] = None
-        self._state_round_queue: Deque[Tuple[int, int]] = deque()
+        self.scope_candidates: List[str] = []
+        self.is_scope_candidate = False
+        self.scope_ecm_buffer: Optional[ECMBuffer] = None
+        self.scope_aggregator: Optional[StateAggregator] = None
+        self._scope_round_queue: Deque[Tuple[int, int]] = deque()
         self._bridge_ecm_hooks: List[Callable[[ECM], None]] = []
-        self._state_rounds_logged: Set[int] = set()
-        self._last_applied_state_round: int = 0
-        self._pending_nation_rounds: Set[int] = set()
-        self._nation_round_to_state_round: Dict[int, int] = {}
-        self._state_round_cache: Dict[int, Any] = {}
-        self._state_round_hashes: Dict[int, str] = {}
-        self._state_digest_records: Dict[int, Dict[str, StateDigest]] = {}
-        self._state_committed_rounds: Set[int] = set()
+        self._scope_rounds_logged: Set[int] = set()
+        self._scope_last_applied_rounds: Dict[str, int] = defaultdict(int)
+        self._scope_round_cache: Dict[int, Any] = {}
+        self._scope_round_hashes: Dict[int, str] = {}
+        self._scope_digest_records: Dict[int, Dict[str, ScopeDigest]] = {}
+        self._scope_committed_rounds: Set[int] = set()
+        self._scope_round_handlers: Dict[str, ScopeRoundHandler] = {}
+        self._register_scope_round_handler(
+            ScopeRoundHandler(
+                scope_name=self.scope_name,
+                config=self.scope_config,
+                trigger_label="cluster",
+                round_queue=self._scope_round_queue,
+                rounds_logged=self._scope_rounds_logged,
+                round_cache=self._scope_round_cache,
+                round_hashes=self._scope_round_hashes,
+                digest_records=self._scope_digest_records,
+                committed_rounds=self._scope_committed_rounds,
+                is_candidate_fn=lambda: self.is_scope_candidate,
+                dispatch_fn=self._dispatch_scope_artifacts,
+                execute_fn=self._execute_scope_round,
+                schedule_higher_fn=self._maybe_schedule_higher_round,
+                budget_fn=self._scope_round_budget,
+            )
+        )
+        if self.higher_scope_name:
+            higher_queue: Deque[Tuple[int, int]] = deque()
+            higher_handler = ScopeRoundHandler(
+                scope_name=self.higher_scope_name,
+                config=self.higher_scope_config,
+                trigger_label=self.scope_name,
+                round_queue=higher_queue,
+                rounds_logged=set(),
+                round_cache={},
+                round_hashes={},
+                digest_records={},
+                committed_rounds=set(),
+                is_candidate_fn=lambda: False,
+                dispatch_fn=lambda scope_round, parent_round, name=self.higher_scope_name, trigger=self.scope_name: self._dispatch_placeholder_scope_round(
+                    name, trigger, scope_round, parent_round
+                ),
+                execute_fn=lambda scope_round, parent_round, name=self.higher_scope_name: self._execute_placeholder_scope_round(
+                    name, scope_round, parent_round
+                ),
+            )
+            self._register_scope_round_handler(higher_handler)
+        self._scope_execution_order = [
+            name for name, _ in sorted(self.scope_configs.items(), key=lambda item: item[1].scope_index)
+        ]
 
         # Convergence state
         self.convergence_config = self._load_convergence_config()
@@ -846,6 +886,67 @@ class NodeService(HierarchyMixin):
             logger.info(f"Elected global aggregator for round {round_idx + 1}: {aggregator_id}")
         return aggregator_id
 
+    def _dispatch_placeholder_scope_round(self, scope_name: str, trigger_label: str, scope_round: int, source_round: int) -> None:
+        logger.info(
+            "Dispatch placeholder for %s round %d after %s round %d",
+            scope_name.upper(),
+            scope_round,
+            trigger_label,
+            source_round,
+        )
+
+    def _execute_placeholder_scope_round(self, scope_name: str, scope_round: int, source_round: int) -> bool:
+        logger.info(
+            "Executing placeholder %s round %d (triggered by %s round %d)",
+            scope_name.upper(),
+            scope_round,
+            self.scope_name,
+            source_round,
+        )
+        return True
+
+    def _handle_completed_scope_round(self, scope_name: str, scope_round: int, source_round: int) -> None:
+        logger.info(
+            "Completed %s round %d (scheduled after %s round %d)",
+            scope_name.upper(),
+            scope_round,
+            self.scope_name,
+            source_round,
+        )
+        if scope_name != self.scope_name:
+            config = self._get_scope_config_entry(scope_name)
+            if config:
+                self._maybe_apply_external_scope_model(scope_name, config)
+
+    def _drain_scope_rounds(self) -> bool:
+        """Execute pending scope rounds (state, nation, etc.) before proceeding."""
+        ran_any = False
+        execution_order = getattr(self, "_scope_execution_order", [self.scope_name])
+        while True:
+            executed = False
+            for scope in execution_order:
+                handler_name = None if scope == self.scope_name else scope
+                result = self._run_next_scope_round(handler_name)
+                if result is None:
+                    continue
+                executed = True
+                ran_any = True
+                scope_name, scope_round, source_round = result
+                if scope_name == self.scope_name:
+                    self._maybe_apply_scope_model(source_round)
+                else:
+                    self._handle_completed_scope_round(scope_name, scope_round, source_round)
+                break
+            if not executed:
+                break
+        for scope in execution_order:
+            if scope == self.scope_name:
+                continue
+            config = self._get_scope_config_entry(scope)
+            if config:
+                self._maybe_apply_external_scope_model(scope, config)
+        return ran_any
+
     def start_aggregator_server(self) -> None:
         """Start aggregator gRPC server if this node is elected."""
         if self.aggregator_server is not None:
@@ -987,8 +1088,8 @@ class NodeService(HierarchyMixin):
     def _update_bridge_hooks(self) -> None:
         """Rebuild the list of ECM hooks and restart the bridge server if needed."""
         hooks: List[Callable[[ECM], None]] = []
-        if self.state_ecm_buffer is not None:
-            hooks.append(self.state_ecm_buffer.add)
+        if self.scope_ecm_buffer is not None:
+            hooks.append(self.scope_ecm_buffer.add)
         if hooks == self._bridge_ecm_hooks:
             return
         self._bridge_ecm_hooks = hooks
@@ -1638,9 +1739,7 @@ class NodeService(HierarchyMixin):
         stop_reason = ""
 
         while self.current_round < max_rounds and not should_stop:
-            state_parent_round = self._run_next_scope_round()
-            if state_parent_round is not None:
-                self._maybe_apply_scope_model(state_parent_round)
+            if self._drain_scope_rounds():
                 continue
             round_idx = self.current_round
             round_start_time = time.monotonic()
@@ -1945,16 +2044,13 @@ class NodeService(HierarchyMixin):
             logger.info("Waiting before next cluster round...")
 
             self._maybe_schedule_scope_round(round_idx)
+            self._drain_scope_rounds()
 
             time.sleep(5)
             self.current_round += 1
 
         self._log_final_model_status()
-        while True:
-            state_parent_round = self._run_next_scope_round()
-            if state_parent_round is None:
-                break
-            self._maybe_apply_scope_model(state_parent_round)
+        self._drain_scope_rounds()
         logger.info("\n" + "="*60)
         logger.info(f"Training completed after {self.current_round + 1} rounds (reason: {stop_reason or 'max_rounds'})")
         logger.info("="*60)
@@ -2028,7 +2124,7 @@ class NodeService(HierarchyMixin):
             return
         signals = self.ecm_buffer.pop_signal_ecms()
         for ecm in signals:
-            digest = parse_state_digest_signal(ecm)
+            digest = parse_scope_digest_signal(ecm)
             if digest:
                 self._record_scope_digest(digest)
 

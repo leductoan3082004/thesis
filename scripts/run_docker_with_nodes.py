@@ -16,7 +16,7 @@ import shlex
 from copy import deepcopy
 from http import client as http_client
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -1128,6 +1128,44 @@ def resolve_system_config_path(cli_path: Optional[Path]) -> Path:
     return (ROOT_DIR / "config" / SYSTEM_CONFIG_FILENAME).resolve()
 
 
+def _load_system_config_data(system_config_path: Path) -> Dict[str, Any]:
+    if not system_config_path.exists():
+        raise SystemExit(
+            f"System config not found at {system_config_path}. "
+            "Pass --nodes or create the file with hierarchy/roster settings.",
+        )
+    try:
+        return json.loads(system_config_path.read_text())
+    except json.JSONDecodeError as exc:  # noqa: TRY003
+        raise SystemExit(f"Invalid JSON in system config {system_config_path}: {exc}") from exc
+
+
+def _extract_scope_names(config_data: Dict[str, Any]) -> List[str]:
+    levels = config_data.get("hierarchy_levels")
+    if not isinstance(levels, list):
+        return ["state"]
+
+    def _order(level: Dict[str, Any]) -> int:
+        try:
+            return int(level.get("scope_index") or level.get("scopeIndex"))
+        except (TypeError, ValueError):
+            return sys.maxsize
+
+    ordered = sorted(levels, key=_order)
+    scopes: List[str] = []
+    seen: set[str] = set()
+    for level in ordered:
+        scope_name = level.get("scope_name") or level.get("scopeName")
+        if not scope_name:
+            continue
+        scope_str = str(scope_name)
+        if scope_str in seen:
+            continue
+        seen.add(scope_str)
+        scopes.append(scope_str)
+    return scopes or ["state"]
+
+
 def _extract_node_count(config_data: Dict[str, Any]) -> Optional[int]:
     candidate = config_data.get("number_of_nodes")
     if candidate is not None:
@@ -1138,22 +1176,18 @@ def _extract_node_count(config_data: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def determine_node_count(cli_nodes: Optional[int], system_config_path: Path) -> int:
+def determine_node_count(
+    cli_nodes: Optional[int],
+    system_config_path: Path,
+    config_data: Optional[Dict[str, Any]] = None,
+) -> int:
     if cli_nodes is not None:
         if cli_nodes < 1:
             raise SystemExit("Number of nodes must be >= 1")
         return cli_nodes
 
-    if not system_config_path.exists():
-        raise SystemExit(
-            f"System config not found at {system_config_path}. "
-            "Pass --nodes or create the file with number_of_nodes defined.",
-        )
-
-    try:
-        config_data = json.loads(system_config_path.read_text())
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Invalid JSON in system config {system_config_path}: {exc}") from exc
+    if config_data is None:
+        config_data = _load_system_config_data(system_config_path)
 
     node_count = _extract_node_count(config_data)
     if node_count is None:
@@ -1197,22 +1231,22 @@ def _normalize_trainer_id(raw: Optional[str], seq_index: int) -> str:
     return f"trainer-node-{seq_index + 1:03d}"
 
 
-def _load_state_assignments(state_map_path: Optional[Path]) -> List[Tuple[str, str, str]]:
+def _load_state_assignments(
+    state_map_path: Optional[Path],
+    scope_names: Sequence[str],
+) -> List[Dict[str, Any]]:
     """
-    Load state-to-node assignments from configuration file.
+    Load state-to-node assignments from configuration file and attach scope metadata.
 
-    The JSON schema is:
+    The base schema mirrors previous releases:
     {
         "states": [
-            {"state_id": "state_a", "count": 20},
-            {"state_id": "state_b", "count": 15}
+            {"state_id": "state_a", "count": 20, "nodes": [...], "nation": "nation_0"}
         ]
     }
-    The system always creates container names sequentially (node_0, node_1, ...),
-    but each state may optionally define the logical node identifiers via the
-    "nodes" list. When provided, those identifiers become the node_id and
-    blockchain identity inside the generated config while the container keeps its
-    predictable node_X name.
+    Additional hierarchy scopes (e.g., "nation") can be specified directly on the
+    state entry (or under a nested "scopes" object) and will be propagated to every
+    trainer belonging to that state.
     """
     if state_map_path is None:
         return []
@@ -1227,7 +1261,40 @@ def _load_state_assignments(state_map_path: Optional[Path]) -> List[Tuple[str, s
     if not isinstance(states, list) or not states:
         raise SystemExit(f"State map {state_map_path} must contain a non-empty 'states' list.")
 
-    assignments: List[Tuple[str, str, str]] = []
+    base_scope_name = scope_names[0] if scope_names else "state"
+
+    def _extract_scope_value(entry: Dict[str, Any], scope: str) -> Optional[str]:
+        for key in (scope, f"{scope}_id", f"{scope}_name"):
+            value = entry.get(key)
+            if value is None:
+                continue
+            value_str = str(value).strip()
+            if value_str:
+                return value_str
+        scopes_blob = entry.get("scopes")
+        if isinstance(scopes_blob, dict):
+            scoped_value = scopes_blob.get(scope)
+            if scoped_value is not None:
+                scoped_str = str(scoped_value).strip()
+                if scoped_str:
+                    return scoped_str
+        return None
+
+    def _build_scope_map(entry: Dict[str, Any], state_value: str) -> Dict[str, str]:
+        scope_map: Dict[str, str] = {}
+        if state_value:
+            scope_map[base_scope_name] = state_value
+            if base_scope_name != "state":
+                scope_map.setdefault("state", state_value)
+        for scope in scope_names:
+            if scope == base_scope_name:
+                continue
+            scoped = _extract_scope_value(entry, scope)
+            if scoped is not None:
+                scope_map[scope] = scoped
+        return scope_map
+
+    assignments: List[Dict[str, Any]] = []
     next_index = 0
     for entry in states:
         if not isinstance(entry, dict):
@@ -1245,7 +1312,14 @@ def _load_state_assignments(state_map_path: Optional[Path]) -> List[Tuple[str, s
                     raise SystemExit(f"Invalid node identifier in state {state_id}: {alias!r}")
                 node_name = f"node_{next_index}"
                 trainer_id = _normalize_trainer_id(alias_str, next_index)
-                assignments.append((node_name, str(state_id), trainer_id))
+                assignments.append(
+                    {
+                        "container_name": node_name,
+                        "state_id": str(state_id),
+                        "trainer_id": trainer_id,
+                        "scopes": dict(_build_scope_map(entry, str(state_id))),
+                    }
+                )
                 next_index += 1
             count = entry.get("count")
             if count is not None and int(count) != len(explicit_nodes):
@@ -1267,7 +1341,14 @@ def _load_state_assignments(state_map_path: Optional[Path]) -> List[Tuple[str, s
         for _ in range(count_val):
             node_name = f"node_{next_index}"
             trainer_id = _normalize_trainer_id(None, next_index)
-            assignments.append((node_name, str(state_id), trainer_id))
+            assignments.append(
+                {
+                    "container_name": node_name,
+                    "state_id": str(state_id),
+                    "trainer_id": trainer_id,
+                    "scopes": dict(_build_scope_map(entry, str(state_id))),
+                }
+            )
             next_index += 1
     return assignments
 
@@ -1506,19 +1587,37 @@ def main() -> None:
     compose_output_path = _resolve_repo_path(args.compose_output)
     system_config_path = resolve_system_config_path(args.system_config)
     state_map_path = _resolve_state_map_path(args.state_map)
-    state_assignments = _load_state_assignments(state_map_path)
+
+    system_config_data: Dict[str, Any] = {}
+    if system_config_path.exists():
+        system_config_data = _load_system_config_data(system_config_path)
+    scope_names = _extract_scope_names(system_config_data) if system_config_data else ["state"]
+    primary_scope_name = scope_names[0] if scope_names else "state"
+
+    state_assignments = _load_state_assignments(state_map_path, scope_names)
     if state_assignments:
-        node_names = [name for name, _, _ in state_assignments]
+        node_names = [assignment["container_name"] for assignment in state_assignments]
         node_count = len(node_names)
         state_counts: Dict[str, int] = {}
-        for _, state_id, _ in state_assignments:
-            state_counts[state_id or "unassigned"] = state_counts.get(state_id or "unassigned", 0) + 1
+        for assignment in state_assignments:
+            state_id = assignment.get("state_id")
+            scope_key = assignment.get("scopes", {}).get(primary_scope_name, "")
+            label = state_id or scope_key or "unassigned"
+            state_counts[label] = state_counts.get(label, 0) + 1
         state_summary = ", ".join(f"{state}: {count}" for state, count in state_counts.items())
         print(f"Loaded state map {state_map_path} ({state_summary})")
     else:
-        node_count = determine_node_count(args.nodes, system_config_path)
+        node_count = determine_node_count(args.nodes, system_config_path, system_config_data or None)
         node_names = [f"node_{i}" for i in range(node_count)]
-        state_assignments = [(name, "", _normalize_trainer_id(None, idx)) for idx, name in enumerate(node_names)]
+        state_assignments = [
+            {
+                "container_name": name,
+                "trainer_id": _normalize_trainer_id(None, idx),
+                "state_id": "",
+                "scopes": {},
+            }
+            for idx, name in enumerate(node_names)
+        ]
         print(
             f"Using node count {node_count} from "
             f"{'--nodes CLI' if args.nodes is not None else system_config_path}"
@@ -1536,13 +1635,27 @@ def main() -> None:
     _clear_runtime_state(blockchain_paths)
     _reset_nodes_dir()
     # Generate configs with the correct IPFS/blockchain layout.
-    for idx, (container_name, state_id, trainer_id) in enumerate(state_assignments):
+    for idx, assignment in enumerate(state_assignments):
+        container_name = assignment["container_name"]
+        trainer_id = assignment["trainer_id"]
+        state_id = assignment.get("state_id") or ""
+        scopes = dict(assignment.get("scopes") or {})
         config = deepcopy(template_config)
         config["node_id"] = trainer_id
         config["trainer_id"] = trainer_id
         config["network_host"] = container_name
         if state_id:
             config["state_id"] = state_id
+        else:
+            fallback_state = scopes.get("state") or scopes.get(primary_scope_name)
+            if fallback_state:
+                config["state_id"] = fallback_state
+        if scopes:
+            config["scope_assignments"] = scopes
+            for scope_key, scope_value in scopes.items():
+                config[scope_key] = scope_value
+        if scope_names:
+            config["scope_hierarchy"] = list(scope_names)
         ipfs_service = _select_ipfs_service(idx, ipfs_services)
         _apply_ipfs_distribution(ipfs_service, config, ipfs_services)
         _apply_blockchain_identity(idx, config, identity_override=trainer_id)

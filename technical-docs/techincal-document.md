@@ -86,7 +86,7 @@ Key components:
 - **State Level**
   - Bridge services flag CIDs originating from state digests using the `STATE_SIGNAL_PREFIX`, enabling quick filtering inside `StateAggregator`.
   - State leaders re-fetch clique outputs (or fall back to anchored data) and average them; digest consensus ensures all state candidates agree on the merged hash before any blockchain commit.
-  - Once consensus forms, leaders anchor the state-level CID/hash, and optional `NationAggregationConfig` hooks can trigger additional rollups.
+  - Once consensus forms, leaders anchor the state-level CID/hash, and optional higher-tier `HierarchyLevelConfig` hooks can trigger additional rollups.
 - **Nation/Future Levels**
   - Config placeholders orchestrate every N state rounds; while nation aggregation is currently a stub, the scheduling primitives and digest plumbing are already in place.
 
@@ -113,7 +113,7 @@ Key components:
 ## 9. Configuration Entry Points
 - `config/node.config.template.json` – authoritative defaults for dataset selection, model hyperparameters, thresholds, and networking.
 - `config/system-config.json` – runtime toggles for convergence, hierarchy cadence, dataset overrides, and monitoring IDs.
-- `config/state-map.json` – maps logical states to sequential node IDs so the generator can size each state roster and feed `StateAggregationConfig`.
+- `config/state-map.json` – maps logical states to sequential node IDs so the generator can size each state roster and feed the level-1 `HierarchyLevelConfig`.
 - Environment variables (e.g., `GRPC_MAX_MESSAGE_MB`, `CENTRAL_METADATA_GATEWAY_URL`, `SYSTEM_CONFIG_PATH`) empower operators to swap infrastructure back ends without code changes.
 
 ## 10. Flow Recap

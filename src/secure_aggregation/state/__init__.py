@@ -5,12 +5,11 @@ from .aggregation import (
     StateAggregator,
     StateClusterModel,
 )
-from .config import NationAggregationConfig, StateAggregationApproach, StateAggregationConfig
+from .config import HierarchyLevelConfig, StateAggregationApproach
 
 __all__ = [
     "StateAggregationApproach",
-    "StateAggregationConfig",
-    "NationAggregationConfig",
+    "HierarchyLevelConfig",
     "StateAggregationError",
     "StateAggregator",
     "StateClusterModel",
