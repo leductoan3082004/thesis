@@ -218,6 +218,7 @@ class NodeService(HierarchyMixin):
         self.neighbor_bridge_addresses: List[str] = []
         self.neighbor_address_map: Dict[str, str] = {}
         self.central_neighbor_addresses: Dict[str, str] = {}
+        self._state_rosters, self._state_cluster_map = self._load_state_metadata()
         self.ecm_buffer: Optional[ECMBuffer] = None
         self.bridge_server: Optional[grpc.Server] = None
         self.bridge_client: Optional[BridgeClient] = None
@@ -903,6 +904,10 @@ class NodeService(HierarchyMixin):
             self.scope_name,
             source_round,
         )
+        config = self._get_scope_config_entry(scope_name)
+        if config is None:
+            return True
+        self._wait_for_higher_scope_anchor(scope_name, config, scope_round)
         return True
 
     def _handle_completed_scope_round(self, scope_name: str, scope_round: int, source_round: int) -> None:
@@ -1215,8 +1220,11 @@ class NodeService(HierarchyMixin):
             self.central_metadata = metadata
             logger.info(
                 f"Fetched central metadata: central clique={metadata.central_clique_idx}, "
-                f"central nodes={metadata.central_nodes}, checker candidates={metadata.checker_candidates}"
+                f"central nodes={metadata.central_nodes}"
             )
+            if metadata.scope_central_nodes:
+                for scope, nodes in sorted(metadata.scope_central_nodes.items()):
+                    logger.info("Central clique for %s: %s", scope, nodes)
             self._update_central_neighbor_addresses()
 
     def _update_central_neighbor_addresses(self) -> None:
@@ -1224,7 +1232,10 @@ class NodeService(HierarchyMixin):
         self.central_neighbor_addresses = {}
         if not self.central_metadata or not self.participant_map:
             return
-        for node_id in self.central_metadata.central_nodes:
+        candidate_nodes = self._preferred_scope_candidates()
+        if not candidate_nodes and self.central_metadata:
+            candidate_nodes = list(self.central_metadata.central_nodes)
+        for node_id in candidate_nodes:
             base_address = self.participant_map.get(node_id)
             attempts = 0
             while not base_address and attempts < 5:
@@ -2205,6 +2216,15 @@ class NodeService(HierarchyMixin):
                 time.sleep(2)
                 self.register_with_ttp()
             logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
+
+        if self.scope_config.enabled:
+            roster = self._state_roster_for() or ["(dynamic)"]
+            logger.info(
+                "%s central candidates for %s: %s",
+                self._scope_label_upper(),
+                getattr(self, "state_id", "unknown_state"),
+                ", ".join(roster),
+            )
 
         if inter_edges:
             bridge_ready = self._init_bridge_with_retries(inter_edges, fatal=False)

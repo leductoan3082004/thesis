@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
-from secure_aggregation.node import ECM, ECMBuffer
+from secure_aggregation.node.ecm_buffer import ECM, ECMBuffer
 from secure_aggregation.state import (
     HierarchyLevelConfig,
     StateAggregationApproach,
@@ -216,6 +218,148 @@ class HierarchyMixin:
         )
         return scope_configs
 
+    def _resolve_state_map_path(self) -> Optional[Path]:
+        """Determine path to the state roster map, if provided."""
+        system_cfg = getattr(self, "system_config", None) or {}
+        explicit = system_cfg.get("state_map_path") or os.getenv("STATE_MAP_PATH")
+        path: Path
+        if explicit:
+            path = Path(str(explicit))
+        else:
+            sys_path = getattr(self, "system_config_path", None)
+            if sys_path:
+                path = Path(sys_path).with_name("state-map.json")
+            else:
+                path = Path("config/state-map.json")
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        return path
+
+    def _resolve_topology_path(self) -> Optional[Path]:
+        """Resolve the topology description path used for clique membership."""
+        config = getattr(self, "inter_cluster_config", None) or {}
+        topo = config.get("topology_file") or os.getenv("TOPOLOGY_FILE")
+        if topo:
+            path = Path(str(topo))
+        else:
+            path = Path("config/topology.json")
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        return path
+
+    @staticmethod
+    def _trainer_to_container(trainer_id: str) -> Optional[str]:
+        suffix = "".join(ch for ch in str(trainer_id) if ch.isdigit())
+        if not suffix:
+            return None
+        try:
+            index = int(suffix) - 1
+        except ValueError:
+            return None
+        if index < 0:
+            return None
+        return f"node_{index}"
+
+    def _load_state_metadata(self) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """Load state rosters and derive cluster coverage for each state."""
+        rosters: Dict[str, List[str]] = {}
+        cluster_map: Dict[str, List[str]] = {}
+        roster_path = self._resolve_state_map_path()
+        if roster_path and roster_path.exists():
+            try:
+                data = json.loads(roster_path.read_text())
+                states = data.get("states") or []
+                for entry in states:
+                    state_id = str(entry.get("state_id") or entry.get("id") or "").strip()
+                    nodes = entry.get("nodes") or []
+                    if not state_id or not isinstance(nodes, list) or not nodes:
+                        continue
+                    normalized = []
+                    for node in nodes:
+                        node_id = str(node).strip()
+                        if node_id:
+                            normalized.append(node_id)
+                    if normalized:
+                        rosters[state_id] = list(dict.fromkeys(normalized))
+            except (OSError, json.JSONDecodeError) as exc:
+                hierarchy_logger.warning("Failed to load state map from %s: %s", roster_path, exc)
+        topo_path = self._resolve_topology_path()
+        container_to_clique: Dict[str, int] = {}
+        if topo_path and topo_path.exists():
+            try:
+                topo = json.loads(topo_path.read_text())
+                cliques = topo.get("cliques") or []
+                for idx, members in enumerate(cliques):
+                    if not isinstance(members, list):
+                        continue
+                    for member in members:
+                        container_to_clique[str(member)] = idx
+            except (OSError, json.JSONDecodeError) as exc:
+                hierarchy_logger.warning("Failed to parse topology file %s: %s", topo_path, exc)
+        for state_id, nodes in rosters.items():
+            seen: Set[str] = set()
+            clusters: List[str] = []
+            for trainer_id in nodes:
+                container = self._trainer_to_container(trainer_id)
+                if not container:
+                    continue
+                clique_idx = container_to_clique.get(container)
+                if clique_idx is None:
+                    continue
+                cluster_id = f"cluster_{clique_idx}"
+                if cluster_id not in seen:
+                    seen.add(cluster_id)
+                    clusters.append(cluster_id)
+            if clusters:
+                cluster_map[state_id] = clusters
+        return rosters, cluster_map
+
+    def _state_metadata(self) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        rosters = getattr(self, "_state_rosters", None)
+        cluster_map = getattr(self, "_state_cluster_map", None)
+        if rosters is None or cluster_map is None:
+            rosters, cluster_map = self._load_state_metadata()
+            setattr(self, "_state_rosters", rosters)
+            setattr(self, "_state_cluster_map", cluster_map)
+        return rosters, cluster_map
+
+    def _state_roster_for(self, scope_id: Optional[str] = None) -> List[str]:
+        rosters, _ = self._state_metadata()
+        key = scope_id or getattr(self, "state_id", None) or getattr(self.scope_config, "scope_id", None)
+        if not key:
+            return []
+        return list(rosters.get(str(key), []))
+
+    def _state_cluster_ids(self, scope_id: Optional[str] = None) -> List[str]:
+        key = scope_id or getattr(self, "state_id", None) or getattr(self.scope_config, "scope_id", None)
+        if not key:
+            return []
+        scope_key = str(key)
+        metadata = getattr(self, "central_metadata", None)
+        if metadata:
+            scope_clusters = getattr(metadata, "scope_cluster_ids", None) or {}
+            clusters = scope_clusters.get(scope_key)
+            if clusters:
+                return list(clusters)
+        _, cluster_map = self._state_metadata()
+        return list(cluster_map.get(scope_key, []))
+
+    def _preferred_scope_candidates(self, limit: Optional[int] = None) -> List[str]:
+        """Return candidate aggregator nodes prioritized by state roster."""
+        roster = self._state_roster_for()
+        metadata_nodes = []
+        if self.central_metadata:
+            metadata_nodes = list(dict.fromkeys(self.central_metadata.central_nodes))
+        if roster:
+            roster = list(dict.fromkeys(roster))
+            intersect = [node for node in metadata_nodes if node in roster]
+            candidates = intersect or roster
+        else:
+            candidates = metadata_nodes
+        if limit and limit > 0:
+            candidates = candidates[:limit]
+        return candidates
+
     def _select_scope_roles(
         self,
         scope_configs: Mapping[str, HierarchyScopeConfig],
@@ -254,11 +398,13 @@ class HierarchyMixin:
             return
         if not self.central_metadata:
             return
+        max_aggs = getattr(self.scope_config, "max_aggregators", 0) or 0
         if self.scope_config.approach == StateAggregationApproach.RING_STAR:
-            candidates = list(self.central_metadata.central_nodes)
+            candidates = self._preferred_scope_candidates(limit=max_aggs)
         else:
-            candidates = list(self.central_metadata.central_nodes)
-        candidates = sorted(dict.fromkeys(candidates))
+            candidates = self._preferred_scope_candidates(limit=max_aggs)
+        if not candidates and self.central_metadata:
+            candidates = list(dict.fromkeys(self.central_metadata.central_nodes))
         previous_candidates = self.scope_candidates
         self.scope_candidates = candidates
         was_candidate = self.is_scope_candidate
@@ -568,9 +714,8 @@ class HierarchyMixin:
         hierarchy_logger.info("=" * 60)
         handler.dispatch_fn(scope_round, source_round)
         completed = handler.execute_fn(scope_round, source_round)
-        if completed and handler.is_candidate_fn():
-            if handler.schedule_higher_fn:
-                handler.schedule_higher_fn(scope_round)
+        if completed and handler.schedule_higher_fn:
+            handler.schedule_higher_fn(scope_round)
         return handler.scope_name, scope_round, source_round
 
     def _execute_scope_round(self, scope_round: int, cluster_round: int) -> bool:
@@ -593,11 +738,14 @@ class HierarchyMixin:
         deadline = time.time() + max(1.0, float(self.scope_config.collection_timeout_seconds))
         snapshot: Dict[str, StateClusterModel] = {}
         missing: List[str] = []
+        required_clusters = self._state_cluster_ids() or (
+            list(self.central_metadata.cluster_ids) if self.central_metadata else []
+        )
         while time.time() < deadline:
             ecms = self.scope_ecm_buffer.get_fresh_ecms()
             snapshot, missing = self.scope_aggregator.build_snapshot(
                 ecms,
-                self.central_metadata.cluster_ids,
+                required_clusters,
                 cluster_round,
             )
             if not missing:
@@ -653,7 +801,7 @@ class HierarchyMixin:
         else:
             target_addresses.update(self.central_neighbor_addresses)
         if not target_addresses and self.participant_map:
-            for node_id in self.central_metadata.central_nodes if self.central_metadata else []:
+            for node_id in self._preferred_scope_candidates():
                 addr = self.participant_map.get(node_id)
                 if not addr:
                     continue
@@ -1016,6 +1164,69 @@ class HierarchyMixin:
                 break
             time.sleep(min(5.0, remaining))
         return None
+
+    def _wait_for_higher_scope_anchor(
+        self,
+        scope_name: str,
+        config: HierarchyLevelConfig,
+        scope_round: int,
+    ) -> bool:
+        """Block until a higher-scope anchor appears or the configured timeout elapses."""
+        if not self.blockchain:
+            return False
+        scope_id = getattr(config, "scope_id", None)
+        if not scope_id:
+            return False
+        scope_namespace = self._scope_namespace(config)
+        wait_budget = (
+            float(getattr(config, "collection_timeout_seconds", 0.0))
+            + float(getattr(config, "consensus_timeout_seconds", 0.0))
+            + float(getattr(config, "commit_timeout_seconds", 0.0))
+        )
+        wait_budget = max(30.0, wait_budget)
+        deadline = time.time() + wait_budget
+        label = getattr(config, "scope_name", scope_name).upper()
+        hierarchy_logger.info(
+            "Waiting up to %.0fs for %s round %d anchor",
+            wait_budget,
+            label,
+            scope_round,
+        )
+        while time.time() < deadline:
+            try:
+                anchor = self.blockchain.get_anchor(
+                    scope_id,
+                    scope_round,
+                    scope=scope_namespace,
+                    suppress_not_found_log=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                hierarchy_logger.warning(
+                    "Failed to poll %s round %d anchor: %s",
+                    label,
+                    scope_round,
+                    exc,
+                )
+                return False
+            if anchor:
+                hierarchy_logger.info(
+                    "%s round %d anchor observed (cid=%s...)",
+                    label,
+                    scope_round,
+                    anchor[0][:8],
+                )
+                return True
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(5.0, remaining))
+        hierarchy_logger.warning(
+            "%s round %d anchor not observed after %.0fs; will continue and retry later",
+            label,
+            scope_round,
+            wait_budget,
+        )
+        return False
 
     def _mark_scope_round_committed(self, scope_round: int) -> None:
         self._scope_committed_rounds.add(scope_round)

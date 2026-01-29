@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Optional
 
 from torchvision import datasets, transforms
 
@@ -57,6 +58,48 @@ def load_node_alias_map(num_clients: int) -> dict[str, str]:
     return alias_map
 
 
+def load_node_scope_assignments(num_clients: int) -> dict[str, str]:
+    """Load mapping from canonical node_X identifiers to their primary scope."""
+    nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+    if not nodes_dir.exists():
+        return {}
+    assignments: dict[str, str] = {}
+    for idx in range(num_clients):
+        node_file = nodes_dir / f"node_{idx}.json"
+        if not node_file.exists():
+            continue
+        try:
+            data = json.loads(node_file.read_text())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to parse node config %s for scope metadata: %s", node_file, exc)
+            continue
+        hierarchy = data.get("scope_hierarchy")
+        primary_scope: Optional[str] = None
+        if isinstance(hierarchy, list) and hierarchy:
+            candidate = str(hierarchy[0]).strip()
+            if candidate:
+                primary_scope = candidate.lower()
+        scopes = data.get("scope_assignments") or {}
+        scope_value: Optional[str] = None
+        search_keys = [primary_scope] if primary_scope else []
+        if "state" not in search_keys:
+            search_keys.append("state")
+        for key in search_keys:
+            if not key:
+                continue
+            value = scopes.get(key)
+            if value:
+                scope_value = str(value).strip()
+                break
+        if not scope_value:
+            fallback = data.get("state_id") or data.get("state")
+            if fallback:
+                scope_value = str(fallback).strip()
+        if scope_value:
+            assignments[f"node_{idx}"] = scope_value
+    return assignments
+
+
 def write_topology_file(
     labels: dict[int, int],
     num_clients: int,
@@ -80,12 +123,15 @@ def write_topology_file(
     partition = {f"node_{key.split('_')[-1]}": value for key, value in partition.items()}
     node_labels = compute_node_labels_from_partition(partition, labels)
 
+    scope_assignments = load_node_scope_assignments(num_clients)
+
     cliques, intra_edges, inter_edges, edge_counts = build_full_topology(
         node_labels=node_labels,
         clique_size=clique_size,
         iterations=iterations,
         edge_mode=edge_mode,
         seed=seed,
+        node_scope_assignments=scope_assignments,
     )
 
     alias_map = load_node_alias_map(num_clients)

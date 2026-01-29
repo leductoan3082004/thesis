@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from typing import Dict, Iterable, List, Mapping, MutableSequence, Sequence, Set, Tuple
 
 LabelDist = Dict[str, float]
+DEFAULT_SCOPE_NAME = "__global__"
 
 
 def _normalize(counts: Mapping[str, float]) -> LabelDist:
@@ -262,6 +263,52 @@ def identify_central_clique(
     return None, []
 
 
+def identify_central_cliques_by_scope(
+    cliques: Sequence[Set[str]],
+    interclique_edges: Sequence[Tuple[int, int]],
+    node_scope_assignments: Mapping[str, str],
+) -> Dict[str, Tuple[int | None, List[str]]]:
+    """
+    Identify central cliques independently for each scope (state/region/etc.).
+
+    Args:
+        cliques: List of cliques for the entire system.
+        interclique_edges: Inter-clique edges across all scopes.
+        node_scope_assignments: Mapping of node_id -> scope identifier.
+
+    Returns:
+        Mapping of scope_id -> (global clique index, preferred bridge nodes).
+    """
+    if not node_scope_assignments:
+        return {}
+
+    scope_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for idx, clique in enumerate(cliques):
+        scope = DEFAULT_SCOPE_NAME
+        for node in clique:
+            scope = str(node_scope_assignments.get(node, DEFAULT_SCOPE_NAME))
+            break
+        scope_to_indices[scope].append(idx)
+
+    results: Dict[str, Tuple[int | None, List[str]]] = {}
+    for scope, indices in scope_to_indices.items():
+        if not indices:
+            continue
+        index_map = {global_idx: local_idx for local_idx, global_idx in enumerate(indices)}
+        scoped_cliques = [cliques[global_idx] for global_idx in indices]
+        scoped_edges = [
+            (index_map[a], index_map[b])
+            for a, b in interclique_edges
+            if a in index_map and b in index_map
+        ]
+        local_idx, nodes = identify_central_clique(scoped_cliques, scoped_edges)
+        if local_idx is None:
+            results[scope] = (None, [])
+        else:
+            results[scope] = (indices[local_idx], nodes)
+    return results
+
+
 def _get_central_bridge_target() -> int:
     """Return desired number of bridge nodes for a ring-star hub."""
     raw = os.getenv("RING_STAR_NUMBER_OF_CENTRAL_NODES")
@@ -408,6 +455,45 @@ def assign_node_edges(
     return node_to_node_edges, node_edge_count
 
 
+def _build_single_scope_topology(
+    node_labels: Mapping[str, Mapping[str, float] | str],
+    clique_size: int,
+    iterations: int,
+    edge_mode: str,
+    small_world_c: int,
+    ring_star_extra: int,
+    seed: int | None,
+) -> Tuple[List[Set[str]], List[Tuple[str, str]], List[Tuple[str, str]], Dict[str, int]]:
+    cliques = build_d_cliques(node_labels, clique_size, iterations, seed)
+    interclique_edges = build_interclique_edges(
+        cliques,
+        mode=edge_mode,
+        small_world_c=small_world_c,
+        ring_star_extra=ring_star_extra,
+    )
+
+    intra_edges: List[Tuple[str, str]] = []
+    for clique in cliques:
+        nodes = sorted(clique)
+        for i, n1 in enumerate(nodes):
+            for n2 in nodes[i + 1 :]:
+                intra_edges.append((n1, n2))
+
+    inter_edges, node_edge_count = assign_node_edges(cliques, interclique_edges)
+    return cliques, intra_edges, inter_edges, node_edge_count
+
+
+def _group_node_labels_by_scope(
+    node_labels: Mapping[str, Mapping[str, float] | str],
+    node_scope_assignments: Mapping[str, str],
+) -> Dict[str, Dict[str, Mapping[str, float] | str]]:
+    grouped: Dict[str, Dict[str, Mapping[str, float] | str]] = defaultdict(dict)
+    for node_id, labels in node_labels.items():
+        scope = str(node_scope_assignments.get(node_id, DEFAULT_SCOPE_NAME))
+        grouped[scope][node_id] = labels
+    return grouped
+
+
 def build_full_topology(
     node_labels: Mapping[str, Mapping[str, float] | str],
     clique_size: int,
@@ -416,6 +502,7 @@ def build_full_topology(
     small_world_c: int = 2,
     ring_star_extra: int = 0,
     seed: int | None = None,
+    node_scope_assignments: Mapping[str, str] | None = None,
 ) -> Tuple[List[Set[str]], List[Tuple[str, str]], List[Tuple[str, str]], Dict[str, int]]:
     """
     Build the complete D-Cliques topology with node-level edges.
@@ -433,6 +520,9 @@ def build_full_topology(
         small_world_c: Parameter for small_world mode (number of power-of-2 offsets).
         ring_star_extra: Additional random edges per clique when using ring_star mode.
         seed: Random seed for reproducibility.
+        node_scope_assignments: Optional mapping of node_id -> scope identifier. When
+            provided, topology construction is performed independently within each scope
+            (e.g., each state gets its own cliques and central nodes).
 
     Returns:
         A tuple of:
@@ -441,24 +531,40 @@ def build_full_topology(
         - inter_edges: List of (node_a, node_b) edges between cliques.
         - node_edge_count: Dict mapping each node to its final edge count.
     """
-    cliques = build_d_cliques(node_labels, clique_size, iterations, seed)
-    interclique_edges = build_interclique_edges(
-        cliques,
-        mode=edge_mode,
-        small_world_c=small_world_c,
-        ring_star_extra=ring_star_extra,
-    )
+    if not node_scope_assignments:
+        return _build_single_scope_topology(
+            node_labels,
+            clique_size,
+            iterations,
+            edge_mode,
+            small_world_c,
+            ring_star_extra,
+            seed,
+        )
 
-    intra_edges: List[Tuple[str, str]] = []
-    for clique in cliques:
-        nodes = sorted(clique)
-        for i, n1 in enumerate(nodes):
-            for n2 in nodes[i + 1 :]:
-                intra_edges.append((n1, n2))
+    grouped = _group_node_labels_by_scope(node_labels, node_scope_assignments)
+    all_cliques: List[Set[str]] = []
+    all_intra: List[Tuple[str, str]] = []
+    all_inter: List[Tuple[str, str]] = []
+    combined_edge_counts: Dict[str, int] = {}
 
-    inter_edges, node_edge_count = assign_node_edges(cliques, interclique_edges)
+    for scope_name in sorted(grouped):
+        scoped_labels = grouped[scope_name]
+        cliques, intra_edges, inter_edges, edge_counts = _build_single_scope_topology(
+            scoped_labels,
+            clique_size,
+            iterations,
+            edge_mode,
+            small_world_c,
+            ring_star_extra,
+            seed,
+        )
+        all_cliques.extend(cliques)
+        all_intra.extend(intra_edges)
+        all_inter.extend(inter_edges)
+        combined_edge_counts.update(edge_counts)
 
-    return cliques, intra_edges, inter_edges, node_edge_count
+    return all_cliques, all_intra, all_inter, combined_edge_counts
 
 
 def metropolis_hastings_weights(num_nodes: int, edges: Iterable[Tuple[int, int]]) -> List[List[float]]:
