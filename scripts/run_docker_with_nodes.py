@@ -31,6 +31,7 @@ except ImportError as exc:  # pragma: no cover - dependency guard
 # Add src to path for topology import
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from secure_aggregation.topology import generate_preliminary_topology
+from secure_aggregation.state.nodes_map import load_nodes_map
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -41,7 +42,7 @@ NODE_TEMPLATE_PATH = ROOT_DIR / "config" / "node.config.template.json"
 NODES_DIR = ROOT_DIR / "config" / "nodes"
 KEYS_DIR = ROOT_DIR / "config" / "keys"
 TOPOLOGY_FILE = ROOT_DIR / "config" / "topology.json"
-STATE_MAP_FILE = ROOT_DIR / "config" / "state-map.json"
+NODES_MAP_FILE = ROOT_DIR / "config" / "nodes-map.json"
 PROMETHEUS_CONFIG = ROOT_DIR / "docker" / "prometheus" / "prometheus.yml"
 SYSTEM_CONFIG_FILENAME = "system-config.json"
 SYSTEM_CONFIG_ENV_VAR = "SYSTEM_CONFIG_PATH"
@@ -167,9 +168,12 @@ def parse_args() -> argparse.Namespace:
         help="Size of each clique in the D-Cliques topology (default: 3).",
     )
     parser.add_argument(
+        "--nodes-map",
         "--state-map",
+        dest="nodes_map",
         type=Path,
-        help="Optional JSON file describing which nodes belong to which state. "
+        help="Optional JSON file describing hierarchical scope membership "
+        "(legacy flag --state-map retained for backward compatibility). "
         "Overrides --nodes and system-config counts when provided.",
     )
     parser.add_argument(
@@ -1209,10 +1213,10 @@ def determine_node_count(
     return node_count_int
 
 
-def _resolve_state_map_path(cli_path: Optional[Path]) -> Optional[Path]:
+def _resolve_nodes_map_path(cli_path: Optional[Path]) -> Optional[Path]:
     if cli_path:
         return _resolve_repo_path(cli_path).resolve()
-    default_path = STATE_MAP_FILE
+    default_path = NODES_MAP_FILE
     if default_path.exists():
         return default_path
     return None
@@ -1231,122 +1235,50 @@ def _normalize_trainer_id(raw: Optional[str], seq_index: int) -> str:
     return f"trainer-node-{seq_index + 1:03d}"
 
 
-def _load_state_assignments(
-    state_map_path: Optional[Path],
+def _load_nodes_map_assignments(
+    nodes_map_path: Optional[Path],
     scope_names: Sequence[str],
 ) -> List[Dict[str, Any]]:
-    """
-    Load state-to-node assignments from configuration file and attach scope metadata.
-
-    The base schema mirrors previous releases:
-    {
-        "states": [
-            {"state_id": "state_a", "count": 20, "nodes": [...], "nation": "nation_0"}
-        ]
-    }
-    Additional hierarchy scopes (e.g., "nation") can be specified directly on the
-    state entry (or under a nested "scopes" object) and will be propagated to every
-    trainer belonging to that state.
-    """
-    if state_map_path is None:
+    """Load node assignments from the hierarchical nodes map."""
+    if nodes_map_path is None:
         return []
-    if not state_map_path.exists():
-        raise SystemExit(f"State map file not found: {state_map_path}")
+    if not nodes_map_path.exists():
+        raise SystemExit(f"Nodes map file not found: {nodes_map_path}")
+    scope_chain = [name.lower() for name in reversed(scope_names or ["state"])]
+    if not scope_chain:
+        scope_chain = ["state"]
     try:
-        data = json.loads(state_map_path.read_text())
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Invalid JSON in state map {state_map_path}: {exc}") from exc
-
-    states = data.get("states")
-    if not isinstance(states, list) or not states:
-        raise SystemExit(f"State map {state_map_path} must contain a non-empty 'states' list.")
-
-    base_scope_name = scope_names[0] if scope_names else "state"
-
-    def _extract_scope_value(entry: Dict[str, Any], scope: str) -> Optional[str]:
-        for key in (scope, f"{scope}_id", f"{scope}_name"):
-            value = entry.get(key)
-            if value is None:
-                continue
-            value_str = str(value).strip()
-            if value_str:
-                return value_str
-        scopes_blob = entry.get("scopes")
-        if isinstance(scopes_blob, dict):
-            scoped_value = scopes_blob.get(scope)
-            if scoped_value is not None:
-                scoped_str = str(scoped_value).strip()
-                if scoped_str:
-                    return scoped_str
-        return None
-
-    def _build_scope_map(entry: Dict[str, Any], state_value: str) -> Dict[str, str]:
-        scope_map: Dict[str, str] = {}
-        if state_value:
-            scope_map[base_scope_name] = state_value
-            if base_scope_name != "state":
-                scope_map.setdefault("state", state_value)
-        for scope in scope_names:
-            if scope == base_scope_name:
-                continue
-            scoped = _extract_scope_value(entry, scope)
-            if scoped is not None:
-                scope_map[scope] = scoped
-        return scope_map
-
+        metadata = load_nodes_map(nodes_map_path, scope_chain)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    lowest_scope = scope_names[0] if scope_names else scope_chain[-1]
+    roster = metadata.rosters.get(lowest_scope.lower())
+    if not roster:
+        raise SystemExit(
+            f"Nodes map {nodes_map_path} must define at least one '{lowest_scope}' entry."
+        )
     assignments: List[Dict[str, Any]] = []
     next_index = 0
-    for entry in states:
-        if not isinstance(entry, dict):
-            raise SystemExit(f"Invalid state entry in {state_map_path}: {entry!r}")
-        state_id = entry.get("state_id") or entry.get("id")
-        if not state_id:
-            raise SystemExit(f"State entry missing 'state_id': {entry!r}")
-        explicit_nodes = entry.get("nodes")
-        if explicit_nodes:
-            if not isinstance(explicit_nodes, list):
-                raise SystemExit(f"'nodes' for state {state_id} must be a list")
-            for alias in explicit_nodes:
-                alias_str = str(alias).strip()
-                if not alias_str:
-                    raise SystemExit(f"Invalid node identifier in state {state_id}: {alias!r}")
-                node_name = f"node_{next_index}"
-                trainer_id = _normalize_trainer_id(alias_str, next_index)
-                assignments.append(
-                    {
-                        "container_name": node_name,
-                        "state_id": str(state_id),
-                        "trainer_id": trainer_id,
-                        "scopes": dict(_build_scope_map(entry, str(state_id))),
-                    }
-                )
-                next_index += 1
-            count = entry.get("count")
-            if count is not None and int(count) != len(explicit_nodes):
-                raise SystemExit(
-                    f"State {state_id} specifies count={count} but provided {len(explicit_nodes)} nodes."
-                )
-            continue
-        count = entry.get("count")
-        if count is None:
-            raise SystemExit(
-                f"State entry for {state_id} must include either 'nodes' or 'count'."
-            )
-        try:
-            count_val = int(count)
-        except (TypeError, ValueError):
-            raise SystemExit(f"Invalid count for state {state_id}: {count!r}") from None
-        if count_val <= 0:
-            raise SystemExit(f"State {state_id} must have count >= 1 (found {count_val}).")
-        for _ in range(count_val):
-            node_name = f"node_{next_index}"
-            trainer_id = _normalize_trainer_id(None, next_index)
+    for scope_id, node_aliases in roster.items():
+        for alias in node_aliases:
+            alias_str = str(alias).strip()
+            if not alias_str:
+                raise SystemExit(f"Invalid node alias under scope {scope_id!r}: {alias!r}")
+            container_name = f"node_{next_index}"
+            trainer_id = _normalize_trainer_id(alias_str, next_index)
+            membership = metadata.memberships.get(alias_str, {})
+            scope_map: Dict[str, str] = {}
+            for scope in scope_names:
+                scope_value = membership.get(scope.lower())
+                if scope_value:
+                    scope_map[scope] = scope_value
+            state_identifier = scope_map.get("state") or scope_map.get(lowest_scope.lower()) or scope_id
             assignments.append(
                 {
-                    "container_name": node_name,
-                    "state_id": str(state_id),
+                    "container_name": container_name,
+                    "state_id": str(state_identifier),
                     "trainer_id": trainer_id,
-                    "scopes": dict(_build_scope_map(entry, str(state_id))),
+                    "scopes": scope_map,
                 }
             )
             next_index += 1
@@ -1586,7 +1518,7 @@ def main() -> None:
     compose_template_path = _resolve_repo_path(args.compose_template)
     compose_output_path = _resolve_repo_path(args.compose_output)
     system_config_path = resolve_system_config_path(args.system_config)
-    state_map_path = _resolve_state_map_path(args.state_map)
+    nodes_map_path = _resolve_nodes_map_path(args.nodes_map)
 
     system_config_data: Dict[str, Any] = {}
     if system_config_path.exists():
@@ -1594,7 +1526,7 @@ def main() -> None:
     scope_names = _extract_scope_names(system_config_data) if system_config_data else ["state"]
     primary_scope_name = scope_names[0] if scope_names else "state"
 
-    state_assignments = _load_state_assignments(state_map_path, scope_names)
+    state_assignments = _load_nodes_map_assignments(nodes_map_path, scope_names)
     if state_assignments:
         node_names = [assignment["container_name"] for assignment in state_assignments]
         node_count = len(node_names)
@@ -1605,7 +1537,7 @@ def main() -> None:
             label = state_id or scope_key or "unassigned"
             state_counts[label] = state_counts.get(label, 0) + 1
         state_summary = ", ".join(f"{state}: {count}" for state, count in state_counts.items())
-        print(f"Loaded state map {state_map_path} ({state_summary})")
+        print(f"Loaded nodes map {nodes_map_path} ({state_summary})")
     else:
         node_count = determine_node_count(args.nodes, system_config_path, system_config_data or None)
         node_names = [f"node_{i}" for i in range(node_count)]
@@ -1672,8 +1604,8 @@ def main() -> None:
     compose_output_path.parent.mkdir(parents=True, exist_ok=True)
     write_compose_file(updated_compose, compose_output_path)
     print(f"Generated docker compose file with {node_count} nodes, clique_size={args.clique_size} -> {compose_output_path}")
-    if state_map_path:
-        print(f"(node count source: {state_map_path})")
+    if nodes_map_path:
+        print(f"(node count source: {nodes_map_path})")
     else:
         print(f"(node count source: {'--nodes CLI' if args.nodes is not None else system_config_path})")
 

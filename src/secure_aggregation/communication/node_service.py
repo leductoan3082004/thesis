@@ -218,6 +218,8 @@ class NodeService(HierarchyMixin):
         self.neighbor_bridge_addresses: List[str] = []
         self.neighbor_address_map: Dict[str, str] = {}
         self.central_neighbor_addresses: Dict[str, str] = {}
+        self.scope_configs = self._load_scope_config()
+        self._init_scope_role_pools()
         self._state_rosters, self._state_cluster_map = self._load_state_metadata()
         self.ecm_buffer: Optional[ECMBuffer] = None
         self.bridge_server: Optional[grpc.Server] = None
@@ -228,7 +230,6 @@ class NodeService(HierarchyMixin):
         self.ecm_forward_wait = float(self.inter_cluster_config.get("ecm_forward_wait_seconds", 5.0))
 
         # State-level aggregation (hierarchy) state
-        self.scope_configs = self._load_scope_config()
         (
             self.scope_name,
             self.scope_config,

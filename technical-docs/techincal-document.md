@@ -59,7 +59,7 @@ Key components:
   - Provides a gRPC ingress for neighbor cliques to push ECMs.
   - Deduplicates entries by CID, respects freshness windows, and exposes signal poppers so higher layers (state/nation) can react without starving clique-level buffers.
 - **State Aggregation Helpers**
-  - Poll ECM buffers looking for coverage across the required clique roster (state roster derived from `state-map.json`).
+  - Poll ECM buffers looking for coverage across the required clique roster (scope roster derived from `nodes-map.json`).
   - Re-hydrate tensors from IPFS, verify SHA256 hashes, average contributions, and publish the consolidated state checkpoint while coordinating digest consensus among state candidates.
 - **Storage Interfaces**
   - `IPFSInterface` allows a mock in-memory store for dev or a true Kubo HTTP API in production.
@@ -91,7 +91,7 @@ Key components:
   - Config placeholders orchestrate every N state rounds; while nation aggregation is currently a stub, the scheduling primitives and digest plumbing are already in place.
 
 ## 7. Deployment and Operational Flow
-1. **Automation entry point** – `scripts/run_docker_with_nodes.py` reads `system-config.json`, optional `state-map.json`, and `node.config.template.json`, then:
+1. **Automation entry point** – `scripts/run_docker_with_nodes.py` reads `system-config.json`, optional `nodes-map.json`, and `node.config.template.json`, then:
    - Generates per-node configs and Compose overrides.
    - Bootstraps Hyperledger Fabric artifacts via the sibling `thesis-blockchain` repo (key enrollment, VC signing, JWT issuance).
    - Starts IPFS, monitoring stack, the TTP, and N node containers (set via `--nodes` or config).
@@ -113,7 +113,7 @@ Key components:
 ## 9. Configuration Entry Points
 - `config/node.config.template.json` – authoritative defaults for dataset selection, model hyperparameters, thresholds, and networking.
 - `config/system-config.json` – runtime toggles for convergence, hierarchy cadence, dataset overrides, and monitoring IDs.
-- `config/state-map.json` – maps logical states to sequential node IDs so the generator can size each state roster and feed the level-1 `HierarchyLevelConfig`.
+- `config/nodes-map.json` – maps hierarchical scopes to sequential node IDs so the generator can size each roster and feed the level-specific `HierarchyLevelConfig`.
 - Environment variables (e.g., `GRPC_MAX_MESSAGE_MB`, `CENTRAL_METADATA_GATEWAY_URL`, `SYSTEM_CONFIG_PATH`) empower operators to swap infrastructure back ends without code changes.
 
 ## 10. Flow Recap

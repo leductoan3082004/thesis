@@ -9,7 +9,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from secure_aggregation.node.ecm_buffer import ECM, ECMBuffer
@@ -20,6 +20,7 @@ from secure_aggregation.state import (
     StateAggregator,
     StateClusterModel,
 )
+from secure_aggregation.state.nodes_map import NodesMapMetadata, load_nodes_map
 from secure_aggregation.storage.model_store import AnchorScope, compute_model_hash, verify_model_hash
 from secure_aggregation.utils import get_logger
 
@@ -59,6 +60,34 @@ class ScopeRoundHandler:
     execute_fn: Callable[[int, int], bool]
     schedule_higher_fn: Optional[Callable[[int], None]] = None
     budget_fn: Optional[Callable[[], Optional[int]]] = None
+
+
+class RoundRobinPool:
+    """Utility to iterate over members in round-robin order."""
+
+    def __init__(self, members: Optional[Sequence[str]] = None) -> None:
+        unique: List[str] = []
+        seen: Set[str] = set()
+        for member in members or []:
+            normalized = str(member).strip()
+            if normalized and normalized not in seen:
+                unique.append(normalized)
+                seen.add(normalized)
+        self._members: List[str] = unique
+        self._cursor: int = 0
+
+    def next(self, count: int = 1) -> List[str]:
+        """Return the next `count` members from the pool."""
+        if not self._members or count <= 0:
+            return []
+        selection: List[str] = []
+        for _ in range(count):
+            selection.append(self._members[self._cursor])
+            self._cursor = (self._cursor + 1) % len(self._members)
+        return selection
+
+    def all_members(self) -> List[str]:
+        return list(self._members)
 
 
 def build_scope_signal_cid(
@@ -218,19 +247,24 @@ class HierarchyMixin:
         )
         return scope_configs
 
-    def _resolve_state_map_path(self) -> Optional[Path]:
-        """Determine path to the state roster map, if provided."""
+    def _resolve_nodes_map_path(self) -> Optional[Path]:
+        """Determine path to the hierarchical nodes map, if provided."""
         system_cfg = getattr(self, "system_config", None) or {}
-        explicit = system_cfg.get("state_map_path") or os.getenv("STATE_MAP_PATH")
+        explicit = (
+            system_cfg.get("nodes_map_path")
+            or system_cfg.get("state_map_path")
+            or os.getenv("NODES_MAP_PATH")
+            or os.getenv("STATE_MAP_PATH")
+        )
         path: Path
         if explicit:
             path = Path(str(explicit))
         else:
             sys_path = getattr(self, "system_config_path", None)
             if sys_path:
-                path = Path(sys_path).with_name("state-map.json")
+                path = Path(sys_path).with_name("nodes-map.json")
             else:
-                path = Path("config/state-map.json")
+                path = Path("config/nodes-map.json")
         if not path.is_absolute():
             path = (Path.cwd() / path).resolve()
         return path
@@ -247,6 +281,79 @@ class HierarchyMixin:
             path = (Path.cwd() / path).resolve()
         return path
 
+    def _scope_order_for_nodes_map(self) -> List[str]:
+        """Return scope names ordered from highest to lowest index."""
+        configs = getattr(self, "scope_configs", None)
+        if not configs:
+            configs = self._load_scope_config()
+            self.scope_configs = configs
+        ordered = sorted((cfg for cfg in configs.values() if cfg.scope_name), key=lambda cfg: cfg.scope_index, reverse=True)
+        return [cfg.scope_name.lower() for cfg in ordered]
+
+    def _load_nodes_map_metadata(self) -> NodesMapMetadata:
+        """Load the hierarchical nodes map once and cache it."""
+        cached = getattr(self, "_nodes_map_metadata", None)
+        if cached is not None:
+            return cached
+        scope_order = self._scope_order_for_nodes_map()
+        path = self._resolve_nodes_map_path()
+        if not scope_order or not path:
+            metadata = NodesMapMetadata(rosters={}, child_map={}, memberships={})
+        else:
+            try:
+                metadata = load_nodes_map(path, scope_order)
+            except ValueError as exc:
+                hierarchy_logger.warning("Failed to load nodes map from %s: %s", path, exc)
+                metadata = NodesMapMetadata(rosters={}, child_map={}, memberships={})
+        setattr(self, "_nodes_map_metadata", metadata)
+        return metadata
+
+    def _scope_rosters(self, scope_name: Optional[str] = None) -> Mapping[str, List[str]]:
+        metadata = self._load_nodes_map_metadata()
+        if not scope_name:
+            return metadata.rosters
+        return metadata.rosters.get(str(scope_name).lower(), {})
+
+    def _scope_children(self, scope_name: str, scope_id: str) -> Mapping[str, List[str]]:
+        metadata = self._load_nodes_map_metadata()
+        key = (str(scope_name).lower(), str(scope_id))
+        return metadata.child_map.get(key, {})
+
+    def _node_scope_memberships(self) -> Mapping[str, Dict[str, str]]:
+        metadata = self._load_nodes_map_metadata()
+        return metadata.memberships
+
+    def _init_scope_role_pools(self) -> None:
+        """Initialize round-robin pools for aggregators and fan-out members."""
+        metadata = self._load_nodes_map_metadata()
+        aggregator_pools: Dict[Tuple[str, str], RoundRobinPool] = {}
+        fanout_pools: Dict[Tuple[str, str], RoundRobinPool] = {}
+        for scope_name, scope_map in metadata.rosters.items():
+            for scope_id, nodes in scope_map.items():
+                if not nodes:
+                    continue
+                key = (scope_name, scope_id)
+                aggregator_pools[key] = RoundRobinPool(nodes)
+                fanout_pools[key] = RoundRobinPool(nodes)
+        self._aggregator_pools = aggregator_pools
+        self._fanout_pools = fanout_pools
+
+    def _next_scope_aggregators(self, scope_name: str, scope_id: str, count: int = 1) -> List[str]:
+        """Return the next aggregators for the supplied scope using round-robin ordering."""
+        pools = getattr(self, "_aggregator_pools", None) or {}
+        pool = pools.get((scope_name.lower(), str(scope_id)))
+        if not pool:
+            return []
+        return pool.next(max(1, count))
+
+    def _next_scope_fanout_members(self, scope_name: str, scope_id: str, count: int = 1) -> List[str]:
+        """Return fan-out nodes for the supplied scope using round-robin ordering."""
+        pools = getattr(self, "_fanout_pools", None) or {}
+        pool = pools.get((scope_name.lower(), str(scope_id)))
+        if not pool:
+            return []
+        return pool.next(max(1, count))
+
     @staticmethod
     def _trainer_to_container(trainer_id: str) -> Optional[str]:
         suffix = "".join(ch for ch in str(trainer_id) if ch.isdigit())
@@ -262,27 +369,9 @@ class HierarchyMixin:
 
     def _load_state_metadata(self) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
         """Load state rosters and derive cluster coverage for each state."""
-        rosters: Dict[str, List[str]] = {}
+        scope_rosters = self._scope_rosters("state") or {}
+        rosters: Dict[str, List[str]] = {scope_id: list(nodes) for scope_id, nodes in scope_rosters.items()}
         cluster_map: Dict[str, List[str]] = {}
-        roster_path = self._resolve_state_map_path()
-        if roster_path and roster_path.exists():
-            try:
-                data = json.loads(roster_path.read_text())
-                states = data.get("states") or []
-                for entry in states:
-                    state_id = str(entry.get("state_id") or entry.get("id") or "").strip()
-                    nodes = entry.get("nodes") or []
-                    if not state_id or not isinstance(nodes, list) or not nodes:
-                        continue
-                    normalized = []
-                    for node in nodes:
-                        node_id = str(node).strip()
-                        if node_id:
-                            normalized.append(node_id)
-                    if normalized:
-                        rosters[state_id] = list(dict.fromkeys(normalized))
-            except (OSError, json.JSONDecodeError) as exc:
-                hierarchy_logger.warning("Failed to load state map from %s: %s", roster_path, exc)
         topo_path = self._resolve_topology_path()
         container_to_clique: Dict[str, int] = {}
         if topo_path and topo_path.exists():

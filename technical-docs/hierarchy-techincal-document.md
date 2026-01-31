@@ -1,178 +1,129 @@
-# Hierarchical Aggregation Logic (State → Nation)
+# Hierarchical Aggregation Logic (Cluster → State → Nation)
 
-## 1. Scope
-This document describes the orchestration logic for aggregation layers that sit above the clique/cluster level. It focuses on two tiers:
-- **State level** – currently implemented end-to-end (collection, digest consensus, anchoring, and downstream replay).
-- **Nation level** – scheduling hooks that watch the state layer and announce higher-tier rounds.
+## 1. Scope and Terminology
+- **Level 0** is synonymous with the cluster layer. This naming is fixed.  
+- A **high-level** round is any round where `level > 0` (state, nation, future tiers).  
+- The document captures the clarified intent of the hierarchy architecture so implementation teams can evolve existing code (`secure_aggregation.communication.node_service.NodeService` and friends) toward the new behavior.
 
-All mechanics live primarily in `secure_aggregation.communication.node_service.NodeService` and supporting helpers under `state/` and `convergence/`.
+## 2. Inputs and Configuration
+1. **Hierarchical Nodes Map (`config/nodes-map.json`)** lists every scope and its members. The schema mirrors `hierarchy_levels`: each object uses the `scope_name` from the config as its key and nests children using the next level’s `scope_name`. Example (scope levels: nation → state → cluster → node):
+   ```json
+   {
+     "nation": [
+       {
+         "nation_id": "VNM",
+         "states": [
+           {
+             "state_id": "state_alpha",
+             "clusters": [
+               {
+                 "cluster_id": "cluster_1",
+                 "nodes": [
+                   "trainer-node-001",
+                   "trainer-node-002"
+                 ]
+               }
+             ]
+           }
+         ]
+       }
+     ]
+   }
+   ```
+   Administrators can add new levels by editing both `hierarchy_levels` and this map; the runtime resolves scope IDs dynamically at startup and treats the resulting structure as immutable for the session.  
+2. **Central Metadata (`central_broadcast.py`)** enumerates `central_nodes` and `cluster_ids`. All nodes pull the latest version so they know the scopes they belong to and which upstream IDs to reference.  
+3. **System Configuration (`system-config.json`)** declares an array of `hierarchy_levels`. Each entry now includes:
+   - `scope_index`, `scope_name`, `scope_id`  
+   - `interval_seconds` (replaces `rounds_per_scope` for high-levels)  
+   - Waiting policy knobs (`wait_seconds`, retry count) that nodes honor when pausing for high-level models  
+   - Merge policy fields (`apply_policy`, `apply_alpha`, etc.) so nodes know how to assimilate each scope’s model when fetched directly.
 
-## 2. Inputs and Topology Metadata
-1. **State Map (`config/state-map.json`)**  
-   - Defines roster per state (`state_id`, desired node count, optional explicit trainer IDs).  
-   - `scripts/run_docker_with_nodes.py` consumes this file to generate node configs and to label containers with logical trainer IDs that align with blockchain identities.
-2. **Central Metadata (`central_broadcast.py`)**  
-   - TTP populates `central_nodes` (ring-star “hub” clique) and `cluster_ids`.  
-   - All nodes can fetch the latest version from the blockchain registry; state aggregators use it to know which clusters must contribute ECMs.
-3. **System Configuration (`system-config.json`)**  
-   - Carries a `hierarchy_levels` array. Each entry declares `scope_index` (1 = closest to clusters), `scope_name`, `scope_id`, `rounds_per_scope`, and optional election/timeout knobs.  
-   - Shared defaults (timeouts, policies, etc.) live under `hierarchy_defaults` and are merged into every level.
+## 3. Level Inventory
+Current deployments use three scopes:
+1. **Level 0 – Cluster**: baseline secure aggregation with secure aggregation protocol → blockchain/IPFS commit after every cluster round.  
+2. **Level 1 – State**: high-level scope aggregating cluster representatives.  
+3. **Level 2 – Nation**: high-level scope aggregating state representatives.  
+The system remains extensible; to add more tiers, extend the config and the time-based scheduler automatically activates them.
 
-## 3. State-Level Flow
+## 4. Time-Based Scheduling of High-Level Rounds
+- Level 0 still runs each time the cluster secure aggregation completes.  
+- Level ≥ 1 rounds are no longer triggered by counting lower-level rounds.  
+- Instead, each high-level scope defines an `interval_seconds`:
+  - Every `t1` seconds → trigger the state round.  
+  - Every `t2` seconds → trigger the nation round.  
+- Administrators ensure `t1 < t2` (or any other hierarchy-consistent constraints) through configuration.  
+- Scheduling daemons fire based on wall-clock timers; if a timer fires while a prior high-level round is still running, the new request is queued until the scope is idle.
 
-### 3.1 Candidate Election
-1. Nodes parse the level-1 hierarchy config (scope_index=1) at startup (`NodeService._load_scope_config`).  
-2. When central metadata arrives, `_configure_state_layer()`:
-   - Derives the candidate pool. For `ring_star`, candidates are `central_nodes`.  
-   - Creates a dedicated `ECMBuffer` for candidates so state digests do not evict clique-level ECMs.  
-   - Instantiates a `StateAggregator` (needs IPFS + blockchain handles).
-3. Each candidate advertises its bridge address offset (+2000) so central peers can exchange digests.
+## 5. Node Runtime Behavior (Non-Blocking Execution)
+### 5.1 Waiting Logic
+- Nodes are never globally blocked by a running high-level round.  
+- When a scheduler announces that scope `S` started, every node checks whether it belongs to `S`.  
+- If yes, it waits for `scope.wait_seconds`. During this window the node pauses local training to give aggregators time to publish models.  
+- After the timer elapses, the node proceeds regardless of aggregator status.
 
-### 3.2 Scheduling
-1. `_state_layer_enabled()` requires `enabled` and `rounds_per_state > 0`.  
-2. At the end of each cluster round, `_maybe_start_state_round(round_idx)` checks whether `(round_idx + 1) % rounds_per_state == 0`.  
-3. If due, it enqueues `(state_round_id, cluster_round_idx)` so execution can happen after local persistence tasks finish.
+### 5.2 Model Fetch Endpoint
+- Once the wait period ends, nodes call the blockchain/IPFS endpoint for scope `S` with retries as configured.  
+- Endpoints are level-aware: the node must specify `(scope_id, desired_level)` so it receives the latest CID for that scope.  
+- If the endpoint returns `404 / empty`, the node resumes cluster rounds. There is no further blocking; nodes will check again the next time the waiting logic triggers.
 
-### 3.3 ECM Collection
-1. `_run_next_state_round()` drains the queue and calls `_dispatch_state_ecm_to_central()` to ensure bridge nodes forward their latest ECM (CID/hash) to all central targets.  
-2. State candidates read their dedicated `state_ecm_buffer`; `_execute_state_round()` repeatedly calls `StateAggregator.build_snapshot()` until every required cluster has contributed, or a collection deadline (default `collection_timeout_seconds`) hits.
-3. Missing clusters trigger warning logs; if coverage is incomplete at the deadline, the round aborts and cluster-level training continues without anchoring.
+### 5.3 Direct Pull and Merge
+- High-level models are no longer pushed downward tier by tier. Nodes directly pull the scope that was executing.  
+- Nodes cache merge metadata per `(scope_id, cid)`. If the CID matches the last applied model, the node skips the merge and continues training.  
+- When a new CID is observed, the node fetches the model from IPFS and merges it into its local model using the level-specific policy declared in `hierarchy_levels`:
+  - e.g., State level → `apply_policy = "replace"`.  
+  - Nation level → `apply_policy = "interpolate"` with `alpha = 0.2`.  
+- These policies are enforced in `NodeEngine.merge_with_scope_model()` (or equivalent) to ensure deterministic application.
 
-### 3.4 Model Retrieval and Merge
-1. For each snapshot entry, `StateAggregator.fetch_models()` pulls tensors from IPFS using the recorded CID or, if missing, a fallback anchor lookup (`_lookup_cluster_anchor`).  
-2. `verify_model_hash()` guarantees integrity.  
-3. `StateAggregator.merge_models()` averages the numpy arrays in deterministic order (cluster ID sorted) and caches the merged tensor plus its SHA256 hash inside `NodeService._state_round_cache`.
+## 6. High-Level Aggregation Pipeline
+### 6.1 Collection with Relaxed Input Freshness
+- Every high-level aggregator still requires a submission from each immediate lower-level representative.  
+- The submission does **not** need to correspond to the most recent round; the representative simply uploads its latest available model.  
+- Aggregators proceed as soon as all representatives have provided *something*, even if those models represent different lower-level rounds. Newer contributions will eventually surface during later intervals.
 
-### 3.5 Digest Consensus
-1. Each candidate broadcasts a lightweight digest via bridge gRPC using the `state::STATE_ID` channel. Payload contains `cluster_round`, `node_id`, and the hash.  
-2. `_await_state_digest_consensus()` waits up to `digest_timeout_seconds` for digests from every candidate.  
-3. `_record_state_digest()` stores both local and remote digests; `_verify_state_digest_consensus()` checks that every hash matches. If hashes differ, the round is rejected (no anchoring).  
-4. Once all digests agree, `_maybe_finalize_state_round()` invokes `_try_state_commit()`.
+### 6.2 Merge, Digest, and Commit
+1. **Merge** – Aggregators fetch input tensors (cluster models for state, state models for nation) from IPFS, verify hashes, and run the scope’s merge algorithm.  
+2. **Digest** – Candidates exchange digests across their coordination channel (e.g., `state::STATE_ID`) to ensure all view the same hash for the merged model. The strict consensus requirement for hash equality remains.  
+3. **Commit** – A single aggregator (see Section 8) publishes the merged tensor to IPFS and anchors the CID/hash on-chain under `/scope/{scope_name}/models`. Others simply watch the blockchain to verify completion.  
+4. **Notification** – Aggregators update the blockchain endpoint so nodes requesting the latest `(scope_id, level)` receive the just-anchored CID.
 
-### 3.6 Commit and Anchoring
-1. `_try_state_commit()` rotates the commit leader each round (`leader_index = state_round % len(candidates)`) to distribute blockchain usage.  
-2. The active leader:
-   - Calls `StateAggregator.publish_state_model()` to add the merged tensor to IPFS (`cid`) and anchor the CID/hash on-chain under the state namespace ( `/state/models`).  
-   - If anchoring fails, the next candidate waits for the public anchor; if none appears before `commit_timeout_seconds`, the function iterates to the next candidate.
-3. Non-leaders poll `_wait_for_state_anchor()` to observe the blockchain commit and mark the round as completed once seen.
-4. After anchoring, the merged model stays cached for downstream application, and the digest/ECM caches for that round are cleared.
+### 6.3 Fan-Out Responsibilities
+- Every immediate lower scope must designate a fan-out set of nodes responsible for relaying its latest model metadata (CID + hash) to the next higher scope.  
+- `system-config.json` adds `fanout_count` (per scope) so administrators can tune redundancy. Example: a state with four clusters and `fanout_count = 2` means each cluster assigns two nodes to report its cluster model to the state aggregator.  
+- During each high-level round:
+  1. Fan-out nodes fetch the latest CID/hash for their *own* scope (e.g., cluster nodes read the current cluster model anchor).  
+  2. They push this metadata to the higher-level aggregator once the high-level round’s waiting period completes. Multiple nodes will send duplicates; aggregators deduplicate by `(scope_id, cid)`.  
+  3. After deduplication, the aggregator expects exactly one unique CID per lower-level scope. Missing scopes trigger the usual timeout logic, but duplicated submissions are normal and provide resilience.  
+- Example: a nation round covers four states. Each state has `fanout_count = 2`, so eight fan-out nodes send their state model CIDs/hashes to the nation aggregator. The aggregator reduces these to four unique CIDs, verifies each hash against blockchain, pulls the corresponding models, and merges them into the new nation model.
 
-### 3.7 Consumption by Cluster Nodes
-1. `_maybe_apply_state_model(round_idx)` runs before each cluster round.  
-2. When a new state anchor exists for `state_id`, nodes fetch it from blockchain/IPFS, verify the hash, and overwrite their local PyTorch model parameters.  
-3. Convergence trackers are “primed” so subsequent delta comparisons measure drift from the state baseline instead of the pre-state global model.  
-4. ECM dispatch for subsequent state rounds always references the most recently applied state model (`_last_model_cid/hash`).
+## 7. Asynchronous Model Retrieval via Blockchain
+### 7.1 Level Identification
+- Blockchain exposes `GET /model/{scope_id}` (illustrative) so nodes can retrieve the latest CID per level without needing to know round indices.  
+- Each node must store the IDs of every high-level scope it belongs to (cluster, state, nation, etc.) and use those IDs when querying.
 
-### 3.8 Failure and Retry Handling
-- **Incomplete ECM coverage** – The round is skipped; scheduler re-attempts on the next interval.  
-- **Digest mismatch** – Logs warning, no anchor is attempted; the round must rerun later.  
-- **Anchor publish failure** – Leader logs error and next candidate takes over (round remains scheduled until any anchor is observed).  
-- **Observer fallback** – Non-candidate nodes use `_wait_for_state_anchor_observer()` to poll for a committed anchor before resuming cluster rounds, preventing divergence when they rely on state checkpoints.
+### 7.2 Merge Tracking
+- Nodes store `(scope_id, last_merged_cid)` locally.  
+- After the waiting period, nodes call the endpoint; if the returned CID differs from the stored CID, they perform the merge and update the tracker. Otherwise they skip.
 
-## 4. Generalized Multi-Tier Pattern
+### 7.3 Async / Skippable Behavior
+- Because retrieval is CID-based instead of round-based, nodes can merge a delayed round later or skip a stale round entirely.  
+- Example scenarios now supported:
+  - A node merges the nation model from round 3 during the execution window of round 4.  
+  - If round 4’s model never completes (timeout), the node simply waits for round 5’s CID and merges that.  
+- Eventually every node incorporates high-level information even if they miss intermediate rounds.
 
-To add layers above state without rewriting orchestration code, we treat every tier as an instance of the same state-machine with pluggable inputs/outputs and on-demand connectivity. Aggregators no longer need to keep permanent channels to every lower-tier member; instead, they reach out to a configurable subset when a tier round starts.
+## 8. Aggregator Election (Single Aggregator per Round)
+- For each high-level round, only one aggregator performs the final commit.  
+- Aggregators are assigned in round-robin across the candidate list.  
+- If the chosen aggregator fails health checks or cannot meet deadlines, the system automatically advances to the next candidate for that same round.  
+- There is no inter-aggregator consensus stage beyond digest checking; once the active aggregator publishes the model, others accept it.
 
-### 4.1 Tier-Agnostic Phases
+## 9. Sequence Summary Under the Updated Architecture
+1. Cluster rounds proceed continuously; after each round, secure aggregation publishes to blockchain/IPFS as before.  
+2. Independent timers trigger state and nation rounds at intervals `t1` and `t2`.  
+3. When a high-level round begins, nodes belonging to that scope wait for `wait_seconds`, then query the blockchain endpoint for `(scope_id, level)` to fetch the latest CID.  
+4. Aggregators collect the latest available submissions from lower levels, even if representing different round numbers, merge, digest, and commit using the single assigned aggregator.  
+5. Nodes retry fetches until they discover a CID they have not yet merged and then apply the configured policy (replace/interpolate/etc.) directly from that scope.  
+6. Because merges are logged per-CID, nodes can safely operate asynchronously: they may ingest round `n-1` during round `n`, or skip entirely if a newer CID supersedes it.  
+7. The process repeats independently for each level, and new levels can be added by editing `hierarchy_levels` with appropriate IDs, intervals, and merge rules.
 
-| Phase | Tier-Agnostic Behavior | Tier-Specific Inputs | Tier Outputs |
-|-------|-----------------------|----------------------|--------------|
-| Scope aggregator election | Pick the most robust nodes for the tier (uptime, stake, reliability, or even random for experimental tiers). | `candidate_selector` strategy, max aggregator count, minimum reputation. | Ordered list of aggregators plus fallback list. |
-| On-demand fan-out | When a tier round begins, each aggregator dials up to `fanout_per_group` nodes per lower-level group (configurable). | Lower-tier roster, connection policy, timeouts. | Set of `SourceContribution` records (group id, node id, cid/hash). |
-| Scheduling | Determine when a tier-round fires (`rounds_per_<tier>`). | Interval + pointer to driving rounds. | Queue entry `(tier_round_id, source_round_idx)`. |
-| Collection & dedupe | Merge contributions from multiple nodes per group, filter duplicates, ensure quorum per group. | Dedup key (cid/hash), per-group quorum. | Snapshot map `{group_id -> [unique references]}`. |
-| Retrieval & merge | Fetch tensors, verify hashes, average/merge. | Tensor shape + merge weights. | Merged ndarray + hash cached per tier round. |
-| Digest consensus | Aggregators exchange hashes via `tier::<tier_id>` channel only after forming ad-hoc connections. | Tier name + aggregator contact info. | Consensus digest ledger. |
-| Commit | Leader (rotating) anchors merged tensor to blockchain/IPFS. | Anchor scope + identifier. | Persistent CID/hash for downstream tiers. |
-| Replay | Lower tiers poll for new anchors and overwrite their baseline. | Scope ID + application policy. | Updated model parameters + convergence reset. |
-
-### 4.2 Implementation Strategy
-1. **Tier descriptors** – Define `TierConfig` objects with `tier_name`, `anchor_scope`, `rounds_per_tier`, `digest_channel_prefix`, `source_scope`, `candidate_selector`, `max_aggregators`, and `fanout_per_group`.
-2. **Aggregator selection** – Provide pluggable strategies:
-   - Reliability-weighted selection (state tier default).
-   - Random sampling for experimental tiers (e.g., nation).
-   - Stake-based or reputation-based as future options.
-3. **Ephemeral connections** – When `_maybe_execute_tier_round(tier_cfg)` runs, selected aggregators:
-   - Query the topology service for the roster of lower-level groups.
-   - Randomly choose up to `fanout_per_group` nodes inside each group and establish temporary channels (gRPC, HTTP, etc.).
-   - Request the latest anchored CID/hash references.
-4. **Snapshot assembly** – Deduplicate references per group so even if both aggregators fetched overlapping nodes the merged snapshot lists each CID once.
-5. **Digest + commit helpers** – Reuse the existing functions but parameterize by `tier_cfg`. Aggregators exchange digests only with other aggregators of the same tier; no broad gossip is needed.
-6. **Recursive replay** – After anchoring, call `_apply_tier_model(tier_cfg, tier_round)` to push the update downstream. Lower tiers keep no knowledge of the connection fan-out—they simply subscribe to their designated scope on the blockchain.
-
-With this pattern, adding “nation”, “federation”, or deeper layers is purely configuration: define how to elect aggregators, how many lower-tier nodes to interrogate per group, and how often the tier round should run. The scheduler, digest, and anchoring pipelines stay identical.
-
-## 5. Nation-Level Flow (Example)
-
-### 5.1 Configuration and Scheduling
-- Higher-level `HierarchyLevelConfig` entries add knobs like `max_aggregators`, `fanout_per_scope`, and `rounds_per_scope`.  
-- The tier scheduler watches completed state rounds; whenever `(state_round % rounds_per_nation) == 0`, it enqueues a nation round with a pointer to the triggering state round.  
-- The active config defines the `nation::NATION_ID` digest channel and the anchor scope (either `STATE` or a dedicated `NATION` namespace).  
-
-### 5.2 Aggregator Selection and Fan-out
-- **Aggregator count** – `max_aggregators = 2`. Two nodes are randomly selected from the entire fleet (configurable to prefer reputational scores later).  
-- **Connection pattern** – For each state group, a nation aggregator chooses up to `fanout_per_group` nodes (e.g., 3) and establishes temporary connections only while collecting references. The nodes need not be bridge nodes; any participant holding the latest state anchor reference suffices.  
-- **Reference gathering** – Each contacted node returns `(cid, hash, state_round)` for its state. Aggregators deduplicate references (if both pulled from the same state node) so each state contributes once.
-
-### 5.3 Nation Round Lifecycle
-1. **Scheduling** – After every `rounds_per_nation` state rounds, `_maybe_schedule_tier_round(nation_cfg)` enqueues a nation round with pointer to the triggering state round.  
-2. **Collection** – Aggregators fetch references from lower-tier nodes using the fan-out rules. They verify that every state group is represented, respecting per-group quorum thresholds.  
-3. **Merge & digest** – Aggregators download tensors from IPFS, merge into the nation model, and exchange digests on the `nation::NATION_ID` channel. Multiple aggregators cross-validate hash equality before proceeding.  
-4. **Commit** – A rotating leader anchors the nation model under its namespace (e.g., `/nation/models`) and uploads to IPFS. Other aggregators observe the anchor and mark the round complete.  
-5. **Distribution** – Using the same temporary connections, aggregators notify at least one node per state that a new nation model is available. States then replay the anchor and push it down to their respective cliques.
-
-This example illustrates how higher tiers inherit the same primitives—only the selection policy, fan-out, and scope identifiers change.
-
-## 6. Sequence Summary
-1. Cluster rounds emit ECMs + metadata.  
-2. State round scheduling fires every `rounds_per_state`.  
-3. State candidates collect ECMs → fetch models → merge → broadcast digests → anchor.  
-4. Cluster nodes pull anchored state models before continuing training.  
-5. After each successful state round, nation round counters increment; once the configured ratio is met, nation hooks notify downstream automation so the upper tier can repeat the same pattern with aggregated state checkpoints.
-
-## 7. Top-Down Model Application Logic
-
-To avoid destabilizing local models when higher tiers publish new checkpoints, application must proceed scope-by-scope (nation → state → cluster → node) using a configurable assimilation algorithm rather than naive replacement. This mirrors best practices from large-scale FL systems (e.g., model interpolation and dampened updates used in production fleets).
-
-### 7.1 General Algorithm
-For each tier `T` (nation, federation, state, etc.) and its immediate downstream tier `T-1`:
-1. Wait until the downstream tier confirms the upstream anchor exists (poll blockchain/IPFS).
-2. Fetch the upstream tensor `M_T` and verify its hash.
-3. Run an `ApplyPolicy` that blends `M_T` with the downstream baseline `M_{T-1}` before handing it off.
-
-Common `ApplyPolicy` strategies (configurable per tier):
-- **Full Replace** (state → cluster legacy mode): `M_{T-1}' = M_T`.  
-- **Model interpolation / partial averaging** (default for higher tiers):  
-  \[
-  W_{t+1}^{(T-1)} = \alpha \, W_{t+1}^{(T)} + (1 - \alpha) \, W_{t}^{(T-1)}, \quad 0 < \alpha < 0.5
-  \]
-  where \(W_{t}^{(T-1)}\) is the downstream baseline before the update, \(W_{t+1}^{(T)}\) is the freshly anchored upstream model, and \(\alpha\) is supplied via configuration (e.g., the level-1 `apply_alpha = 0.2`).  
-- **Adaptive Trust** (inspired by FedProx/Elastic Averaging): dynamically set \(\alpha\) based on divergence or group reliability.  
-- **Layer-wise Injection**: only replace specific layers (e.g., classifier head) while leaving feature backbone untouched.
-
-### 7.2 Top-Down Propagation Steps
-Propagation is triggered only when the system reaches a tier that has no higher-level rounds queued. Example: if a nation round finishes but a continent round is scheduled to run immediately after, the nation layer caches its result and waits for the continent tier to finish (and for confirmation that no higher tier is pending). Once the topmost active tier completes, cascading proceeds top-down, one tier at a time, ensuring no higher layer will override the update mid-flight.
-
-1. **Nation → State**  
-   - Nation aggregator publishes anchor.  
-   - If a higher tier (e.g., continent) is scheduled or running, nation nodes defer propagation until that tier completes. Otherwise, each state aggregator polls `AnchorScope.NATION`, retrieves `M_nation`, and applies the configured policy (default: interpolated merge) to produce `M_state'`.  
-   - `M_state'` becomes the new baseline for state-level rounds and is cached as the reference when dispatching ECMs to nation aggregators during the next cycle.
-2. **State → Cluster**  
-   - State anchors already exist today; `_maybe_apply_scope_model()` should obey each level's `apply_policy` from its hierarchy config. If the state tier still has pending rounds for the same macro-cycle, propagation is postponed until the scope round queue drains.  
-   - After applying, call `_prime_convergence_tracker_state()` so delta metrics reset relative to the updated baseline.
-3. **Cluster → Node**  
-   - When clusters finish secure aggregation and no more cluster-level windows remain before the next higher-tier trigger, nodes optionally perform a final blend with their local cache (useful for devices with personalization layers). This is already supported via `NodeEngine.merge_with_remote()`; exposing the same policy knobs keeps all tiers consistent.
-
-### 7.3 Implementation Hooks
-- Introduce a shared utility `apply_tier_update(tier_cfg, upstream_tensor, local_tensor)` returning the blended tensor and metadata (`alpha_used`, `source_round`).  
-- Each `HierarchyLevelConfig` includes policy fields (including the interpolation weight \(\alpha\)):
-  ```json
-  {
-    "apply_policy": "interpolate",
-    "apply_alpha": 0.3,
-    "apply_layer_mask": ["classifier.*"]
-  }
-  ```
-- Ensure each tier calls `apply_tier_update` only after its direct upstream has settled; no tier jumps directly to node level. This guarantees deterministic sequencing: Nation anchor → states assimilate → clusters assimilate → individual nodes refresh.
-
-By enforcing step-wise application with configurable blending—and waiting until the highest pending tier completes before cascading—we prevent abrupt shifts, preserve personalization, and make it trivial to add yet another tier. Once the topmost round settles, every scope inherits the new model in order: highest tier → … → nation → state → cluster → node, never skipping intermediate checkpoints.
+This document now serves as the canonical specification for implementing the clarified hierarchy approach: high-level rounds are scheduled by time, nodes remain non-blocking, model dissemination happens via direct pulls keyed by scope IDs, aggregators accept asynchronous inputs, and exactly one aggregator anchors each round using round-robin selection.

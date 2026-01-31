@@ -1,0 +1,27 @@
+{
+  "nation": [
+    {
+      "nation_id": "nation_0",
+      "states": [
+        {
+          "state_id": "state_alpha",
+          "nodes": [
+            "trainer-node-001",
+            "trainer-node-002",
+            "trainer-node-003",
+            "trainer-node-004"
+          ]
+        },
+        {
+          "state_id": "state_beta",
+          "nodes": [
+            "trainer-node-005",
+            "trainer-node-006",
+            "trainer-node-007",
+            "trainer-node-008"
+          ]
+        }
+      ]
+    }
+  ]
+}
