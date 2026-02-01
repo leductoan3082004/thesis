@@ -153,9 +153,9 @@ def _add_edge(edges: Set[Tuple[int, int]], a: int, b: int) -> None:
 
 def build_interclique_edges(
     cliques: Sequence[Set[str]],
-    mode: str = "ring_star",
+    mode: str = "ring_extra",
     small_world_c: int = 2,
-    ring_star_extra: int = 0,
+    ring_star_extra: int = 1,
 ) -> List[Tuple[int, int]]:
     """
     Construct inter-clique edges between clique indices.
@@ -164,13 +164,13 @@ def build_interclique_edges(
         cliques: Collection of node sets.
         mode: Inter-clique topology mode.
         small_world_c: Number of power-of-two offsets when mode == "small_world".
-        ring_star_extra: Extra random edges per clique when mode == "ring_star".
+        ring_star_extra: Extra random edges per clique when mode == "ring_star" or "ring_extra".
     """
     num = len(cliques)
     edges: Set[Tuple[int, int]] = set()
     if num <= 1:
         return []
-    if mode not in {"ring", "fractal", "small_world", "fully_connected", "ring_star"}:
+    if mode not in {"ring", "ring_extra", "ring_star", "fractal", "small_world", "fully_connected"}:
         raise ValueError(f"Unknown edge mode '{mode}'")
     if small_world_c <= 0 and mode == "small_world":
         raise ValueError("small_world_c must be positive")
@@ -180,6 +180,11 @@ def build_interclique_edges(
     for i in range(num):
         _add_edge(edges, i, (i + 1) % num)
     if mode == "ring":
+        return sorted(edges)
+    if mode == "ring_extra":
+        if ring_star_extra > 0:
+            rng = random.Random(num * 37 + 7)
+            _add_ring_star_extra_edges(edges, num, ring_star_extra, rng)
         return sorted(edges)
     if mode == "ring_star":
         # Choose the clique with the most nodes (ties broken by lowest index).
@@ -498,9 +503,9 @@ def build_full_topology(
     node_labels: Mapping[str, Mapping[str, float] | str],
     clique_size: int,
     iterations: int = 1000,
-    edge_mode: str = "small_world",
+    edge_mode: str = "ring_extra",
     small_world_c: int = 2,
-    ring_star_extra: int = 0,
+    ring_star_extra: int = 1,
     seed: int | None = None,
     node_scope_assignments: Mapping[str, str] | None = None,
 ) -> Tuple[List[Set[str]], List[Tuple[str, str]], List[Tuple[str, str]], Dict[str, int]]:

@@ -61,7 +61,7 @@ class ScenarioConfig:
     participants: List[str]
     threshold: int
     clique_size: int
-    inter_clique_edges: str = "small_world"
+    inter_clique_edges: str = "ring_extra"
     topology_iterations: int = 1000
     small_world_c: int = 2
     service_hostnames: Dict[str, str] = field(default_factory=dict)
@@ -87,8 +87,8 @@ class ScenarioConfig:
             raise ValueError("Scenario participants must be unique")
         if threshold <= 0 or threshold > len(participants):
             raise ValueError("Scenario threshold must satisfy 0 < t <= |participants|")
-        inter_clique_edges = data.get("inter_clique_edges", "small_world")
-        if inter_clique_edges not in {"ring", "fractal", "small_world", "fully_connected"}:
+        inter_clique_edges = data.get("inter_clique_edges", "ring_extra")
+        if inter_clique_edges not in {"ring", "ring_extra", "ring_star", "fractal", "small_world", "fully_connected"}:
             raise ValueError(f"Unknown inter-clique edge mode '{inter_clique_edges}'")
         topology_iterations = int(data.get("topology_iterations", 1000))
         if topology_iterations <= 0:

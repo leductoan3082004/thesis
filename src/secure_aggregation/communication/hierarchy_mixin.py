@@ -346,6 +346,39 @@ class HierarchyMixin:
             return []
         return pool.next(max(1, count))
 
+    def _scope_interval_seconds(self, config: Optional[HierarchyLevelConfig]) -> float:
+        if not config:
+            return 0.0
+        try:
+            return float(getattr(config, "interval_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _init_scope_timers(self) -> None:
+        """Initialize per-scope round counters and timer deadlines."""
+        now = time.time()
+        counters: Dict[str, int] = {}
+        next_fire: Dict[str, float] = {}
+        for name, cfg in (getattr(self, "scope_configs", None) or {}).items():
+            counters[name] = 0
+            interval = self._scope_interval_seconds(cfg)
+            if interval > 0:
+                next_fire[name] = now + interval
+        self._scope_round_counters = counters
+        self._scope_next_fire_at = next_fire
+
+    def _increment_scope_round(self, scope_name: str, fallback: Optional[int] = None) -> int:
+        counters = getattr(self, "_scope_round_counters", None)
+        if counters is None:
+            counters = {}
+            self._scope_round_counters = counters
+        current = counters.get(scope_name, 0)
+        if fallback is not None and fallback > current:
+            counters[scope_name] = fallback
+            return fallback
+        counters[scope_name] = current + 1
+        return counters[scope_name]
+
     def _next_scope_fanout_members(self, scope_name: str, scope_id: str, count: int = 1) -> List[str]:
         """Return fan-out nodes for the supplied scope using round-robin ordering."""
         pools = getattr(self, "_fanout_pools", None) or {}
@@ -528,18 +561,25 @@ class HierarchyMixin:
             )
 
     def _scope_layer_enabled(self) -> bool:
-        return bool(self.scope_config.enabled and self.scope_config.rounds_per_scope > 0)
+        interval = self._scope_interval_seconds(self.scope_config)
+        return bool(self.scope_config.enabled and (self.scope_config.rounds_per_scope > 0 or interval > 0))
 
     def _higher_scope_enabled(self) -> bool:
         higher_cfg = getattr(self, "higher_scope_config", None)
-        rounds_per = getattr(higher_cfg, "rounds_per_scope", 0) if higher_cfg else 0
-        return bool(higher_cfg and higher_cfg.enabled and rounds_per > 0)
+        if not higher_cfg:
+            return False
+        interval = self._scope_interval_seconds(higher_cfg)
+        rounds_per = getattr(higher_cfg, "rounds_per_scope", 0)
+        return bool(higher_cfg.enabled and (rounds_per > 0 or interval > 0))
 
     def _scope_round_budget(self) -> Optional[int]:
         """Estimate how many state rounds can occur over the training horizon."""
         if not self._scope_layer_enabled():
             return None
-        interval = max(1, self.scope_config.rounds_per_scope)
+        rounds_interval = getattr(self.scope_config, "rounds_per_scope", 0)
+        if rounds_interval <= 0:
+            return None
+        interval = max(1, rounds_interval)
         cluster_total = self.training_config.get("rounds")
         try:
             cluster_total = int(cluster_total)
@@ -568,51 +608,54 @@ class HierarchyMixin:
             or not self.model
         ):
             return
-        interval = max(1, self.scope_config.rounds_per_scope)
-        completed_rounds = (round_idx + 1) // interval
         last_applied = scope_progress.get(scope_key, 0)
-        while last_applied < completed_rounds:
-            target_round = last_applied + 1
+        next_round = last_applied + 1
+        scope_label = getattr(self.scope_config, "scope_name", "state")
+        while True:
             try:
                 anchor = self.blockchain.get_anchor(
                     scope_id,
-                    target_round,
+                    next_round,
                     scope=scope_namespace,
                 )
             except Exception as exc:  # noqa: BLE001
                 hierarchy_logger.warning(
-                    "Failed to fetch state anchor for round %d: %s",
-                    target_round,
+                    "Failed to fetch %s anchor for round %d: %s",
+                    scope_label,
+                    next_round,
                     exc,
                 )
                 return
             if anchor is None:
-                hierarchy_logger.debug(
-                    "State model round %d not yet available; will retry later",
-                    target_round,
-                )
-                return
+                if next_round == last_applied + 1:
+                    hierarchy_logger.debug(
+                        "No new %s model available for round %d; will retry later",
+                        scope_label,
+                        next_round,
+                    )
+                break
             cid, expected_hash = anchor
-            scope_label = getattr(self.scope_config, "scope_name", "state")
             hierarchy_logger.info(
                 "%s model round %d detected on blockchain (cid=%s..., hash=%s...)",
                 scope_label.capitalize(),
-                target_round,
+                next_round,
                 cid[:12],
                 expected_hash[:12],
             )
             state_model = self.ipfs.get(cid)
             if state_model is None:
                 hierarchy_logger.warning(
-                    "State model round %d unavailable on IPFS (cid=%s...)",
-                    target_round,
+                    "%s model round %d unavailable on IPFS (cid=%s...)",
+                    scope_label,
+                    next_round,
                     cid[:16],
                 )
                 return
             if not verify_model_hash(state_model, expected_hash):
                 hierarchy_logger.warning(
-                    "State model round %d hash mismatch (cid=%s...)",
-                    target_round,
+                    "%s model round %d hash mismatch (cid=%s...)",
+                    scope_label,
+                    next_round,
                     cid[:16],
                 )
                 return
@@ -620,14 +663,15 @@ class HierarchyMixin:
             self._last_model_cid = cid
             self._last_model_hash = expected_hash
             self._last_model_data_id = None
-            last_applied = target_round
+            last_applied = next_round
             scope_progress[scope_key] = last_applied
             hierarchy_logger.info(
                 "Applied %s round %d model (cid=%s...); next cluster rounds will start from this baseline",
                 scope_label.upper(),
-                target_round,
+                next_round,
                 cid[:12],
             )
+            next_round += 1
 
     def _maybe_apply_external_scope_model(self, scope_name: str, config: HierarchyLevelConfig) -> None:
         """Apply anchored models for a higher scope to this node's baseline."""
@@ -748,37 +792,84 @@ class HierarchyMixin:
             return exporter()
         return None
 
-    def _maybe_schedule_scope_round(self, round_idx: int) -> None:
-        """Trigger scope aggregation when the configured interval elapses."""
-        if not self._scope_layer_enabled():
-            hierarchy_logger.debug("Skipping %s round scheduling: layer disabled", self._scope_label_lower())
+    def _schedule_round_for_handler(self, handler: ScopeRoundHandler, trigger_round_idx: int) -> None:
+        config = handler.config
+        scope_label = getattr(config, "scope_name", handler.scope_name) or handler.scope_name
+        enabled = bool(
+            getattr(config, "enabled", False)
+            and (
+                getattr(config, "rounds_per_scope", 0) > 0
+                or self._scope_interval_seconds(config) > 0
+            )
+        )
+        if not enabled:
             return
-        interval = self.scope_config.rounds_per_scope
-        if interval <= 0:
+        scope_key = handler.scope_name.lower()
+        interval_seconds = self._scope_interval_seconds(config)
+        if interval_seconds > 0:
+            next_fire_map = getattr(self, "_scope_next_fire_at", None)
+            if next_fire_map is None:
+                next_fire_map = {}
+                self._scope_next_fire_at = next_fire_map
+            next_fire = next_fire_map.get(scope_key)
+            if not next_fire:
+                next_fire_map[scope_key] = time.time() + interval_seconds
+                return
+            now = time.time()
+            did_schedule = False
+            while now >= next_fire:
+                scope_round = self._increment_scope_round(scope_key)
+                if not any(sr == scope_round for sr, _ in handler.round_queue):
+                    handler.round_queue.append((scope_round, trigger_round_idx))
+                    hierarchy_logger.info(
+                        "Scheduling %s round %d via %.1fs interval timer",
+                        scope_label.lower(),
+                        scope_round,
+                        interval_seconds,
+                    )
+                did_schedule = True
+                next_fire += interval_seconds
+            next_fire_map[scope_key] = next_fire
+            if not did_schedule:
+                hierarchy_logger.debug(
+                    "%s timer not due yet (next fire in %.1fs)",
+                    scope_label.upper(),
+                    max(0.0, next_fire - now),
+                )
             return
-        due = (round_idx + 1) % interval == 0
+        interval_rounds = getattr(config, "rounds_per_scope", 0)
+        if interval_rounds <= 0:
+            return
+        due = (trigger_round_idx + 1) % interval_rounds == 0
         hierarchy_logger.debug(
             "%s round scheduler invoked for cluster round %d (interval=%d, due=%s)",
-            self._scope_label_upper(),
-            round_idx + 1,
-            interval,
+            scope_label.upper(),
+            trigger_round_idx + 1,
+            interval_rounds,
             due,
         )
         if not due:
             return
-        scope_round = (round_idx + 1) // interval
-        if any(sr == scope_round for sr, _ in self._scope_round_queue):
-            hierarchy_logger.debug(
-                "%s round %d already scheduled; skipping duplicate", self._scope_label_upper(), scope_round
-            )
+        scope_round = (trigger_round_idx + 1) // interval_rounds
+        self._increment_scope_round(scope_key, fallback=scope_round)
+        if any(sr == scope_round for sr, _ in handler.round_queue):
+            hierarchy_logger.debug("%s round %d already scheduled; skipping duplicate", scope_label.upper(), scope_round)
             return
         hierarchy_logger.info(
             "Scheduling %s round %d to run after completion of cluster round %d",
-            self._scope_label_lower(),
+            scope_label.lower(),
             scope_round,
-            round_idx + 1,
+            trigger_round_idx + 1,
         )
-        self._scope_round_queue.append((scope_round, round_idx))
+        handler.round_queue.append((scope_round, trigger_round_idx))
+
+    def _maybe_schedule_scope_round(self, round_idx: int) -> None:
+        """Check each registered scope handler and schedule rounds when due."""
+        handlers = list(getattr(self, "_scope_round_handlers", {}).values())
+        if not handlers:
+            return
+        for handler in handlers:
+            self._schedule_round_for_handler(handler, round_idx)
 
     def _run_next_scope_round(self, scope_name: Optional[str] = None) -> Optional[Tuple[str, int, int]]:
         """Execute the next scheduled round for the supplied scope, if available."""
@@ -788,7 +879,8 @@ class HierarchyMixin:
             return None
         config = handler.config
         rounds_per_scope = getattr(config, "rounds_per_scope", 0)
-        if not (getattr(config, "enabled", False) and rounds_per_scope > 0):
+        interval_seconds = self._scope_interval_seconds(config)
+        if not (getattr(config, "enabled", False) and (rounds_per_scope > 0 or interval_seconds > 0)):
             handler.round_queue.clear()
             return None
         if not handler.round_queue:
@@ -1324,9 +1416,11 @@ class HierarchyMixin:
         self._scope_round_hashes.pop(scope_round, None)
 
     def _maybe_schedule_higher_round(self, completed_scope_round: int) -> None:
-        """Schedule a higher-level round after enough current-level rounds have finished."""
+        """Legacy helper kept for compatibility when higher tiers still rely on round ratios."""
         if not self._higher_scope_enabled():
             return
+        if self._scope_interval_seconds(self.higher_scope_config) > 0:
+            return  # timer-based scheduling supersedes ratio logic
         handler = self._get_scope_round_handler(self.higher_scope_name)
         if handler is None:
             return

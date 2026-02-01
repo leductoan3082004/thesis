@@ -4,7 +4,9 @@
     "digest_timeout_seconds": 5.0,
     "consensus_timeout_seconds": 30.0,
     "commit_timeout_seconds": 10.0,
-    "rounds_per_scope": 3
+    "rounds_per_scope": 0,
+    "interval_seconds": 0,
+    "wait_seconds": 10
   },
   "hierarchy_levels": [
     {
@@ -13,7 +15,9 @@
       "scope_id": "state_0",
       "enabled": true,
       "approach": "ring_star",
-      "rounds_per_scope": 2,
+      "rounds_per_scope": 0,
+      "interval_seconds": 120,
+      "wait_seconds": 20,
       "max_aggregators": 2,
       "fanout_per_group": 2,
       "apply_policy": "replace"
@@ -23,7 +27,9 @@
       "scope_name": "nation",
       "scope_id": "nation_0",
       "enabled": true,
-      "rounds_per_scope": 2,
+      "rounds_per_scope": 0,
+      "interval_seconds": 300,
+      "wait_seconds": 30,
       "max_aggregators": 2,
       "fanout_per_scope": 2,
       "apply_policy": "interpolate",

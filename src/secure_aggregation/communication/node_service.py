@@ -220,6 +220,7 @@ class NodeService(HierarchyMixin):
         self.central_neighbor_addresses: Dict[str, str] = {}
         self.scope_configs = self._load_scope_config()
         self._init_scope_role_pools()
+        self._init_scope_timers()
         self._state_rosters, self._state_cluster_map = self._load_state_metadata()
         self.ecm_buffer: Optional[ECMBuffer] = None
         self.bridge_server: Optional[grpc.Server] = None
@@ -237,19 +238,23 @@ class NodeService(HierarchyMixin):
             higher_scope_config,
         ) = self._select_scope_roles(self.scope_configs)
         self.higher_scope_config = higher_scope_config or HierarchyLevelConfig(scope_index=self.scope_config.scope_index + 1)
+        scope_interval = self._scope_interval_seconds(self.scope_config)
+        higher_interval = self._scope_interval_seconds(self.higher_scope_config)
         logger.info(
-            "%s aggregation config: enabled=%s, rounds_per_scope=%s, scope_id=%s, approach=%s",
+            "%s aggregation config: enabled=%s, rounds_per_scope=%s, interval_seconds=%.1f, scope_id=%s, approach=%s",
             self._scope_label_upper(),
             self.scope_config.enabled,
             self.scope_config.rounds_per_scope,
+            scope_interval,
             self.scope_config.scope_id,
             self.scope_config.approach.value if hasattr(self.scope_config.approach, "value") else self.scope_config.approach,
         )
         logger.info(
-            "%s scheduling config: enabled=%s, rounds_per_scope=%s, apply_policy=%s, apply_alpha=%.3f",
+            "%s scheduling config: enabled=%s, rounds_per_scope=%s, interval_seconds=%.1f, apply_policy=%s, apply_alpha=%.3f",
             self._higher_scope_label_upper(),
             self.higher_scope_config.enabled,
             self.higher_scope_config.rounds_per_scope,
+            higher_interval,
             getattr(self.higher_scope_config, "apply_policy", "replace"),
             float(getattr(self.higher_scope_config, "apply_alpha", 0.0) or 0.0),
         )
@@ -1219,13 +1224,18 @@ class NodeService(HierarchyMixin):
         metadata = fetch_central_metadata(self.blockchain)
         if metadata:
             self.central_metadata = metadata
-            logger.info(
-                f"Fetched central metadata: central clique={metadata.central_clique_idx}, "
-                f"central nodes={metadata.central_nodes}"
-            )
+            if metadata.central_nodes:
+                logger.info(
+                    "Fetched central metadata: central clique=%s, central nodes=%s",
+                    metadata.central_clique_idx,
+                    metadata.central_nodes,
+                )
+            else:
+                logger.info("Fetched central metadata: no dedicated central clique")
             if metadata.scope_central_nodes:
                 for scope, nodes in sorted(metadata.scope_central_nodes.items()):
-                    logger.info("Central clique for %s: %s", scope, nodes)
+                    if nodes:
+                        logger.info("Central clique for %s: %s", scope, nodes)
             self._update_central_neighbor_addresses()
 
     def _update_central_neighbor_addresses(self) -> None:
@@ -1234,8 +1244,6 @@ class NodeService(HierarchyMixin):
         if not self.central_metadata or not self.participant_map:
             return
         candidate_nodes = self._preferred_scope_candidates()
-        if not candidate_nodes and self.central_metadata:
-            candidate_nodes = list(self.central_metadata.central_nodes)
         for node_id in candidate_nodes:
             base_address = self.participant_map.get(node_id)
             attempts = 0

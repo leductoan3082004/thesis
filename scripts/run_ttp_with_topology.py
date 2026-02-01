@@ -169,7 +169,7 @@ def main():
     parser.add_argument("--clique-size", type=int, default=4, help="Clique size")
     parser.add_argument("--alpha", type=float, default=0.5, help="Dirichlet alpha")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--edge-mode", type=str, default="small_world", help="Inter-clique edge mode")
+    parser.add_argument("--edge-mode", type=str, default="ring_extra", help="Inter-clique edge mode")
     parser.add_argument("--iterations", type=int, default=1000, help="Topology iterations")
     parser.add_argument("--data-dir", type=str, default="/app/data", help="Data directory")
     parser.add_argument("--config", type=str, help="JSON config file (overrides CLI args)")

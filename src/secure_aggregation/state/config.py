@@ -25,6 +25,8 @@ class HierarchyLevelConfig:
         scope_name: Human-readable name (used in logs and bridge channels).
         scope_id: Identifier used when anchoring models on-chain.
         rounds_per_scope: Number of lower-level rounds before this level fires.
+        interval_seconds: Wall-clock interval between rounds (time-based scheduler).
+        wait_seconds: Optional pause nodes should honor before pulling this scope's model.
         approach: Candidate election approach for collection-enabled levels.
         collection_timeout_seconds: Max time to wait for ECM coverage.
         digest_timeout_seconds: How long to wait for peer digests per round.
@@ -43,6 +45,8 @@ class HierarchyLevelConfig:
     scope_name: str = "state"
     scope_id: str = "scope_0"
     rounds_per_scope: int = 0
+    interval_seconds: float = 0.0
+    wait_seconds: float = 0.0
     approach: StateAggregationApproach = StateAggregationApproach.RING_STAR
     collection_timeout_seconds: float = 15.0
     digest_timeout_seconds: float = 5.0
@@ -104,11 +108,11 @@ class HierarchyLevelConfig:
         """
         if self.rounds_per_scope <= 0 and rounds_hint:
             self.rounds_per_scope = max(1, int(rounds_hint))
-        if self.rounds_per_scope > 0 and not self.enabled:
+        has_time_interval = self.interval_seconds > 0
+        if (self.rounds_per_scope > 0 or has_time_interval) and not self.enabled:
             self.enabled = True
 
     @property
     def collects_lower_scope(self) -> bool:
         """Return True if this level runs collection/aggregation logic."""
         return bool(self.collection_timeout_seconds > 0)
-

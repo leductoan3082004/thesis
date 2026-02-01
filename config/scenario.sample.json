@@ -3,7 +3,7 @@
   "participants": ["node_a", "node_b", "node_c"],
   "threshold": 2,
   "clique_size": 2,
-  "inter_clique_edges": "small_world",
+  "inter_clique_edges": "ring_extra",
   "topology_iterations": 10,
   "small_world_c": 2,
   "service_hostnames": {

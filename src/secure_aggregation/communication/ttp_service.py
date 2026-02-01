@@ -42,7 +42,7 @@ class TopologyConfig:
     clique_size: int
     alpha: float = 0.5
     seed: int = 42
-    inter_clique_edges: str = "small_world"
+    inter_clique_edges: str = "ring_extra"
     topology_iterations: int = 1000
     small_world_c: int = 2
 
@@ -277,11 +277,13 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
         )
         central_idx: Optional[int] = None
         central_nodes: List[str] = []
-        scope_central = identify_central_cliques_by_scope(
-            cliques,
-            clique_edges,
-            node_scope_assignments or {},
-        )
+        scope_central: Dict[str, Tuple[int | None, List[str]]] = {}
+        if config.inter_clique_edges == "ring_star":
+            scope_central = identify_central_cliques_by_scope(
+                cliques,
+                clique_edges,
+                node_scope_assignments or {},
+            )
         scope_central_nodes: Dict[str, List[str]] = {}
         scope_cluster_ids: Dict[str, List[str]] = defaultdict(list)
         scope_assignments_lookup = node_scope_assignments or {}
@@ -305,15 +307,11 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             for node in normalized_nodes:
                 if node not in central_nodes:
                     central_nodes.append(node)
-        if not central_nodes:
-            central_idx, central_nodes = identify_central_clique(cliques, clique_edges)
-            if central_idx is None or not central_nodes:
-                return
         # Ensure deterministic ordering for metadata payload.
         central_nodes = list(dict.fromkeys(central_nodes))
         cluster_ids = [f"cluster_{i}" for i in range(len(cliques))]
         metadata = CentralMetadata(
-            central_clique_idx=central_idx,
+            central_clique_idx=central_idx if central_idx is not None else -1,
             central_nodes=central_nodes,
             checker_candidates=central_nodes[:2] if len(central_nodes) > 1 else central_nodes,
             total_cliques=len(cliques),

@@ -31,7 +31,7 @@
    }
    ```
    Administrators can add new levels by editing both `hierarchy_levels` and this map; the runtime resolves scope IDs dynamically at startup and treats the resulting structure as immutable for the session.  
-2. **Central Metadata (`central_broadcast.py`)** enumerates `central_nodes` and `cluster_ids`. All nodes pull the latest version so they know the scopes they belong to and which upstream IDs to reference.  
+2. **Topology Metadata (`central_broadcast.py`)** distributes the latest cluster roster and ring-neighbor hints. Nodes use it to learn which clusters participate in each scope and how to reach peers when establishing temporary fan-out links to higher-level aggregators.  
 3. **System Configuration (`system-config.json`)** declares an array of `hierarchy_levels`. Each entry now includes:
    - `scope_index`, `scope_name`, `scope_id`  
    - `interval_seconds` (replaces `rounds_per_scope` for high-levels)  
@@ -44,6 +44,8 @@ Current deployments use three scopes:
 2. **Level 1 – State**: high-level scope aggregating cluster representatives.  
 3. **Level 2 – Nation**: high-level scope aggregating state representatives.  
 The system remains extensible; to add more tiers, extend the config and the time-based scheduler automatically activates them.
+
+Every scope reuses the ring topology for peer discovery; extra edges are opened only for the duration of a high-level round so fan-out nodes can talk directly to the single elected aggregator. No central clique is required.
 
 ## 4. Time-Based Scheduling of High-Level Rounds
 - Level 0 still runs each time the cluster secure aggregation completes.  
@@ -91,7 +93,7 @@ The system remains extensible; to add more tiers, extend the config and the time
 - `system-config.json` adds `fanout_count` (per scope) so administrators can tune redundancy. Example: a state with four clusters and `fanout_count = 2` means each cluster assigns two nodes to report its cluster model to the state aggregator.  
 - During each high-level round:
   1. Fan-out nodes fetch the latest CID/hash for their *own* scope (e.g., cluster nodes read the current cluster model anchor).  
-  2. They push this metadata to the higher-level aggregator once the high-level round’s waiting period completes. Multiple nodes will send duplicates; aggregators deduplicate by `(scope_id, cid)`.  
+  2. They establish a temporary gRPC link to the elected aggregator (selected via round-robin for that scope) and push the metadata as soon as the round’s waiting window opens. No hub or central clique is involved; the overlay is a ring with these short-lived extra edges. Multiple fan-outs will send duplicates; aggregators deduplicate by `(scope_id, cid)`.  
   3. After deduplication, the aggregator expects exactly one unique CID per lower-level scope. Missing scopes trigger the usual timeout logic, but duplicated submissions are normal and provide resilience.  
 - Example: a nation round covers four states. Each state has `fanout_count = 2`, so eight fan-out nodes send their state model CIDs/hashes to the nation aggregator. The aggregator reduces these to four unique CIDs, verifies each hash against blockchain, pulls the corresponding models, and merges them into the new nation model.
 
