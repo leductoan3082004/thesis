@@ -285,7 +285,6 @@ class NodeService(HierarchyMixin):
                 is_candidate_fn=lambda: self.is_scope_candidate,
                 dispatch_fn=self._dispatch_scope_artifacts,
                 execute_fn=self._execute_scope_round,
-                schedule_higher_fn=self._maybe_schedule_higher_round,
                 budget_fn=self._scope_round_budget,
             )
         )
