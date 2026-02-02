@@ -82,18 +82,17 @@ Every scope reuses the ring topology for peer discovery; extra edges are opened 
 - The submission does **not** need to correspond to the most recent round; the representative simply uploads its latest available model.  
 - Aggregators proceed as soon as all representatives have provided *something*, even if those models represent different lower-level rounds. Newer contributions will eventually surface during later intervals.
 
-### 6.2 Merge, Digest, and Commit
-1. **Merge** – Aggregators fetch input tensors (cluster models for state, state models for nation) from IPFS, verify hashes, and run the scope’s merge algorithm.  
-2. **Digest** – Candidates exchange digests across their coordination channel (e.g., `state::STATE_ID`) to ensure all view the same hash for the merged model. The strict consensus requirement for hash equality remains.  
-3. **Commit** – A single aggregator (see Section 8) publishes the merged tensor to IPFS and anchors the CID/hash on-chain under `/scope/{scope_name}/models`. Others simply watch the blockchain to verify completion.  
-4. **Notification** – Aggregators update the blockchain endpoint so nodes requesting the latest `(scope_id, level)` receive the just-anchored CID.
+### 6.2 Merge and Commit
+1. **Merge** – The elected aggregator fetches input tensors (cluster models for state, state models for nation) from IPFS, verifies hashes, and runs the scope’s merge algorithm.  
+2. **Commit** – That same aggregator publishes the merged tensor to IPFS and anchors the CID/hash on-chain under `/scope/{scope_name}/models`. Peers simply watch the blockchain to observe completion.  
+3. **Notification** – Once anchored, nodes requesting the latest `(scope_id, level)` automatically receive the just-committed CID.
 
 ### 6.3 Fan-Out Responsibilities
 - Every immediate lower scope must designate a fan-out set of nodes responsible for relaying its latest model metadata (CID + hash) to the next higher scope.  
 - `system-config.json` adds `fanout_count` (per scope) so administrators can tune redundancy. Example: a state with four clusters and `fanout_count = 2` means each cluster assigns two nodes to report its cluster model to the state aggregator.  
 - During each high-level round:
   1. Fan-out nodes fetch the latest CID/hash for their *own* scope (e.g., cluster nodes read the current cluster model anchor).  
-  2. They establish a temporary gRPC link to the elected aggregator (selected via round-robin for that scope) and push the metadata as soon as the round’s waiting window opens. No hub or central clique is involved; the overlay is a ring with these short-lived extra edges. Multiple fan-outs will send duplicates; aggregators deduplicate by `(scope_id, cid)`.  
+  2. Before pushing, each fan-out node pings the elected aggregator’s bridge endpoint. If the node is unreachable, they advance to the next candidate in the round-robin order and repeat the health probe. Only when a candidate responds do they establish the temporary gRPC link and send the metadata. No hub or central clique is involved; the overlay is a ring with these short-lived extra edges. Duplicates remain acceptable and are deduplicated by `(scope_id, cid)` on the aggregator.  
   3. After deduplication, the aggregator expects exactly one unique CID per lower-level scope. Missing scopes trigger the usual timeout logic, but duplicated submissions are normal and provide resilience.  
 - Example: a nation round covers four states. Each state has `fanout_count = 2`, so eight fan-out nodes send their state model CIDs/hashes to the nation aggregator. The aggregator reduces these to four unique CIDs, verifies each hash against blockchain, pulls the corresponding models, and merges them into the new nation model.
 
@@ -116,14 +115,14 @@ Every scope reuses the ring topology for peer discovery; extra edges are opened 
 ## 8. Aggregator Election (Single Aggregator per Round)
 - For each high-level round, only one aggregator performs the final commit.  
 - Aggregators are assigned in round-robin across the candidate list.  
-- If the chosen aggregator fails health checks or cannot meet deadlines, the system automatically advances to the next candidate for that same round.  
-- There is no inter-aggregator consensus stage beyond digest checking; once the active aggregator publishes the model, others accept it.
+- If the chosen aggregator fails the fan-out health probes or cannot meet deadlines, the system automatically advances to the next candidate for that same round.  
+- There is no inter-aggregator consensus stage; once the active aggregator publishes the model, others accept it.
 
 ## 9. Sequence Summary Under the Updated Architecture
 1. Cluster rounds proceed continuously; after each round, secure aggregation publishes to blockchain/IPFS as before.  
 2. Independent timers trigger state and nation rounds at intervals `t1` and `t2`.  
 3. When a high-level round begins, nodes belonging to that scope wait for `wait_seconds`, then query the blockchain endpoint for `(scope_id, level)` to fetch the latest CID.  
-4. Aggregators collect the latest available submissions from lower levels, even if representing different round numbers, merge, digest, and commit using the single assigned aggregator.  
+4. Aggregators collect the latest available submissions from lower levels, even if representing different round numbers, merge, and commit using the single assigned aggregator.  
 5. Nodes retry fetches until they discover a CID they have not yet merged and then apply the configured policy (replace/interpolate/etc.) directly from that scope.  
 6. Because merges are logged per-CID, nodes can safely operate asynchronously: they may ingest round `n-1` during round `n`, or skip entirely if a newer CID supersedes it.  
 7. The process repeats independently for each level, and new levels can be added by editing `hierarchy_levels` with appropriate IDs, intervals, and merge rules.

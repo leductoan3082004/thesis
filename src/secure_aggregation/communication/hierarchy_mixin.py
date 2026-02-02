@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -29,19 +29,6 @@ HierarchyScopeConfig = HierarchyLevelConfig
 
 
 @dataclass
-class ScopeDigest:
-    """Scope-level model digest shared between central candidates."""
-
-    node_id: str
-    scope_id: str
-    scope_round: int
-    cluster_round: int
-    model_hash: str
-    model_cid: Optional[str]
-    received_at: float
-
-
-@dataclass
 class ScopeRoundHandler:
     """Describes how to run aggregation rounds for a specific scope."""
 
@@ -52,12 +39,32 @@ class ScopeRoundHandler:
     rounds_logged: Set[int]
     round_cache: Dict[int, Any]
     round_hashes: Dict[int, str]
-    digest_records: Dict[int, Dict[str, ScopeDigest]]
     committed_rounds: Set[int]
     is_candidate_fn: Callable[[], bool]
     dispatch_fn: Callable[[int, int], None]
     execute_fn: Callable[[int, int], bool]
     budget_fn: Optional[Callable[[], Optional[int]]] = None
+
+
+@dataclass
+class ScopeRuntime:
+    """Mutable state that tracks per-scope aggregation context."""
+
+    scope_name: str
+    config: HierarchyLevelConfig
+    scope_id: Optional[str]
+    round_queue: Deque[Tuple[int, int]]
+    rounds_logged: Set[int]
+    round_cache: Dict[int, Any]
+    round_hashes: Dict[int, str]
+    committed_rounds: Set[int]
+    candidates: List[str]
+    is_candidate: bool
+    ecm_buffer: Optional[ECMBuffer]
+    aggregator: Optional[StateAggregator]
+    last_model_cid: Optional[str]
+    last_model_hash: Optional[str]
+    last_model_data_id: Optional[str]
 
 
 class RoundRobinPool:
@@ -86,63 +93,6 @@ class RoundRobinPool:
 
     def all_members(self) -> List[str]:
         return list(self._members)
-
-
-def build_scope_signal_cid(
-    scope_label: str,
-    scope_id: Optional[str],
-    scope_round: int,
-    node_id: str,
-) -> str:
-    """Create a recognizable CID for scope digest signaling over the bridge."""
-    safe_scope = (scope_label or "scope").lower()
-    safe_scope_id = scope_id or "unknown"
-    return f"signal::{safe_scope}::{safe_scope_id}::{scope_round}::{node_id}"
-
-
-def parse_scope_digest_signal(ecm: ECM) -> Optional[ScopeDigest]:
-    """Convert a bridge ECM carrying a digest signal into a ScopeDigest."""
-    if not ecm.is_signal or not ecm.source_cluster:
-        return None
-    try:
-        scope_label, scope_identifier = ecm.source_cluster.split("::", 1)
-    except ValueError:
-        return None
-    if not scope_identifier:
-        return None
-    scope_round = ecm.round_idx
-    if scope_round < 0:
-        return None
-    cluster_round = scope_round
-    origin_node: Optional[str] = None
-    if ecm.convergence_data_id:
-        try:
-            payload = json.loads(ecm.convergence_data_id)
-            origin_node = payload.get("node_id") or None
-            payload_round = payload.get("cluster_round")
-            if payload_round is not None:
-                try:
-                    cluster_round = int(payload_round)
-                except (TypeError, ValueError):
-                    pass
-        except (TypeError, ValueError, json.JSONDecodeError):
-            hierarchy_logger.debug("Malformed scope digest payload: %s", ecm.convergence_data_id)
-    if not origin_node and ecm.cid.startswith("signal::"):
-        parts = ecm.cid.split("::")
-        if len(parts) >= 5:
-            origin_node = parts[-1]
-    if not origin_node:
-        hierarchy_logger.debug("Unable to determine origin node for scope digest cid=%s", ecm.cid)
-        return None
-    return ScopeDigest(
-        node_id=origin_node,
-        scope_id=scope_identifier,
-        scope_round=scope_round,
-        cluster_round=cluster_round,
-        model_hash=ecm.hash,
-        model_cid=None,
-        received_at=ecm.received_at,
-    )
 
 
 class HierarchyMixin:
@@ -321,6 +271,309 @@ class HierarchyMixin:
         metadata = self._load_nodes_map_metadata()
         return metadata.memberships
 
+    def _scope_name_order(self) -> List[str]:
+        configs = getattr(self, "scope_configs", None) or {}
+        ordered = sorted(configs.values(), key=lambda cfg: (cfg.scope_index, cfg.scope_name))
+        return [cfg.scope_name.lower() for cfg in ordered if cfg.scope_name]
+
+    def _lower_scope_name(self, scope_name: str) -> Optional[str]:
+        ordered = self._scope_name_order()
+        key = str(scope_name or "").lower()
+        if key not in ordered:
+            return None
+        idx = ordered.index(key)
+        if idx == 0:
+            return "cluster"
+        return ordered[idx - 1]
+
+    def _node_scope_membership_map(self) -> Mapping[str, str]:
+        """Return cached membership path for this node, keyed by scope name."""
+        node_id = getattr(self, "node_id", None)
+        if not node_id:
+            return {}
+        memberships = self._node_scope_memberships()
+        mapping = memberships.get(node_id)
+        if not mapping:
+            mapping = {}
+        scope_map = {name.lower(): scope_id for name, scope_id in mapping.items() if scope_id}
+        if "cluster" not in scope_map:
+            clique_id = getattr(self, "clique_id", None)
+            if clique_id is not None and clique_id >= 0:
+                scope_map["cluster"] = f"cluster_{clique_id}"
+        return scope_map
+
+    def _runtime_for_scope(self, scope_name: Optional[str] = None) -> ScopeRuntime:
+        runtimes = getattr(self, "_scope_runtimes", None) or {}
+        key = str(scope_name or self.scope_name or "state").lower()
+        runtime = runtimes.get(key)
+        if runtime is None:
+            raise KeyError(f"No runtime registered for scope '{key}'")
+        return runtime
+
+    def _runtime_for_scope_label(self, scope_label: Optional[str]) -> ScopeRuntime:
+        label = str(scope_label or self.scope_name or "state").lower()
+        configs = getattr(self, "scope_configs", None) or {}
+        config = configs.get(label)
+        if not config:
+            return self.scope_runtime
+        return self._ensure_scope_runtime(config.scope_name, config)
+
+    @staticmethod
+    def _runtime_label_lower(runtime: ScopeRuntime) -> str:
+        name = runtime.config.scope_name or runtime.scope_name or "scope"
+        return str(name).lower()
+
+    @staticmethod
+    def _runtime_label_upper(runtime: ScopeRuntime) -> str:
+        return HierarchyMixin._runtime_label_lower(runtime).upper()
+
+    def _runtime_scope_identifier(self, runtime: ScopeRuntime) -> Optional[str]:
+        return self._node_scope_identifier_for(runtime.scope_name, runtime.config)
+
+    def _ensure_scope_runtime(self, scope_name: str, config: HierarchyLevelConfig) -> ScopeRuntime:
+        runtimes = getattr(self, "_scope_runtimes", None)
+        if runtimes is None:
+            runtimes = {}
+            self._scope_runtimes = runtimes
+        key = str(scope_name or "").lower()
+        runtime = runtimes.get(key)
+        if runtime is None:
+            scope_id = self._node_scope_identifier_for(scope_name, config)
+            runtime = ScopeRuntime(
+                scope_name=scope_name,
+                config=config,
+                scope_id=scope_id,
+                round_queue=deque(),
+                rounds_logged=set(),
+                round_cache={},
+                round_hashes={},
+                committed_rounds=set(),
+                candidates=[],
+                is_candidate=False,
+                ecm_buffer=None,
+                aggregator=None,
+                last_model_cid=None,
+                last_model_hash=None,
+                last_model_data_id=None,
+            )
+            runtimes[key] = runtime
+        return runtime
+
+    def _iter_scope_runtimes(self) -> List[ScopeRuntime]:
+        runtimes = getattr(self, "_scope_runtimes", None) or {}
+        return list(runtimes.values())
+
+    @property
+    def scope_runtime(self) -> ScopeRuntime:
+        return self._runtime_for_scope(self.scope_name)
+
+    @property
+    def scope_candidates(self) -> List[str]:
+        return self.scope_runtime.candidates
+
+    @scope_candidates.setter
+    def scope_candidates(self, value: List[str]) -> None:
+        self.scope_runtime.candidates = list(value or [])
+
+    @property
+    def is_scope_candidate(self) -> bool:
+        return self.scope_runtime.is_candidate
+
+    @is_scope_candidate.setter
+    def is_scope_candidate(self, value: bool) -> None:
+        self.scope_runtime.is_candidate = bool(value)
+
+    @property
+    def scope_ecm_buffer(self) -> Optional[ECMBuffer]:
+        return self.scope_runtime.ecm_buffer
+
+    @scope_ecm_buffer.setter
+    def scope_ecm_buffer(self, buffer: Optional[ECMBuffer]) -> None:
+        self.scope_runtime.ecm_buffer = buffer
+
+    @property
+    def scope_aggregator(self) -> Optional[StateAggregator]:
+        return self.scope_runtime.aggregator
+
+    @scope_aggregator.setter
+    def scope_aggregator(self, aggregator: Optional[StateAggregator]) -> None:
+        self.scope_runtime.aggregator = aggregator
+
+    def _node_scope_identifier_for(self, scope_name: str, config: Optional[HierarchyLevelConfig]) -> Optional[str]:
+        """Resolve this node's scope identifier for the supplied level."""
+        normalized = str(scope_name or "").lower()
+        membership = self._node_scope_membership_map()
+        scope_id = membership.get(normalized)
+        if scope_id:
+            return scope_id
+        if config and getattr(config, "scope_id", None):
+            return str(config.scope_id)
+        if normalized == self.scope_name.lower():
+            return self._scope_identifier()
+        return None
+
+    def _node_participates_in_scope(self, scope_name: str, config: Optional[HierarchyLevelConfig]) -> bool:
+        """Return True if this node belongs to the supplied scope."""
+        scope_id = self._node_scope_identifier_for(scope_name, config)
+        return bool(scope_id)
+
+    def _scope_member_roster(self, scope_name: str, scope_id: Optional[str]) -> List[str]:
+        rosters = self._scope_rosters(scope_name) or {}
+        key = str(scope_id) if scope_id is not None else None
+        if key:
+            members = rosters.get(key)
+            if members:
+                return list(members)
+        scope_key = str(scope_name or "").lower()
+        if scope_key == "cluster" and key == f"cluster_{getattr(self, 'clique_id', -1)}":
+            clique_members = getattr(self, "clique_members", None) or []
+            if clique_members:
+                return list(clique_members)
+        return []
+
+    @staticmethod
+    def _round_robin_subset(members: Sequence[str], count: int, seed: int) -> List[str]:
+        seen: Set[str] = set()
+        unique: List[str] = []
+        for member in members:
+            normalized = str(member).strip()
+            if not normalized or normalized in seen:
+                continue
+            unique.append(normalized)
+            seen.add(normalized)
+        if not unique or count <= 0:
+            return []
+        total = len(unique)
+        if count >= total:
+            return list(unique)
+        seed = max(0, seed - 1)
+        start = (seed * max(1, count)) % total
+        selection: List[str] = []
+        for offset in range(count):
+            selection.append(unique[(start + offset) % total])
+        return selection
+
+    def _scope_round_leader(
+        self,
+        scope_name: str,
+        scope_id: Optional[str],
+        scope_round: int,
+        *,
+        fallback: Optional[Sequence[str]] = None,
+    ) -> Optional[str]:
+        members = self._scope_member_roster(scope_name, scope_id)
+        if not members and fallback:
+            members = list(fallback)
+        if not members:
+            return None
+        index = (max(0, scope_round - 1)) % len(members)
+        return members[index]
+
+    def _ordered_scope_candidates(self, runtime: ScopeRuntime, scope_round: int) -> List[str]:
+        roster = self._scope_member_roster(runtime.scope_name, runtime.scope_id)
+        if not roster:
+            roster = list(runtime.candidates or [])
+        if not roster:
+            return []
+        leader_index = (max(0, scope_round - 1)) % len(roster)
+        return [roster[(leader_index + offset) % len(roster)] for offset in range(len(roster))]
+
+    def _select_healthy_scope_aggregator(
+        self,
+        runtime: ScopeRuntime,
+        scope_round: int,
+        timeout: float = 3.0,
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """Return the first aggregator whose bridge endpoint is reachable."""
+        ordered = self._ordered_scope_candidates(runtime, scope_round)
+        if not ordered:
+            return None
+        label_lower = self._runtime_label_lower(runtime)
+        for candidate in ordered:
+            if candidate == self.node_id:
+                return candidate, None
+            address = self._resolve_scope_bridge_address(candidate)
+            if not address:
+                hierarchy_logger.warning(
+                    "Missing bridge address for %s aggregator %s; trying next candidate",
+                    label_lower,
+                    candidate,
+                )
+                continue
+            if not self._ensure_bridge_client(allow_state_layer=True) or self.bridge_client is None:
+                return None
+            if self.bridge_client.wait_for_ready(address, timeout=timeout):
+                return candidate, address
+            hierarchy_logger.warning(
+                "%s aggregator %s unreachable; trying next candidate",
+                label_lower,
+                candidate,
+            )
+        return None
+
+    def _scope_round_fanout_members(
+        self,
+        child_scope: str,
+        child_scope_id: Optional[str],
+        scope_round: int,
+        per_child_count: int,
+    ) -> List[str]:
+        roster = self._scope_member_roster(child_scope, child_scope_id)
+        return self._round_robin_subset(roster, per_child_count, scope_round)
+
+    def _resolve_scope_bridge_address(self, node_id: str) -> Optional[str]:
+        if not node_id:
+            return None
+        bridge_map = getattr(self, "central_neighbor_addresses", None) or {}
+        address = bridge_map.get(node_id)
+        if address:
+            return address
+        participant_map = getattr(self, "participant_map", None) or {}
+        base_address = participant_map.get(node_id)
+        if not base_address:
+            return None
+        try:
+            host, port_str = base_address.split(":")
+            bridge_port = int(port_str) + 2000
+        except ValueError:
+            return None
+        return f"{host}:{bridge_port}"
+
+    def _is_fanout_node_for_scope_round(
+        self,
+        runtime: ScopeRuntime,
+        scope_round: int,
+    ) -> bool:
+        config = runtime.config
+        configured = getattr(config, "fanout_count", None)
+        if configured is None:
+            configured = getattr(config, "fanout_per_scope", None)
+        if configured is None:
+            configured = getattr(config, "fanout_per_group", None)
+        try:
+            fanout_count = int(configured) if configured is not None else 0
+        except (TypeError, ValueError):
+            fanout_count = 0
+        if fanout_count <= 0:
+            return True
+        memberships = self._node_scope_membership_map()
+        child_scope = self._lower_scope_name(runtime.scope_name)
+        if not child_scope:
+            return False
+        if child_scope == "cluster":
+            child_scope_id = f"cluster_{self.clique_id}"
+        else:
+            child_scope_id = memberships.get(child_scope)
+        if not child_scope_id:
+            return False
+        fanout_members = self._scope_round_fanout_members(
+            child_scope,
+            child_scope_id,
+            scope_round,
+            fanout_count,
+        )
+        return self.node_id in fanout_members
+
     def _init_scope_role_pools(self) -> None:
         """Initialize round-robin pools for aggregators and fan-out members."""
         metadata = self._load_nodes_map_metadata()
@@ -384,6 +637,96 @@ class HierarchyMixin:
         if not pool:
             return []
         return pool.next(max(1, count))
+
+    def _queue_scope_wait(self, scope_name: str, config: HierarchyLevelConfig) -> None:
+        """Record a wait window so nodes pause before fetching the next scope model."""
+        if not self._node_participates_in_scope(scope_name, config):
+            return
+        wait_seconds = float(getattr(config, "wait_seconds", 0.0) or 0.0)
+        scope_key = str(scope_name or "").lower()
+        ready = getattr(self, "_ready_scope_fetches", None)
+        if ready is None:
+            ready = set()
+            self._ready_scope_fetches = ready
+        if wait_seconds <= 0:
+            ready.add(scope_key)
+            hierarchy_logger.info(
+                "%s wait window is 0s; immediately queued fetch cycle",
+                scope_name.upper(),
+            )
+            return
+        queue = getattr(self, "_pending_scope_waits", None)
+        if queue is None:
+            queue = deque()
+            self._pending_scope_waits = queue
+        queue.append((scope_key, wait_seconds, time.time()))
+        hierarchy_logger.info(
+            "Queued %s wait window of %.0fs after scheduler trigger",
+            scope_name.upper(),
+            wait_seconds,
+        )
+
+    def _pause_for_scope_waits(self) -> bool:
+        """Sleep until queued wait windows elapse before fetching high-level models."""
+        queue: Optional[Deque[Tuple[str, float, float]]] = getattr(self, "_pending_scope_waits", None)
+        if not queue:
+            return False
+        ready = getattr(self, "_ready_scope_fetches", None)
+        if ready is None:
+            ready = set()
+            self._ready_scope_fetches = ready
+        waited = False
+        while queue:
+            scope_key, wait_seconds, scheduled_at = queue.popleft()
+            elapsed = max(0.0, time.time() - scheduled_at)
+            remaining = max(0.0, wait_seconds - elapsed)
+            if remaining > 0:
+                waited = True
+                hierarchy_logger.info(
+                    "Waiting %.0fs before pulling latest %s model",
+                    remaining,
+                    scope_key.upper(),
+                )
+                time.sleep(remaining)
+            else:
+                hierarchy_logger.debug(
+                    "%s wait window elapsed upstream (extra %.1fs)",
+                    scope_key.upper(),
+                    elapsed - wait_seconds,
+                )
+            ready.add(scope_key)
+        return waited
+
+    def _apply_ready_scope_models(self) -> bool:
+        """Fetch and merge scope models whose wait windows have elapsed."""
+        ready: Optional[Set[str]] = getattr(self, "_ready_scope_fetches", None)
+        if not ready:
+            return False
+        scope_configs = getattr(self, "scope_configs", None) or {}
+        pending = list(ready)
+        ready.clear()
+        attempted = False
+        for scope_key in pending:
+            config = scope_configs.get(scope_key)
+            if not config:
+                continue
+            attempted = True
+            if scope_key == self.scope_name.lower():
+                self._maybe_apply_scope_model(None)
+            else:
+                self._maybe_apply_external_scope_model(scope_key, config)
+        return attempted
+
+    def _prime_scope_fetches(self) -> None:
+        """Ensure nodes pull the latest models for scopes they belong to on startup."""
+        scope_configs = getattr(self, "scope_configs", None) or {}
+        ready = getattr(self, "_ready_scope_fetches", None)
+        if ready is None:
+            ready = set()
+            self._ready_scope_fetches = ready
+        for scope_key, config in scope_configs.items():
+            if self._node_participates_in_scope(scope_key, config):
+                ready.add(scope_key)
 
     @staticmethod
     def _trainer_to_container(trainer_id: str) -> Optional[str]:
@@ -464,6 +807,30 @@ class HierarchyMixin:
         _, cluster_map = self._state_metadata()
         return list(cluster_map.get(scope_key, []))
 
+    def _child_scope_ids_for_runtime(self, runtime: ScopeRuntime) -> List[str]:
+        child_scope = self._lower_scope_name(runtime.scope_name)
+        if not child_scope:
+            return []
+        scope_id = runtime.scope_id
+        parent_label = str(runtime.scope_name or "").lower()
+        if child_scope == "cluster":
+            ids = self._state_cluster_ids(scope_id)
+        else:
+            if not scope_id:
+                return []
+            children = self._scope_children(runtime.scope_name, scope_id)
+            ids = children.get(child_scope, [])
+        return [f"{parent_label}::{child_id}" for child_id in (ids or [])]
+
+    def _fanout_payload_for_child_scope(self, child_scope: str) -> Tuple[Optional[str], Optional[str]]:
+        if child_scope == "cluster":
+            return self._last_model_cid, self._last_model_hash
+        try:
+            child_runtime = self._runtime_for_scope(child_scope)
+        except KeyError:
+            return None, None
+        return child_runtime.last_model_cid, child_runtime.last_model_hash
+
     def _preferred_scope_candidates(self, limit: Optional[int] = None) -> List[str]:
         """Return candidate aggregator nodes prioritized by state roster."""
         roster = self._state_roster_for()
@@ -507,67 +874,72 @@ class HierarchyMixin:
         return configs.get(str(key).lower())
 
     def _configure_scope_layer(self) -> None:
-        """Determine which nodes act as state aggregators based on metadata."""
-        if not self.scope_config.enabled:
-            if self.scope_ecm_buffer is not None:
-                self.scope_ecm_buffer = None
-                self._update_bridge_hooks()
-                self._ensure_bridge_stack()
-            self.scope_candidates = []
-            self.is_scope_candidate = False
+        """Configure aggregator/fan-out roles for all hierarchy scopes."""
+        self._configure_scope_runtimes()
+
+    def _configure_scope_runtimes(self) -> None:
+        configs = getattr(self, "scope_configs", None) or {}
+        for scope_name, config in configs.items():
+            runtime = self._ensure_scope_runtime(scope_name, config)
+            self._configure_single_scope_runtime(runtime)
+        self._update_bridge_hooks()
+        self._ensure_bridge_stack(allow_state_layer=True)
+
+    def _configure_single_scope_runtime(self, runtime: ScopeRuntime) -> None:
+        config = runtime.config
+        runtime.scope_id = self._node_scope_identifier_for(runtime.scope_name, config)
+        if not self._runtime_enabled(runtime):
+            runtime.candidates = []
+            runtime.is_candidate = False
+            runtime.ecm_buffer = None
+            runtime.aggregator = None
             return
-        if not self.central_metadata:
-            return
-        max_aggs = getattr(self.scope_config, "max_aggregators", 0) or 0
-        if self.scope_config.approach == StateAggregationApproach.RING_STAR:
-            candidates = self._preferred_scope_candidates(limit=max_aggs)
-        else:
-            candidates = self._preferred_scope_candidates(limit=max_aggs)
-        if not candidates and self.central_metadata:
-            candidates = list(dict.fromkeys(self.central_metadata.central_nodes))
-        previous_candidates = self.scope_candidates
-        self.scope_candidates = candidates
-        was_candidate = self.is_scope_candidate
-        self.is_scope_candidate = self.node_id in self.scope_candidates
-        if self.is_scope_candidate and self.scope_ecm_buffer is None:
-            freshness = float(
-                max(
-                    self.inter_cluster_config.get("freshness_window", 300.0),
-                    self.scope_config.collection_timeout_seconds * 2,
+        scope_id = runtime.scope_id
+        roster = self._scope_member_roster(runtime.scope_name, scope_id)
+        runtime.candidates = roster
+        was_candidate = runtime.is_candidate
+        runtime.is_candidate = self.node_id in roster
+        collects = bool(config.collects_lower_scope)
+        if runtime.is_candidate and collects:
+            if runtime.ecm_buffer is None:
+                freshness = float(
+                    max(
+                        self.inter_cluster_config.get("freshness_window", 300.0),
+                        config.collection_timeout_seconds * 2,
+                    )
                 )
-            )
-            self.scope_ecm_buffer = ECMBuffer(freshness_window=freshness)
-            self._update_bridge_hooks()
-            self._ensure_bridge_stack()
-        elif not self.is_scope_candidate and self.scope_ecm_buffer is not None:
-            self.scope_ecm_buffer = None
-            self._update_bridge_hooks()
-            self._ensure_bridge_stack()
-        if self.is_scope_candidate and self.scope_aggregator is None and self.ipfs is not None:
-            self.scope_aggregator = StateAggregator(self.scope_config, self.ipfs, self.blockchain)
+                runtime.ecm_buffer = ECMBuffer(freshness_window=freshness)
+        else:
+            runtime.ecm_buffer = None
+        if runtime.is_candidate and runtime.aggregator is None and self.ipfs is not None:
+            runtime.aggregator = StateAggregator(config, self.ipfs, self.blockchain)
+        elif not runtime.is_candidate:
+            runtime.aggregator = None
         if (
-            candidates
-            and candidates != previous_candidates
-            and self.is_scope_candidate
+            runtime.is_candidate
             and not was_candidate
+            and runtime.candidates
         ):
             hierarchy_logger.info(
                 "%s candidate %s joined aggregator pool with %d candidates",
-                self._scope_label_upper(),
+                (config.scope_name or runtime.scope_name).upper(),
                 self.node_id,
-                len(candidates),
+                len(runtime.candidates),
             )
 
+    def _runtime_enabled(self, runtime: ScopeRuntime) -> bool:
+        interval = self._scope_interval_seconds(runtime.config)
+        return bool(runtime.config.enabled and interval > 0)
+
     def _scope_layer_enabled(self) -> bool:
-        interval = self._scope_interval_seconds(self.scope_config)
-        return bool(self.scope_config.enabled and interval > 0)
+        return self._runtime_enabled(self.scope_runtime)
 
     def _higher_scope_enabled(self) -> bool:
         higher_cfg = getattr(self, "higher_scope_config", None)
         if not higher_cfg:
             return False
-        interval = self._scope_interval_seconds(higher_cfg)
-        return bool(higher_cfg.enabled and interval > 0)
+        higher_runtime = self._ensure_scope_runtime(self.higher_scope_name, higher_cfg)
+        return self._runtime_enabled(higher_runtime)
 
     def _scope_round_budget(self) -> Optional[int]:
         """Estimate how many state rounds can occur over the training horizon."""
@@ -590,160 +962,103 @@ class HierarchyMixin:
             return max(1, slots) if slots > 0 else None
         return None
 
-    def _maybe_apply_scope_model(self, round_idx: int) -> None:
-        """Fetch and apply anchored state models as the new baseline."""
-        scope_key = self.scope_name.lower()
-        scope_progress = getattr(self, "_scope_last_applied_rounds", None)
-        if scope_progress is None:
-            scope_progress = {}
-            setattr(self, "_scope_last_applied_rounds", scope_progress)
-        scope_id = self._scope_identifier()
-        scope_namespace = self._scope_namespace()
-        if (
-            not self._scope_layer_enabled()
-            or not self.blockchain
-            or not self.ipfs
-            or not scope_id
-            or not self.model
-        ):
-            return
-        last_applied = scope_progress.get(scope_key, 0)
-        next_round = last_applied + 1
-        scope_label = getattr(self.scope_config, "scope_name", "state")
-        while True:
-            try:
-                anchor = self.blockchain.get_anchor(
-                    scope_id,
-                    next_round,
-                    scope=scope_namespace,
-                )
-            except Exception as exc:  # noqa: BLE001
-                hierarchy_logger.warning(
-                    "Failed to fetch %s anchor for round %d: %s",
-                    scope_label,
-                    next_round,
-                    exc,
-                )
-                return
-            if anchor is None:
-                if next_round == last_applied + 1:
-                    hierarchy_logger.debug(
-                        "No new %s model available for round %d; will retry later",
-                        scope_label,
-                        next_round,
-                    )
-                break
-            cid, expected_hash = anchor
-            hierarchy_logger.info(
-                "%s model round %d detected on blockchain (cid=%s..., hash=%s...)",
-                scope_label.capitalize(),
-                next_round,
-                cid[:12],
-                expected_hash[:12],
-            )
-            state_model = self.ipfs.get(cid)
-            if state_model is None:
-                hierarchy_logger.warning(
-                    "%s model round %d unavailable on IPFS (cid=%s...)",
-                    scope_label,
-                    next_round,
-                    cid[:16],
-                )
-                return
-            if not verify_model_hash(state_model, expected_hash):
-                hierarchy_logger.warning(
-                    "%s model round %d hash mismatch (cid=%s...)",
-                    scope_label,
-                    next_round,
-                    cid[:16],
-                )
-                return
-            self._apply_scope_policy_tensor_for(self.scope_config, state_model, scope_label.upper())
-            self._last_model_cid = cid
-            self._last_model_hash = expected_hash
-            self._last_model_data_id = None
-            last_applied = next_round
-            scope_progress[scope_key] = last_applied
-            hierarchy_logger.info(
-                "Applied %s round %d model (cid=%s...); next cluster rounds will start from this baseline",
-                scope_label.upper(),
-                next_round,
-                cid[:12],
-            )
-            next_round += 1
+    def _maybe_apply_scope_model(self, round_idx: Optional[int] = None) -> None:
+        """Fetch and apply the latest anchored model for this node's scope."""
+        self._apply_scope_model_from_anchor(self.scope_name, self.scope_config, is_local_scope=True)
 
     def _maybe_apply_external_scope_model(self, scope_name: str, config: HierarchyLevelConfig) -> None:
         """Apply anchored models for a higher scope to this node's baseline."""
-        scope_key = scope_name.lower()
-        if not self.blockchain or not self.ipfs or not self.model:
+        self._apply_scope_model_from_anchor(scope_name, config, is_local_scope=False)
+
+    def _apply_scope_model_from_anchor(
+        self,
+        scope_name: str,
+        config: HierarchyLevelConfig,
+        *,
+        is_local_scope: bool,
+    ) -> None:
+        if (
+            not config
+            or not self.blockchain
+            or not self.ipfs
+            or not self.model
+            or not self._node_participates_in_scope(scope_name, config)
+        ):
             return
-        scope_id = getattr(config, "scope_id", None)
+        scope_id = self._node_scope_identifier_for(scope_name, config)
         if not scope_id:
+            hierarchy_logger.debug("Scope %s lacks identifier for node %s; skipping fetch", scope_name, getattr(self, "node_id", "unknown"))
             return
+        scope_label = str(getattr(config, "scope_name", scope_name) or scope_name)
+        runtime = self._ensure_scope_runtime(scope_name, config)
+        try:
+            anchor = self.blockchain.get_latest_scope_model(scope_label, scope_id)
+        except Exception as exc:  # noqa: BLE001
+            hierarchy_logger.warning(
+                "Failed to query latest %s model for %s: %s",
+                scope_label,
+                scope_id,
+                exc,
+            )
+            return
+        if anchor is None:
+            hierarchy_logger.debug(
+                "No %s models available yet for scope_id=%s; will retry on next trigger",
+                scope_label.lower(),
+                scope_id,
+            )
+            return
+        last_cids = getattr(self, "_scope_last_applied_cids", None)
+        if last_cids is None:
+            last_cids = {}
+            setattr(self, "_scope_last_applied_cids", last_cids)
+        scope_key = f"{scope_label.lower()}::{scope_id}"
+        if last_cids.get(scope_key) == anchor.cid:
+            hierarchy_logger.info(
+                "%s model cid=%s... already applied; skipping merge",
+                scope_label.upper(),
+                anchor.cid[:12],
+            )
+            return
+        upstream_model = self.ipfs.get(anchor.cid)
+        if upstream_model is None:
+            hierarchy_logger.warning(
+                "%s latest model unavailable on IPFS (cid=%s...)",
+                scope_label.upper(),
+                anchor.cid[:12],
+            )
+            return
+        if not verify_model_hash(upstream_model, anchor.hash):
+            hierarchy_logger.warning(
+                "%s latest model hash mismatch (cid=%s...)",
+                scope_label.upper(),
+                anchor.cid[:12],
+            )
+            return
+        if is_local_scope:
+            self._apply_scope_policy_tensor(upstream_model)
+        else:
+            self._apply_scope_policy_tensor_for(config, upstream_model, scope_label.upper())
+        runtime.last_model_cid = anchor.cid
+        runtime.last_model_hash = anchor.hash
+        runtime.last_model_data_id = anchor.data_id
+        if is_local_scope:
+            self._last_model_cid = anchor.cid
+            self._last_model_hash = anchor.hash
+            self._last_model_data_id = anchor.data_id
         scope_progress = getattr(self, "_scope_last_applied_rounds", None)
         if scope_progress is None:
             scope_progress = {}
             setattr(self, "_scope_last_applied_rounds", scope_progress)
-        last_applied = scope_progress.get(scope_key, 0)
-        target_round = last_applied + 1
-        scope_namespace = self._scope_namespace(config)
-        while True:
-            try:
-                anchor = self.blockchain.get_anchor(
-                    scope_id,
-                    target_round,
-                    scope=scope_namespace,
-                )
-            except Exception as exc:  # noqa: BLE001
-                hierarchy_logger.warning(
-                    "Failed to fetch %s anchor for round %d: %s",
-                    scope_name,
-                    target_round,
-                    exc,
-                )
-                return
-            if anchor is None:
-                hierarchy_logger.debug(
-                    "%s model round %d not yet available; will retry later",
-                    scope_name.upper(),
-                    target_round,
-                )
-                return
-            cid, expected_hash = anchor
-            scope_label = getattr(config, "scope_name", scope_name)
-            hierarchy_logger.info(
-                "%s model round %d detected on blockchain (cid=%s..., hash=%s...)",
-                scope_label.capitalize(),
-                target_round,
-                cid[:12],
-                expected_hash[:12],
-            )
-            scope_model = self.ipfs.get(cid)
-            if scope_model is None:
-                hierarchy_logger.warning(
-                    "%s model round %d unavailable on IPFS (cid=%s...)",
-                    scope_label,
-                    target_round,
-                    cid[:16],
-                )
-                return
-            if not verify_model_hash(scope_model, expected_hash):
-                hierarchy_logger.warning(
-                    "%s model round %d hash mismatch (cid=%s...)",
-                    scope_label,
-                    target_round,
-                    cid[:16],
-                )
-                return
-            self._apply_scope_policy_tensor_for(config, scope_model, scope_label.upper())
-            scope_progress[scope_key] = target_round
-            hierarchy_logger.info(
-                "Applied %s round %d model (cid=%s...); downstream scopes will start from this baseline",
-                scope_label.upper(),
-                target_round,
-                cid[:12],
-            )
-            target_round += 1
+        if anchor.round_num is not None:
+            scope_progress[scope_key] = anchor.round_num
+        last_cids[scope_key] = anchor.cid
+        hierarchy_logger.info(
+            "Applied %s model round %s (cid=%s...) from latest-scope endpoint",
+            scope_label.upper(),
+            anchor.round_num if anchor.round_num is not None else "?",
+            anchor.cid[:12],
+        )
 
     def _apply_scope_policy_tensor(self, upstream_tensor: np.ndarray) -> None:
         """Apply upstream tensor for the current scope according to the configured policy."""
@@ -825,6 +1140,7 @@ class HierarchyMixin:
             scope_round = self._increment_scope_round(scope_key)
             if not any(sr == scope_round for sr, _ in handler.round_queue):
                 handler.round_queue.append((scope_round, trigger_round_idx))
+                self._queue_scope_wait(handler.scope_name, config)
                 hierarchy_logger.info(
                     "Scheduling %s round %d via %.1fs interval timer",
                     scope_label.lower(),
@@ -882,41 +1198,61 @@ class HierarchyMixin:
         handler.execute_fn(scope_round, source_round)
         return handler.scope_name, scope_round, source_round
 
-    def _execute_scope_round(self, scope_round: int, cluster_round: int) -> bool:
+    def _execute_scope_round(
+        self,
+        scope_round: int,
+        cluster_round: int,
+        runtime: Optional[ScopeRuntime] = None,
+    ) -> bool:
         """Collect ECMs, merge models, and broadcast digest for a state round."""
-        if not self._scope_layer_enabled():
+        runtime = runtime or self._runtime_for_scope(self.scope_name)
+        if not self._runtime_enabled(runtime):
             return False
-        if scope_round not in self._scope_rounds_logged:
+        config = runtime.config
+        label_lower = self._runtime_label_lower(runtime)
+        label_upper = label_lower.upper()
+        if runtime.scope_id is None:
+            hierarchy_logger.debug("Node %s is not part of %s scope; skipping", self.node_id, label_lower)
+            return False
+        if scope_round not in runtime.rounds_logged:
             total_scope_rounds = self._scope_round_budget()
             label = f"/{total_scope_rounds}" if total_scope_rounds else ""
-            self._scope_rounds_logged.add(scope_round)
-        can_aggregate = (
-            self.scope_aggregator is not None
-            and self.scope_ecm_buffer is not None
-            and self.central_metadata is not None
+            runtime.rounds_logged.add(scope_round)
+        can_aggregate = runtime.aggregator is not None and runtime.ecm_buffer is not None
+        scope_id = runtime.scope_id
+        expected_leader = self._scope_round_leader(
+            runtime.scope_name,
+            scope_id,
+            scope_round,
+            fallback=runtime.candidates,
         )
         if not can_aggregate:
-            return self._wait_for_scope_anchor_observer(scope_round)
-        if scope_round in self._scope_round_cache:
+            return self._wait_for_scope_anchor_observer(scope_round, runtime=runtime)
+        if expected_leader and self.node_id != expected_leader:
+            hierarchy_logger.info(
+                "%s round %d aggregator=%s; running local merge for digest verification",
+                self._runtime_label_upper(runtime),
+                scope_round,
+                expected_leader,
+            )
+        if scope_round in runtime.round_cache:
             return True
-        deadline = time.time() + max(1.0, float(self.scope_config.collection_timeout_seconds))
+        deadline = time.time() + max(1.0, float(config.collection_timeout_seconds))
         snapshot: Dict[str, StateClusterModel] = {}
         missing: List[str] = []
-        required_clusters = self._state_cluster_ids() or (
-            list(self.central_metadata.cluster_ids) if self.central_metadata else []
-        )
+        required_clusters = self._child_scope_ids_for_runtime(runtime)
         while time.time() < deadline:
-            ecms = self.scope_ecm_buffer.get_fresh_ecms()
-            snapshot, missing = self.scope_aggregator.build_snapshot(
+            ecms = runtime.ecm_buffer.get_fresh_ecms()
+            snapshot, missing = runtime.aggregator.build_snapshot(
                 ecms,
                 required_clusters,
-                cluster_round,
+                None,
             )
             if not missing:
                 break
             hierarchy_logger.debug(
                 "%s round %d waiting for ECMs from clusters: %s",
-                self._scope_label_lower(),
+                label_lower,
                 scope_round,
                 ", ".join(sorted(missing)),
             )
@@ -924,138 +1260,171 @@ class HierarchyMixin:
         if missing:
             hierarchy_logger.warning(
                 "%s round %d missing ECMs from clusters: %s",
-                self._scope_label_lower(),
+                label_lower,
                 scope_round,
                 ", ".join(sorted(missing)),
             )
             return False
         try:
-            models = self.scope_aggregator.fetch_models(snapshot, fallback_lookup=self._lookup_lower_scope_anchor)
-            merged_model = self.scope_aggregator.merge_models(models)
+            models = runtime.aggregator.fetch_models(snapshot, fallback_lookup=self._lookup_lower_scope_anchor)
+            merged_model = runtime.aggregator.merge_models(models)
         except StateAggregationError as exc:
-            hierarchy_logger.error("%s aggregation failed for round %d: %s", self._scope_label_upper(), scope_round, exc)
+            hierarchy_logger.error("%s aggregation failed for round %d: %s", label_upper, scope_round, exc)
             return False
         model_hash = compute_model_hash(merged_model)
-        self._scope_round_cache[scope_round] = merged_model
-        self._scope_round_hashes[scope_round] = model_hash
-        self._broadcast_scope_digest(scope_round, cluster_round, model_hash)
-        local_digest = ScopeDigest(
-            node_id=self.node_id,
-            scope_id=self._scope_identifier() or "",
-            scope_round=scope_round,
-            cluster_round=cluster_round,
-            model_hash=model_hash,
-            model_cid=None,
-            received_at=time.time(),
-        )
-        self._record_scope_digest(local_digest, local=True)
-        self._await_scope_digest_consensus(scope_round)
-        self._verify_scope_digest_consensus(scope_round, model_hash)
+        runtime.round_cache[scope_round] = merged_model
+        runtime.round_hashes[scope_round] = model_hash
+        self._try_scope_commit(scope_round, runtime=runtime)
         return True
 
-    def _dispatch_scope_artifacts(self, scope_round: int, cluster_round: int) -> None:
+    def _dispatch_scope_artifacts(
+        self,
+        scope_round: int,
+        cluster_round: int,
+        runtime: Optional[ScopeRuntime] = None,
+    ) -> None:
         """Have bridge nodes forward their latest ECM to scope aggregators when a round starts."""
-        if not self._scope_layer_enabled():
+        runtime = runtime or self.scope_runtime
+        if not self._runtime_enabled(runtime):
             return
-        target_addresses: Dict[str, str] = {}
-        if not self.central_neighbor_addresses:
+        label_lower = self._runtime_label_lower(runtime)
+        if runtime.scope_id is None:
+            hierarchy_logger.debug("Node %s not a member of %s scope; skipping dispatch", self.node_id, label_lower)
+            return
+        child_scope = self._lower_scope_name(runtime.scope_name)
+        if not child_scope:
             hierarchy_logger.debug(
-                "No central neighbor addresses available for %s dispatch", self._scope_label_lower()
-            )
-        else:
-            target_addresses.update(self.central_neighbor_addresses)
-        if not target_addresses and self.participant_map:
-            for node_id in self._preferred_scope_candidates():
-                addr = self.participant_map.get(node_id)
-                if not addr:
-                    continue
-                try:
-                    host, port_str = addr.split(":")
-                    target_addresses[node_id] = f"{host}:{int(port_str) + 2000}"
-                except ValueError:
-                    continue
-        if not target_addresses:
-            hierarchy_logger.warning(
-                "%s dispatch skipped for round %d: no central targets resolved",
-                self._scope_label_lower(),
-                scope_round,
+                "No child scope configured for %s; skipping dispatch",
+                label_lower,
             )
             return
-        target_list = ", ".join(f"{node}@{addr}" for node, addr in sorted(target_addresses.items()))
-        hierarchy_logger.info("%s dispatch targets for round %d: %s", self._scope_label_upper(), scope_round, target_list)
-        if not self._last_model_cid or not self._last_model_hash:
+        payload_cid, payload_hash = self._fanout_payload_for_child_scope(child_scope)
+        if not payload_cid or not payload_hash:
             hierarchy_logger.info(
                 "Skipping %s dispatch for round %d: missing latest model reference (cid=%s, hash=%s)",
-                self._scope_label_lower(),
+                label_lower,
                 scope_round,
-                self._last_model_cid or "N/A",
-                self._last_model_hash or "N/A",
+                payload_cid or "N/A",
+                payload_hash or "N/A",
             )
             return
-        targets = [
-            addr
-            for node_id, addr in target_addresses.items()
-            if node_id != self.node_id
-        ]
-        if not targets:
+        if child_scope == "cluster":
+            child_scope_id = f"cluster_{self.clique_id}"
+        else:
+            membership = self._node_scope_membership_map()
+            child_scope_id = membership.get(child_scope)
+        if not child_scope_id:
+            hierarchy_logger.info(
+                "Skipping %s dispatch for round %d: unable to resolve %s membership for node %s",
+                label_lower,
+                scope_round,
+                child_scope,
+                self.node_id,
+            )
+            return
+        channel_label = f"{runtime.scope_name.lower()}::{child_scope_id}"
+        selection = self._select_healthy_scope_aggregator(runtime, scope_round)
+        if not selection:
+            hierarchy_logger.warning(
+                "%s dispatch skipped for round %d: no healthy aggregators reachable",
+                label_lower,
+                scope_round,
+            )
+            return
+        aggregator_id, aggregator_address = selection
+        if aggregator_id == self.node_id:
+            hierarchy_logger.debug(
+                "Node %s is %s round %d aggregator; skipping fan-out dispatch",
+                self.node_id,
+                label_lower.upper(),
+                scope_round,
+            )
+            return
+        if not self._is_fanout_node_for_scope_round(runtime, scope_round):
+            hierarchy_logger.debug(
+                "%s not selected as %s fan-out for round %d; waiting for higher-level model",
+                self.node_id,
+                label_lower,
+                scope_round,
+            )
+            return
+        if not aggregator_address:
+            hierarchy_logger.warning(
+                "Healthy %s aggregator %s lacks bridge address; skipping dispatch",
+                label_lower,
+                aggregator_id,
+            )
             return
         if not self._ensure_bridge_client(allow_state_layer=True):
             hierarchy_logger.warning(
                 "Cannot dispatch %s artifacts for round %d: bridge client unavailable",
-                self._scope_label_lower(),
+                label_lower,
                 scope_round,
             )
             return
         accepted = self.bridge_client.broadcast_ecm(
-            targets,
-            f"cluster_{self.clique_id}",
+            [aggregator_address],
+            channel_label,
             cluster_round,
-            self._last_model_cid,
-            self._last_model_hash,
+            payload_cid,
+            payload_hash,
         )
         hierarchy_logger.info(
-            "Dispatched %s artifacts for round %d to %d/%d candidates",
-            self._scope_label_lower(),
+            "Dispatched %s artifacts for round %d to aggregator %s (accepted=%d)",
+            label_lower,
             scope_round,
+            aggregator_id,
             accepted,
-            len(targets),
         )
 
-    def _wait_for_scope_anchor_observer(self, scope_round: int) -> bool:
-        """Wait for another node to commit the state round before continuing."""
-        timeout = (
-            float(self.scope_config.collection_timeout_seconds)
-            + float(self.scope_config.consensus_timeout_seconds)
-            + float(self.scope_config.commit_timeout_seconds)
-        )
+    def _wait_for_scope_anchor_observer(
+        self,
+        scope_round: int,
+        runtime: Optional[ScopeRuntime] = None,
+    ) -> bool:
+        """Pause briefly for another candidate to publish the scope anchor."""
+        runtime = runtime or self.scope_runtime
+        if not self._runtime_enabled(runtime):
+            return False
+        label_lower = self._runtime_label_lower(runtime)
+        wait_seconds = float(getattr(runtime.config, "wait_seconds", 0.0) or 0.0)
+        if wait_seconds <= 0:
+            hierarchy_logger.info(
+                "No wait window configured for %s observers; continuing without delay",
+                label_lower,
+            )
+            return True
         hierarchy_logger.info(
-            "Waiting up to %.0fs for %s round %d anchor to appear",
-            timeout,
-            self._scope_label_lower(),
+            "Waiting up to %.0fs for %s round %d anchor to appear before continuing",
+            wait_seconds,
+            label_lower,
             scope_round,
         )
-        anchor = self._wait_for_scope_anchor(scope_round, timeout)
+        anchor = self._wait_for_scope_anchor(scope_round, wait_seconds, runtime=runtime)
         if anchor:
             hierarchy_logger.info(
                 "Observed %s round %d anchor committed elsewhere (cid=%s...)",
-                self._scope_label_lower(),
+                label_lower,
                 scope_round,
                 anchor[0][:8],
             )
-            return True
-            hierarchy_logger.warning(
-                "%s round %d anchor not observed after waiting %.0fs; continuing cluster training",
-                self._scope_label_lower(),
+        else:
+            hierarchy_logger.info(
+                "%s round %d anchor not observed after %.0fs wait window; proceeding with cluster training",
+                label_lower,
                 scope_round,
-                timeout,
+                wait_seconds,
             )
-        return False
+        return True
 
     def _lookup_lower_scope_anchor(self, cluster_id: str, round_idx: int) -> Optional[Tuple[str, str]]:
         if not self.blockchain:
             return None
+        key = cluster_id
+        if "::" in key:
+            _, key = key.split("::", 1)
         try:
-            return self.blockchain.get_anchor(cluster_id, round_idx, scope=AnchorScope.CLUSTER)
+            return self.blockchain.get_anchor(key, round_idx, scope=AnchorScope.CLUSTER)
         except Exception as exc:  # noqa: BLE001
             hierarchy_logger.warning(
                 "Failed to fetch anchor for cluster %s round %s: %s",
@@ -1065,245 +1434,87 @@ class HierarchyMixin:
             )
             return None
 
-    def _broadcast_scope_digest(self, scope_round: int, cluster_round: int, model_hash: str) -> None:
-        """Share this node's scope digest with other central candidates."""
-        hierarchy_logger.info(
-            "Broadcasting %s digest round=%d to other aggregators",
-            self._scope_label_lower(),
-            scope_round,
-        )
-        if not self._scope_layer_enabled():
+    def _try_scope_commit(
+        self,
+        scope_round: int,
+        runtime: Optional[ScopeRuntime] = None,
+    ) -> None:
+        runtime = runtime or self.scope_runtime
+        if not self._runtime_enabled(runtime):
             return
-        if not self.central_neighbor_addresses:
-            hierarchy_logger.debug("No central neighbor addresses available for %s digest broadcast", self._scope_label_lower())
+        label_lower = self._runtime_label_lower(runtime)
+        candidates = runtime.candidates or []
+        aggregator = runtime.aggregator
+        if not candidates or aggregator is None or scope_round in runtime.committed_rounds:
             return
-        if not self._ensure_bridge_client(allow_state_layer=True):
-            hierarchy_logger.warning(
-                "Cannot broadcast %s digest for round %d: bridge client unavailable",
-                self._scope_label_lower(),
-                scope_round,
-            )
-            return
-        payload = json.dumps(
-            {
-                "cluster_round": cluster_round,
-                "node_id": self.node_id,
-            }
-        )
-        scope_id = self._scope_identifier()
-        cid = build_scope_signal_cid(self._scope_label_lower(), scope_id, scope_round, self.node_id)
-        targets = [addr for node_id, addr in self.central_neighbor_addresses.items() if node_id != self.node_id]
-        if not targets:
-            return
-        channel_label = f"{self._scope_label_lower()}::{scope_id or 'unknown'}"
-        accepted = self.bridge_client.broadcast_ecm_with_metadata(
-            targets,
-            channel_label,
-            scope_round,
-            cid,
-            model_hash,
-            metadata=payload,
-        )
-        detail_targets = targets.copy()
-        hierarchy_logger.info(
-            "Broadcasted %s digest round=%d hash=%s... to %d/%d aggregators (%s)",
-            self._scope_label_lower(),
-            scope_round,
-            model_hash[:8],
-            accepted,
-            len(targets),
-            ", ".join(detail_targets) if detail_targets else "none",
-        )
-
-    def _record_scope_digest(self, digest: ScopeDigest, local: bool = False) -> None:
-        if not self._scope_layer_enabled():
-            return
-        records = self._scope_digest_records.setdefault(digest.scope_round, {})
-        prev = records.get(digest.node_id)
-        if prev and prev.model_hash == digest.model_hash:
-            return
-        records[digest.node_id] = digest
-        if local:
-            hierarchy_logger.info(
-                "Recorded local %s digest round=%d hash=%s...",
-                self._scope_label_lower(),
-                digest.scope_round,
-                digest.model_hash[:8],
-            )
-        else:
-            hierarchy_logger.info(
-                "Observed %s digest round=%d from %s hash=%s...",
-                self._scope_label_lower(),
-                digest.scope_round,
-                digest.node_id,
-                digest.model_hash[:8],
-            )
-        self._maybe_finalize_scope_round(digest.scope_round)
-
-    def _await_scope_digest_consensus(self, scope_round: int) -> None:
-        """Block until digests from all central candidates are observed or timeout elapses."""
-        if (
-            not self._scope_layer_enabled()
-            or not self.scope_candidates
-            or len(self.scope_candidates) <= 1
-        ):
-            return
-        timeout = float(self.scope_config.digest_timeout_seconds or 0.0)
-        if timeout <= 0:
-            return
-        deadline = time.time() + timeout
-        hierarchy_logger.info(
-            "Waiting up to %.0fs for peer %s digests (round %d)",
-            timeout,
-            self._scope_label_lower(),
-            scope_round,
-        )
-        last_log = 0.0
-        while time.time() < deadline:
-            self._process_incoming_signals()
-            records = self._scope_digest_records.get(scope_round, {})
-            if len(records) >= len(self.scope_candidates):
-                hierarchy_logger.info(
-                    "Received all %d %s digests for round %d",
-                    len(records),
-                    self._scope_label_lower(),
-                    scope_round,
-                )
-                return
-            missing = sorted(set(self.scope_candidates) - set(records.keys()))
-            now = time.time()
-            if missing and now - last_log >= 3.0:
-                hierarchy_logger.debug(
-                    "%s round %d waiting for digests from: %s",
-                    self._scope_label_lower(),
-                    scope_round,
-                    ", ".join(missing),
-                )
-                last_log = now
-            time.sleep(1.0)
-        remaining = sorted(
-            set(self.scope_candidates)
-            - set((self._scope_digest_records.get(scope_round) or {}).keys())
-        )
-        if remaining:
-            hierarchy_logger.warning(
-                "%s round %d timed out waiting for digests from: %s",
-                self._scope_label_lower(),
-                scope_round,
-                ", ".join(remaining),
-            )
-
-    def _verify_scope_digest_consensus(self, scope_round: int, local_hash: str) -> None:
-        """Ensure all digests agree with the local hash before committing."""
-        records = self._scope_digest_records.get(scope_round, {})
-        if not records:
-            return
-        hashes = {digest.model_hash for digest in records.values()}
-        if len(hashes) == 1 and local_hash in hashes:
-            hierarchy_logger.info("%s round %d digests are consistent (hash=%s...)", self._scope_label_lower(), scope_round, local_hash[:8])
-            return
-        hierarchy_logger.warning(
-            "%s round %d digest mismatch detected. Local hash=%s..., peers=%s",
-            self._scope_label_lower(),
-            scope_round,
-            local_hash[:8],
-            ", ".join(h[:8] for h in sorted(hashes)),
-        )
-
-    def _maybe_finalize_scope_round(self, scope_round: int) -> None:
-        if (
-            not self._scope_layer_enabled()
-            or scope_round in self._scope_committed_rounds
-            or not self.scope_candidates
-        ):
-            return
-        records = self._scope_digest_records.get(scope_round, {})
-        if len(records) < len(self.scope_candidates):
-            return
-        hashes = {digest.model_hash for digest in records.values()}
-        if len(hashes) != 1:
-            hierarchy_logger.warning(
-                "%s round %d has conflicting digests: %s",
-                self._scope_label_lower(),
-                scope_round,
-                ", ".join(sorted(hashes)),
-            )
-            return
-        hierarchy_logger.info(
-            "%s round %d digest consensus reached across %d candidates (hash=%s...)",
-            self._scope_label_lower(),
-            scope_round,
-            len(records),
-            next(iter(hashes))[:8],
-        )
-        self._try_scope_commit(scope_round)
-
-    def _try_scope_commit(self, scope_round: int) -> None:
-        if (
-            not self._scope_layer_enabled()
-            or not self.scope_candidates
-            or not self.scope_aggregator
-            or scope_round in self._scope_committed_rounds
-        ):
-            return
-        model = self._scope_round_cache.get(scope_round)
+        model = runtime.round_cache.get(scope_round)
         if model is None:
             hierarchy_logger.debug(
-                "State round %d consensus reached but local model missing; waiting to commit",
+                "%s round %d consensus reached but local model missing; waiting to commit",
+                label_lower.upper(),
                 scope_round,
             )
             return
-        leader_index = scope_round % len(self.scope_candidates)
-        ordered_candidates = [
-            self.scope_candidates[(leader_index + offset) % len(self.scope_candidates)]
-            for offset in range(len(self.scope_candidates))
-        ]
+        ordered_candidates = self._ordered_scope_candidates(runtime, scope_round) or list(candidates)
+        commit_timeout = float(getattr(runtime.config, "commit_timeout_seconds", 0.0) or 0.0)
         for candidate in ordered_candidates:
             if candidate == self.node_id:
-                anchor = self.scope_aggregator.get_anchor(scope_round)
+                anchor = aggregator.get_anchor(scope_round)
                 if anchor:
-                    self._mark_scope_round_committed(scope_round)
+                    self._mark_scope_round_committed(scope_round, runtime=runtime)
                     return
                 try:
-                    cid, hash_val, data_id = self.scope_aggregator.publish_state_model(model, scope_round)
+                    cid, hash_val, data_id = aggregator.publish_state_model(model, scope_round)
                 except StateAggregationError as exc:
-                    hierarchy_logger.error("%s round %d commit failed on %s: %s", self._scope_label_lower(), scope_round, self.node_id, exc)
+                    hierarchy_logger.error(
+                        "%s round %d commit failed on %s: %s",
+                        label_lower,
+                        scope_round,
+                        self.node_id,
+                        exc,
+                    )
                     continue
                 if cid and hash_val:
                     hierarchy_logger.info(
                         "%s round %d committed by %s (cid=%s..., data_id=%s)",
-                        self._scope_label_lower(),
+                        label_lower,
                         scope_round,
                         self.node_id,
                         cid[:8],
                         data_id or "N/A",
                     )
-                    self._mark_scope_round_committed(scope_round)
+                    self._mark_scope_round_committed(scope_round, runtime=runtime)
                     return
             else:
-                anchor = self._wait_for_scope_anchor(scope_round, self.scope_config.commit_timeout_seconds)
+                anchor = self._wait_for_scope_anchor(scope_round, commit_timeout, runtime=runtime)
                 if anchor:
                     hierarchy_logger.info(
                         "%s round %d observed anchor (cid=%s...) by peer",
-                        self._scope_label_lower(),
+                        label_lower,
                         scope_round,
                         anchor[0][:8],
                     )
-                    self._mark_scope_round_committed(scope_round)
+                    self._mark_scope_round_committed(scope_round, runtime=runtime)
                     return
-        hierarchy_logger.warning("%s round %d not anchored after iterating all candidates", self._scope_label_lower(), scope_round)
+        hierarchy_logger.warning("%s round %d not anchored after iterating all candidates", label_lower, scope_round)
 
-    def _wait_for_scope_anchor(self, scope_round: int, timeout: float) -> Optional[Tuple[str, str]]:
-        scope_id = self._scope_identifier()
-        scope_namespace = self._scope_namespace()
-        if self.scope_aggregator is None and (self.blockchain is None or not scope_id):
+    def _wait_for_scope_anchor(
+        self,
+        scope_round: int,
+        timeout: float,
+        runtime: Optional[ScopeRuntime] = None,
+    ) -> Optional[Tuple[str, str]]:
+        runtime = runtime or self.scope_runtime
+        scope_id = self._runtime_scope_identifier(runtime)
+        scope_namespace = self._scope_namespace(runtime.config)
+        if runtime.aggregator is None and (self.blockchain is None or not scope_id):
             return None
         deadline = time.time() + max(0.0, timeout)
         while time.time() < deadline:
             anchor: Optional[Tuple[str, str]] = None
             try:
-                if self.scope_aggregator is not None:
-                    anchor = self.scope_aggregator.get_anchor(
+                if runtime.aggregator is not None:
+                    anchor = runtime.aggregator.get_anchor(
                         scope_round,
                         suppress_not_found_log=True,
                     )
@@ -1392,11 +1603,15 @@ class HierarchyMixin:
         )
         return False
 
-    def _mark_scope_round_committed(self, scope_round: int) -> None:
-        self._scope_committed_rounds.add(scope_round)
-        self._scope_digest_records.pop(scope_round, None)
-        self._scope_round_cache.pop(scope_round, None)
-        self._scope_round_hashes.pop(scope_round, None)
+    def _mark_scope_round_committed(
+        self,
+        scope_round: int,
+        runtime: Optional[ScopeRuntime] = None,
+    ) -> None:
+        runtime = runtime or self.scope_runtime
+        runtime.committed_rounds.add(scope_round)
+        runtime.round_cache.pop(scope_round, None)
+        runtime.round_hashes.pop(scope_round, None)
 
     def _announce_higher_round(self, higher_round: int, source_scope_round: int) -> None:
         """Placeholder for higher-level aggregation flow."""

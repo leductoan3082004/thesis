@@ -235,6 +235,23 @@ class BridgeClient:
                 accepted += 1
         return accepted
 
+    def wait_for_ready(self, address: str, timeout: float = 2.0) -> bool:
+        """Return True if the target bridge endpoint responds within timeout."""
+        try:
+            stub = self._get_stub(address)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to create bridge stub for %s: %s", address, exc)
+            return False
+        channel = self._channels.get(address)
+        if channel is None:
+            return False
+        try:
+            grpc.channel_ready_future(channel).result(timeout=timeout)
+            return True
+        except grpc.FutureTimeoutError:
+            logger.warning("Bridge peer %s not ready after %.1fs", address, timeout)
+            return False
+
     def close(self) -> None:
         """Close all channels."""
         for channel in self._channels.values():

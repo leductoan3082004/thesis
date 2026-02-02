@@ -38,6 +38,7 @@ class HierarchyLevelConfig:
         max_aggregators: Optional bound on concurrent aggregators.
         fanout_per_group: Optional fan-out hint for multi-hop topologies.
         fanout_per_scope: Optional fan-out hint for higher scopes.
+        fanout_count: Optional number of fan-out nodes per child scope.
     """
 
     enabled: bool = False
@@ -58,6 +59,7 @@ class HierarchyLevelConfig:
     max_aggregators: Optional[int] = None
     fanout_per_group: Optional[int] = None
     fanout_per_scope: Optional[int] = None
+    fanout_count: Optional[int] = None
 
     @classmethod
     def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "HierarchyLevelConfig":
@@ -93,7 +95,7 @@ class HierarchyLevelConfig:
                     kwargs[key] = [str(v) for v in value]
                 else:
                     kwargs[key] = [str(value)]
-            elif key in ("max_aggregators", "fanout_per_group", "fanout_per_scope"):
+            elif key in ("max_aggregators", "fanout_per_group", "fanout_per_scope", "fanout_count"):
                 kwargs[key] = int(value) if value is not None else None
             else:
                 kwargs[key] = str(value)

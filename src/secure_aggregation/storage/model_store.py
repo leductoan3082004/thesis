@@ -158,6 +158,11 @@ class BlockchainInterface(ABC):
         """Fetch raw data payload by ID."""
         pass
 
+    @abstractmethod
+    def get_latest_scope_model(self, scope_name: str, scope_id: str) -> Optional[ModelAnchor]:
+        """Return the most recently anchored model for the supplied scope, if any."""
+        pass
+
 
 class MockIPFS(IPFSInterface):
     """
@@ -427,6 +432,10 @@ class MockBlockchain(BlockchainInterface):
         if record is None:
             logger.warning(f"{BLOCKCHAIN_LOG_TAG} MockBlockchain missing data_id={data_id}")
         return record
+
+    def get_latest_scope_model(self, scope_name: str, scope_id: str) -> Optional[ModelAnchor]:
+        """Mock implementation reuses the local registry for all scopes."""
+        return self.get_latest_anchor(scope_id, scope=scope_name)
 
 
 class KuboIPFS(IPFSInterface):
@@ -698,6 +707,73 @@ class RegistryBlockchain(BlockchainInterface):
         except httpx.HTTPError as e:
             logger.error(f"Failed to get latest anchor: {e}")
             raise RuntimeError(f"Registry get_latest_anchor failed: {e}") from e
+
+    def get_latest_scope_model(self, scope_name: str, scope_id: str) -> Optional[ModelAnchor]:
+        """Query the registry for the most recent model anchored for the supplied scope."""
+        scope_key = normalize_scope(scope_name)
+        identifier_field = scope_key
+        try:
+            response = self._client.get(
+                f"{self._registry_url}/{scope_key}/models/latest",
+                params={identifier_field: scope_id},
+            )
+            if response.status_code == 404:
+                try:
+                    detail = response.json().get("detail", response.text)
+                except (ValueError, AttributeError):
+                    detail = response.text
+                message = detail.strip() if detail else f"no models found for {scope_key} {scope_id}"
+                logger.info("%s %s", BLOCKCHAIN_LOG_TAG, message)
+                return None
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            logger.error(
+                "%s Registry returned %s for %s latest model lookup",
+                BLOCKCHAIN_LOG_TAG,
+                exc.response.status_code,
+                scope_key,
+            )
+            raise RuntimeError(f"Registry latest {scope_key} failed: {exc}") from exc
+        except httpx.HTTPError as exc:
+            logger.error(
+                "%s Registry latest %s query failed: %s",
+                BLOCKCHAIN_LOG_TAG,
+                scope_key,
+                exc,
+            )
+            raise RuntimeError(f"Registry latest {scope_key} failed: {exc}") from exc
+        record = response.json()
+        payload = record.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        cid = payload.get("cid") or payload.get("model_cid")
+        hash_val = payload.get("model_hash")
+        if not (cid and hash_val):
+            logger.warning(
+                "%s latest %s response missing cid/hash (scope_id=%s)",
+                BLOCKCHAIN_LOG_TAG,
+                scope_key,
+                scope_id,
+            )
+            return None
+        round_num = record.get("round") or record.get("round_num")
+        try:
+            normalized_round = int(round_num)
+        except (TypeError, ValueError):
+            normalized_round = 0
+        return ModelAnchor(
+            cluster_id=scope_id,
+            round_num=normalized_round,
+            cid=cid,
+            hash=hash_val,
+            data_id=record.get("data_id"),
+            submitted_at=record.get("submitted_at"),
+        )
 
     def close(self) -> None:
         """Close the HTTP client."""
@@ -1254,6 +1330,85 @@ class GatewayBlockchain(BlockchainInterface):
                 f"{BLOCKCHAIN_LOG_TAG} Latest anchor cluster={cluster_id}, round={anchor.round_num}, cid={anchor.cid[:16]}..."
             )
         return anchor
+
+    def get_latest_scope_model(self, scope_name: str, scope_id: str) -> Optional[ModelAnchor]:
+        """Call the gateway's latest-model endpoint for the requested scope."""
+        scope_key = normalize_scope(scope_name)
+        identifier_field = scope_key
+        try:
+            response = self._client.get(
+                f"{self._base_url}/{scope_key}/models/latest",
+                headers=self._auth_headers(),
+                params={identifier_field: scope_id},
+            )
+            if response.status_code == 404:
+                try:
+                    detail = response.json().get("detail", response.text)
+                except (ValueError, AttributeError):
+                    detail = response.text
+                message = detail.strip() if detail else f"no models found for {scope_key} {scope_id}"
+                logger.info("%s %s", BLOCKCHAIN_LOG_TAG, message)
+                return None
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            logger.error(
+                "%s Gateway returned %s for latest %s lookup",
+                BLOCKCHAIN_LOG_TAG,
+                exc.response.status_code,
+                scope_key,
+            )
+            raise RuntimeError(f"Gateway latest {scope_key} failed: {exc}") from exc
+        except httpx.HTTPError as exc:
+            logger.error(
+                "%s Gateway latest %s query failed: %s",
+                BLOCKCHAIN_LOG_TAG,
+                scope_key,
+                exc,
+            )
+            raise RuntimeError(f"Gateway latest {scope_key} failed: {exc}") from exc
+        record = response.json()
+        payload = record.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        cid = payload.get("cid") or payload.get("model_cid")
+        hash_val = payload.get("model_hash")
+        if not (cid and hash_val):
+            logger.warning(
+                "%s latest %s response missing cid/hash for scope=%s",
+                BLOCKCHAIN_LOG_TAG,
+                scope_key,
+                scope_id,
+            )
+            return None
+        round_num = record.get("round") or record.get("round_num")
+        try:
+            normalized_round = int(round_num)
+        except (TypeError, ValueError):
+            normalized_round = 0
+        data_id = record.get("data_id") or f"{scope_key}::{scope_id}::{normalized_round}"
+        submitted_at = record.get("submitted_at")
+        self._store.remember(
+            scope_id,
+            normalized_round,
+            data_id,
+            cid,
+            hash_val,
+            submitted_at,
+            scope=scope_key,
+        )
+        return ModelAnchor(
+            cluster_id=scope_id,
+            round_num=normalized_round,
+            cid=cid,
+            hash=hash_val,
+            data_id=data_id,
+            submitted_at=submitted_at,
+        )
 
     def close(self) -> None:
         self._client.close()

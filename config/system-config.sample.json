@@ -19,7 +19,7 @@
       "interval_seconds": 120,
       "wait_seconds": 20,
       "max_aggregators": 2,
-      "fanout_per_group": 2,
+      "fanout_count": 2,
       "apply_policy": "replace"
     },
     {
@@ -31,7 +31,7 @@
       "interval_seconds": 300,
       "wait_seconds": 30,
       "max_aggregators": 2,
-      "fanout_per_scope": 2,
+      "fanout_count": 2,
       "apply_policy": "interpolate",
       "apply_alpha": 0.2
     }
