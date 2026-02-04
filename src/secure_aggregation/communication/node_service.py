@@ -860,11 +860,22 @@ class NodeService(HierarchyMixin):
             source_round,
         )
         if scope_name != self.scope_name:
-            logger.info(
-                "%s round %d finished; waiting for configured pull window to elapse",
-                scope_name.upper(),
-                scope_round,
-            )
+            config = self._get_scope_config_entry(scope_name)
+            wait_seconds = float(getattr(config, "wait_seconds", 0.0) or 0.0) if config else 0.0
+            if wait_seconds > 0:
+                logger.info(
+                    "%s round %d finished; waiting %.0fs before pulling latest %s model",
+                    scope_name.upper(),
+                    scope_round,
+                    wait_seconds,
+                    scope_name.upper(),
+                )
+            else:
+                logger.info(
+                    "%s round %d finished; no wait window configured before pulling latest model",
+                    scope_name.upper(),
+                    scope_round,
+                )
 
     def _process_high_level_rounds(self) -> bool:
         """Drain scheduled rounds, enforce wait windows, and pull latest scope models."""

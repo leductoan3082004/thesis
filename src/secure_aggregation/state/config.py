@@ -29,8 +29,8 @@ class HierarchyLevelConfig:
         wait_seconds: Optional pause nodes should honor before pulling this scope's model.
         approach: Candidate election approach for collection-enabled levels.
         collection_timeout_seconds: Max time to wait for ECM coverage.
-        digest_timeout_seconds: How long to wait for peer digests per round.
-        consensus_timeout_seconds: Overall timeout for digest alignment.
+        digest_timeout_seconds: Legacy knob retained for backward compatibility (no longer used).
+        consensus_timeout_seconds: Legacy knob retained for backward compatibility (no longer used).
         commit_timeout_seconds: Per-candidate wait before trying to commit.
         apply_policy: Policy for assimilating upstream checkpoints.
         apply_alpha: Interpolation weight when apply_policy="interpolate".

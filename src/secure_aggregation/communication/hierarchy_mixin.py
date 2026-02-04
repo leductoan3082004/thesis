@@ -1204,7 +1204,7 @@ class HierarchyMixin:
         cluster_round: int,
         runtime: Optional[ScopeRuntime] = None,
     ) -> bool:
-        """Collect ECMs, merge models, and broadcast digest for a state round."""
+        """Collect child-scope artifacts, merge models, and publish the round."""
         runtime = runtime or self._runtime_for_scope(self.scope_name)
         if not self._runtime_enabled(runtime):
             return False
@@ -1230,7 +1230,7 @@ class HierarchyMixin:
             return self._wait_for_scope_anchor_observer(scope_round, runtime=runtime)
         if expected_leader and self.node_id != expected_leader:
             hierarchy_logger.info(
-                "%s round %d aggregator=%s; running local merge for digest verification",
+                "%s round %d aggregator=%s; running local merge while waiting for anchor",
                 self._runtime_label_upper(runtime),
                 scope_round,
                 expected_leader,
@@ -1241,27 +1241,40 @@ class HierarchyMixin:
         snapshot: Dict[str, StateClusterModel] = {}
         missing: List[str] = []
         required_clusters = self._child_scope_ids_for_runtime(runtime)
+        child_scope_label = self._lower_scope_name(runtime.scope_name) or "child"
         while time.time() < deadline:
-            ecms = runtime.ecm_buffer.get_fresh_ecms()
+            artifacts = runtime.ecm_buffer.get_fresh_ecms()
             snapshot, missing = runtime.aggregator.build_snapshot(
-                ecms,
+                artifacts,
                 required_clusters,
                 None,
             )
             if not missing:
                 break
             hierarchy_logger.debug(
-                "%s round %d waiting for ECMs from clusters: %s",
+                "%s round %d waiting for %s artifacts from: %s",
                 label_lower,
                 scope_round,
+                child_scope_label.upper(),
                 ", ".join(sorted(missing)),
             )
             time.sleep(1.0)
+        collected = sorted(snapshot.keys())
+        hierarchy_logger.info(
+            "%s round %d collected %d/%d %s artifacts: %s",
+            label_lower,
+            scope_round,
+            len(collected),
+            len(required_clusters),
+            child_scope_label.upper(),
+            ", ".join(collected) if collected else "none",
+        )
         if missing:
             hierarchy_logger.warning(
-                "%s round %d missing ECMs from clusters: %s",
+                "%s round %d missing %s artifacts from: %s",
                 label_lower,
                 scope_round,
+                child_scope_label.upper(),
                 ", ".join(sorted(missing)),
             )
             return False
@@ -1271,6 +1284,13 @@ class HierarchyMixin:
         except StateAggregationError as exc:
             hierarchy_logger.error("%s aggregation failed for round %d: %s", label_upper, scope_round, exc)
             return False
+        hierarchy_logger.info(
+            "%s round %d merged %d %s artifacts successfully; preparing commit",
+            label_lower,
+            scope_round,
+            len(models),
+            child_scope_label.lower(),
+        )
         model_hash = compute_model_hash(merged_model)
         runtime.round_cache[scope_round] = merged_model
         runtime.round_hashes[scope_round] = model_hash
@@ -1283,7 +1303,7 @@ class HierarchyMixin:
         cluster_round: int,
         runtime: Optional[ScopeRuntime] = None,
     ) -> None:
-        """Have bridge nodes forward their latest ECM to scope aggregators when a round starts."""
+        """Have bridge nodes forward their latest child-scope artifact to the elected aggregator."""
         runtime = runtime or self.scope_runtime
         if not self._runtime_enabled(runtime):
             return

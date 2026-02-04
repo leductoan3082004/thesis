@@ -1001,13 +1001,6 @@ class GatewayBlockchain(BlockchainInterface):
         )
         response.raise_for_status()
         result = response.json()
-        logger.info(
-            f"{BLOCKCHAIN_LOG_TAG} Submitted %s model id=%s round=%s data_id=%s",
-            scope_key,
-            scope_id,
-            scope_round,
-            result.get("data_id"),
-        )
         return result
 
     def _fetch_control_data(self, data_id: str) -> Dict:

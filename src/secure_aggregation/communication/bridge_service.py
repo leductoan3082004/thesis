@@ -16,7 +16,7 @@ from secure_aggregation.node import ECM, ECMBuffer
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("bridge_service")
-STATE_SIGNAL_PREFIX = "state::"
+STATE_CHANNEL_PREFIX = "state::"
 
 
 class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
@@ -68,8 +68,8 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
     ) -> secureagg_pb2.ECMSubmitResponse:
         """Receive ECM broadcast from neighbor cluster."""
         cid = request.cid or f"signal::{request.cluster_id}::{request.round}"
-        is_state_signal = request.cluster_id.startswith(STATE_SIGNAL_PREFIX)
-        if request.convergence_data_id and not request.cid and not is_state_signal:
+        is_state_channel = request.cluster_id.startswith(STATE_CHANNEL_PREFIX)
+        if request.convergence_data_id and not request.cid and not is_state_channel:
             cid = f"signal::convergence::{request.convergence_data_id}"
         is_signal = cid.startswith("signal::")
         ecm = ECM(
@@ -84,12 +84,7 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
         )
         self.ecm_buffer.add(ecm)
         self._emit_hooks(ecm)
-        if is_state_signal:
-            logger.info(
-                f"Received state digest from {request.cluster_id} round {request.round}: "
-                f"cid={request.cid[:8]}..."
-            )
-        else:
+        if not is_signal:
             logger.info(
                 f"Received ECM from cluster {request.cluster_id} "
                 f"round {request.round}: cid={request.cid[:8]}..."
@@ -173,9 +168,9 @@ class BridgeClient:
             if self.send_ecm(addr, cluster_id, round_num, cid, model_hash):
                 accepted += 1
 
-        if cluster_id.startswith(STATE_SIGNAL_PREFIX):
+        if cluster_id.startswith(STATE_CHANNEL_PREFIX):
             logger.info(
-                f"Broadcast state digest to {accepted}/{len(neighbor_addresses)} neighbors "
+                f"Broadcast state artifact to {accepted}/{len(neighbor_addresses)} neighbors "
                 f"(state={cluster_id}, round={round_num})"
             )
         else:
@@ -194,7 +189,7 @@ class BridgeClient:
         model_hash: str,
         metadata: Optional[str] = None,
     ) -> bool:
-        """Send ECM with auxiliary metadata (used for state digests)."""
+        """Send ECM with auxiliary metadata (used for state artifacts)."""
         try:
             stub = self._get_stub(neighbor_address)
             request = secureagg_pb2.ECMBroadcast(
