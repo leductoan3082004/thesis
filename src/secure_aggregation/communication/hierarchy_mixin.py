@@ -20,7 +20,7 @@ from secure_aggregation.state import (
     StateClusterModel,
 )
 from secure_aggregation.state.nodes_map import NodesMapMetadata, load_nodes_map
-from secure_aggregation.storage.model_store import AnchorScope, compute_model_hash, verify_model_hash
+from secure_aggregation.storage.model_store import AnchorScope, ModelAnchor, compute_model_hash, verify_model_hash
 from secure_aggregation.utils import get_logger
 
 hierarchy_logger = get_logger("hierarchy")
@@ -65,6 +65,7 @@ class ScopeRuntime:
     last_model_cid: Optional[str]
     last_model_hash: Optional[str]
     last_model_data_id: Optional[str]
+    pending_anchor: Optional[ModelAnchor] = None
 
 
 class RoundRobinPool:
@@ -666,6 +667,60 @@ class HierarchyMixin:
             wait_seconds,
         )
 
+    def _scope_wait_key(self, runtime: ScopeRuntime) -> str:
+        label = getattr(runtime.config, "scope_name", runtime.scope_name) or runtime.scope_name or "scope"
+        return str(label).lower()
+
+    def _scope_applied_key(self, runtime: ScopeRuntime) -> Optional[str]:
+        scope_id = runtime.scope_id
+        if not scope_id:
+            return None
+        return f"{self._scope_wait_key(runtime)}::{scope_id}"
+
+    def _mark_scope_fetch_ready(
+        self,
+        runtime: ScopeRuntime,
+        anchor_cid: Optional[str],
+        anchor: Optional[ModelAnchor] = None,
+    ) -> None:
+        scope_key = self._scope_wait_key(runtime)
+        applied_key = self._scope_applied_key(runtime)
+        last_cids = getattr(self, "_scope_last_applied_cids", None) or {}
+        if anchor_cid and applied_key and last_cids.get(applied_key) == anchor_cid:
+            return
+        ready = getattr(self, "_ready_scope_fetches", None)
+        if ready is None:
+            ready = set()
+            self._ready_scope_fetches = ready
+        if scope_key in ready:
+            return
+        queue = getattr(self, "_pending_scope_waits", None)
+        if queue:
+            queue = deque(entry for entry in queue if entry[0] != scope_key)
+            self._pending_scope_waits = queue
+        ready.add(scope_key)
+        runtime.pending_anchor = anchor
+        if anchor_cid:
+            hierarchy_logger.info(
+                "%s anchor cid=%s... observed; fetching latest model without remaining wait window",
+                self._runtime_label_upper(runtime),
+                anchor_cid[:8],
+            )
+        else:
+            hierarchy_logger.info(
+                "%s wait window cleared; fetching latest model without delay",
+                self._runtime_label_upper(runtime),
+            )
+
+    def _clear_scope_wait(self, runtime: ScopeRuntime) -> None:
+        scope_key = self._scope_wait_key(runtime)
+        queue = getattr(self, "_pending_scope_waits", None)
+        if not queue:
+            return
+        retained = deque(entry for entry in queue if entry[0] != scope_key)
+        queue.clear()
+        queue.extend(retained)
+
     def _pause_for_scope_waits(self) -> bool:
         """Sleep until queued wait windows elapse before fetching high-level models."""
         queue: Optional[Deque[Tuple[str, float, float]]] = getattr(self, "_pending_scope_waits", None)
@@ -970,6 +1025,49 @@ class HierarchyMixin:
         """Apply anchored models for a higher scope to this node's baseline."""
         self._apply_scope_model_from_anchor(scope_name, config, is_local_scope=False)
 
+    def _record_scope_model_application(
+        self,
+        runtime: ScopeRuntime,
+        scope_round: Optional[int],
+        cid: Optional[str],
+        hash_val: Optional[str],
+        data_id: Optional[str],
+        tensor: Optional[np.ndarray],
+    ) -> None:
+        if cid:
+            runtime.last_model_cid = cid
+            if runtime.scope_name.lower() == self.scope_name.lower():
+                self._last_model_cid = cid
+        if hash_val:
+            runtime.last_model_hash = hash_val
+            if runtime.scope_name.lower() == self.scope_name.lower():
+                self._last_model_hash = hash_val
+        if data_id:
+            runtime.last_model_data_id = data_id
+            if runtime.scope_name.lower() == self.scope_name.lower():
+                self._last_model_data_id = data_id
+        applied_key = self._scope_applied_key(runtime)
+        if applied_key:
+            last_cids = getattr(self, "_scope_last_applied_cids", None)
+            if last_cids is None:
+                last_cids = {}
+                setattr(self, "_scope_last_applied_cids", last_cids)
+            if cid:
+                last_cids[applied_key] = cid
+            progress = getattr(self, "_scope_last_applied_rounds", None)
+            if progress is None:
+                progress = {}
+                setattr(self, "_scope_last_applied_rounds", progress)
+            if scope_round is not None:
+                progress[applied_key] = scope_round
+        runtime.pending_anchor = None
+        if tensor is not None:
+            if runtime.scope_name.lower() == self.scope_name.lower():
+                self._apply_scope_policy_tensor(tensor)
+            else:
+                self._apply_scope_policy_tensor_for(runtime.config, tensor, runtime.config.scope_name.upper())
+        self._clear_scope_wait(runtime)
+
     def _apply_scope_model_from_anchor(
         self,
         scope_name: str,
@@ -991,16 +1089,19 @@ class HierarchyMixin:
             return
         scope_label = str(getattr(config, "scope_name", scope_name) or scope_name)
         runtime = self._ensure_scope_runtime(scope_name, config)
-        try:
-            anchor = self.blockchain.get_latest_scope_model(scope_label, scope_id)
-        except Exception as exc:  # noqa: BLE001
-            hierarchy_logger.warning(
-                "Failed to query latest %s model for %s: %s",
-                scope_label,
-                scope_id,
-                exc,
-            )
-            return
+        anchor = runtime.pending_anchor
+        runtime.pending_anchor = None
+        if anchor is None:
+            try:
+                anchor = self.blockchain.get_latest_scope_model(scope_label, scope_id)
+            except Exception as exc:  # noqa: BLE001
+                hierarchy_logger.warning(
+                    "Failed to query latest %s model for %s: %s",
+                    scope_label,
+                    scope_id,
+                    exc,
+                )
+                return
         if anchor is None:
             hierarchy_logger.debug(
                 "No %s models available yet for scope_id=%s; will retry on next trigger",
@@ -1015,8 +1116,10 @@ class HierarchyMixin:
         scope_key = f"{scope_label.lower()}::{scope_id}"
         if last_cids.get(scope_key) == anchor.cid:
             hierarchy_logger.info(
-                "%s model cid=%s... already applied; skipping merge",
+                "No new %s model available for %s=%s (cid=%s... already applied)",
                 scope_label.upper(),
+                scope_label.lower(),
+                scope_id,
                 anchor.cid[:12],
             )
             return
@@ -1227,13 +1330,16 @@ class HierarchyMixin:
             fallback=runtime.candidates,
         )
         if not can_aggregate:
-            return self._wait_for_scope_anchor_observer(scope_round, runtime=runtime)
-        if expected_leader and self.node_id != expected_leader:
-            hierarchy_logger.info(
-                "%s round %d aggregator=%s; running local merge while waiting for anchor",
-                self._runtime_label_upper(runtime),
+            return self._wait_for_scope_anchor_observer(
                 scope_round,
-                expected_leader,
+                runtime=runtime,
+                leader_id=expected_leader,
+            )
+        if expected_leader and self.node_id != expected_leader:
+            return self._wait_for_scope_anchor_observer(
+                scope_round,
+                runtime=runtime,
+                leader_id=expected_leader,
             )
         if scope_round in runtime.round_cache:
             return True
@@ -1401,26 +1507,51 @@ class HierarchyMixin:
         self,
         scope_round: int,
         runtime: Optional[ScopeRuntime] = None,
+        *,
+        leader_id: Optional[str] = None,
     ) -> bool:
         """Pause briefly for another candidate to publish the scope anchor."""
         runtime = runtime or self.scope_runtime
         if not self._runtime_enabled(runtime):
             return False
         label_lower = self._runtime_label_lower(runtime)
+        label_upper = self._runtime_label_upper(runtime)
         wait_seconds = float(getattr(runtime.config, "wait_seconds", 0.0) or 0.0)
         if wait_seconds <= 0:
-            hierarchy_logger.info(
-                "No wait window configured for %s observers; continuing without delay",
-                label_lower,
-            )
+            if leader_id:
+                hierarchy_logger.info(
+                    "%s round %d aggregator=%s; no wait window configured before checking for anchor",
+                    label_upper,
+                    scope_round,
+                    leader_id,
+                )
+            else:
+                hierarchy_logger.info(
+                    "No wait window configured for %s observers; continuing without delay",
+                    label_lower,
+                )
             return True
-        hierarchy_logger.info(
-            "Waiting up to %.0fs for %s round %d anchor to appear before continuing",
-            wait_seconds,
-            label_lower,
+        if leader_id:
+            hierarchy_logger.info(
+                "%s round %d aggregator=%s; waiting up to %.0fs for anchor before continuing",
+                label_upper,
+                scope_round,
+                leader_id,
+                wait_seconds,
+            )
+        else:
+            hierarchy_logger.info(
+                "Waiting up to %.0fs for %s round %d anchor to appear before continuing",
+                wait_seconds,
+                label_lower,
+                scope_round,
+            )
+        anchor = self._wait_for_scope_anchor(
             scope_round,
+            wait_seconds,
+            runtime=runtime,
+            expedite_fetch=True,
         )
-        anchor = self._wait_for_scope_anchor(scope_round, wait_seconds, runtime=runtime)
         if anchor:
             hierarchy_logger.info(
                 "Observed %s round %d anchor committed elsewhere (cid=%s...)",
@@ -1481,6 +1612,7 @@ class HierarchyMixin:
             if candidate == self.node_id:
                 anchor = aggregator.get_anchor(scope_round)
                 if anchor:
+                    self._record_scope_model_application(runtime, scope_round, cid, hash_val, data_id, model)
                     self._mark_scope_round_committed(scope_round, runtime=runtime)
                     return
                 try:
@@ -1503,7 +1635,18 @@ class HierarchyMixin:
                         cid[:8],
                         data_id or "N/A",
                     )
+                    scope_identifier = runtime.scope_id or getattr(runtime.config, "scope_id", None) or runtime.scope_name
+                    pending_anchor = None
+                    if scope_identifier:
+                        pending_anchor = ModelAnchor(
+                            cluster_id=str(scope_identifier),
+                            round_num=scope_round,
+                            cid=cid,
+                            hash=hash_val,
+                            data_id=data_id,
+                        )
                     self._mark_scope_round_committed(scope_round, runtime=runtime)
+                    self._mark_scope_fetch_ready(runtime, cid, pending_anchor)
                     return
             else:
                 anchor = self._wait_for_scope_anchor(scope_round, commit_timeout, runtime=runtime)
@@ -1523,37 +1666,32 @@ class HierarchyMixin:
         scope_round: int,
         timeout: float,
         runtime: Optional[ScopeRuntime] = None,
+        *,
+        expedite_fetch: bool = False,
     ) -> Optional[Tuple[str, str]]:
         runtime = runtime or self.scope_runtime
         scope_id = self._runtime_scope_identifier(runtime)
-        scope_namespace = self._scope_namespace(runtime.config)
-        if runtime.aggregator is None and (self.blockchain is None or not scope_id):
+        scope_label = str(getattr(runtime.config, "scope_name", runtime.scope_name) or runtime.scope_name or "state")
+        if self.blockchain is None or not scope_id:
             return None
         deadline = time.time() + max(0.0, timeout)
         while time.time() < deadline:
-            anchor: Optional[Tuple[str, str]] = None
             try:
-                if runtime.aggregator is not None:
-                    anchor = runtime.aggregator.get_anchor(
-                        scope_round,
-                        suppress_not_found_log=True,
-                    )
-                elif self.blockchain is not None and scope_id:
-                    anchor = self.blockchain.get_anchor(
-                        scope_id,
-                        scope_round,
-                        scope=scope_namespace,
-                        suppress_not_found_log=True,
-                    )
+                latest_anchor = self.blockchain.get_latest_scope_model(scope_label, scope_id)
             except Exception as exc:  # noqa: BLE001
                 hierarchy_logger.warning(
-                    "Failed to poll state anchor round %d: %s",
-                    scope_round,
+                    "Failed to query latest %s model for scope_id=%s: %s",
+                    scope_label,
+                    scope_id,
                     exc,
                 )
                 return None
-            if anchor:
-                return anchor
+            if latest_anchor and latest_anchor.cid and latest_anchor.hash:
+                latest_round = getattr(latest_anchor, "round_num", None)
+                if latest_round is not None and latest_round >= scope_round:
+                    if expedite_fetch:
+                        self._mark_scope_fetch_ready(runtime, latest_anchor.cid, latest_anchor)
+                    return (latest_anchor.cid, latest_anchor.hash)
             remaining = deadline - time.time()
             if remaining <= 0:
                 break

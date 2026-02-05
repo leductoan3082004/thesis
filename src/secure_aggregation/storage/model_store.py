@@ -497,7 +497,6 @@ class KuboIPFS(IPFSInterface):
             result = response.json()
             cid = result["Hash"]
             self._replicate_to_peers(serialized, cid)
-            logger.info(f"{IPFS_LOG_TAG} Uploaded model to IPFS cid={cid[:16]}...")
             return cid
         except httpx.HTTPError as e:
             logger.error(f"{IPFS_LOG_TAG} Failed to add model to IPFS: {e}")
@@ -589,7 +588,6 @@ class KuboIPFS(IPFSInterface):
                 params={"arg": cid},
                 timeout=60.0,
             )
-            logger.info(f"{IPFS_LOG_TAG} Provided CID via {api_url} cid={cid[:16]}...")
         except httpx.HTTPError as e:
             logger.warning(f"{IPFS_LOG_TAG} Failed to provide CID via {api_url}: {e}")
 
@@ -718,12 +716,12 @@ class RegistryBlockchain(BlockchainInterface):
                 params={identifier_field: scope_id},
             )
             if response.status_code == 404:
-                try:
-                    detail = response.json().get("detail", response.text)
-                except (ValueError, AttributeError):
-                    detail = response.text
-                message = detail.strip() if detail else f"no models found for {scope_key} {scope_id}"
-                logger.info("%s %s", BLOCKCHAIN_LOG_TAG, message)
+                logger.debug(
+                    "%s No %s model available yet for scope=%s",
+                    BLOCKCHAIN_LOG_TAG,
+                    scope_key,
+                    scope_id,
+                )
                 return None
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -954,12 +952,7 @@ class GatewayBlockchain(BlockchainInterface):
             json={"payload": payload},
         )
         response.raise_for_status()
-        result = response.json()
-        logger.info(
-            f"{BLOCKCHAIN_LOG_TAG} Submitted payload to gateway cluster={payload.get('cluster_id')} "
-            f"round={payload.get('round')} data_id={result.get('data_id')}"
-        )
-        return result
+        return response.json()
 
     def _commit_cluster_model(self, cluster_id: str, round_num: int, cid: str, hash_val: str) -> Dict:
         response = self._client.post(
@@ -975,12 +968,7 @@ class GatewayBlockchain(BlockchainInterface):
             },
         )
         response.raise_for_status()
-        result = response.json()
-        logger.info(
-            f"{BLOCKCHAIN_LOG_TAG} Submitted cluster model cluster={cluster_id} round={round_num} "
-            f"data_id={result.get('data_id')}"
-        )
-        return result
+        return response.json()
 
     def _commit_scope_model(self, scope_key: str, scope_id: str, scope_round: int, cid: str, hash_val: str) -> Dict:
         scope_key = scope_key.lower()
@@ -1090,14 +1078,6 @@ class GatewayBlockchain(BlockchainInterface):
                 hash_val,
                 submitted_at,
                 scope=scope_key,
-            )
-            logger.info(
-                "%s Anchored %s model scope=%s, round=%s, data_id=%s",
-                BLOCKCHAIN_LOG_TAG,
-                scope_key,
-                cluster_id,
-                round_num,
-                data_id,
             )
         return data_id
 
@@ -1318,10 +1298,6 @@ class GatewayBlockchain(BlockchainInterface):
             return None
         round_num, _ = latest
         anchor = self._resolve_entry(cluster_id, round_num, scope_key)
-        if anchor:
-            logger.info(
-                f"{BLOCKCHAIN_LOG_TAG} Latest anchor cluster={cluster_id}, round={anchor.round_num}, cid={anchor.cid[:16]}..."
-            )
         return anchor
 
     def get_latest_scope_model(self, scope_name: str, scope_id: str) -> Optional[ModelAnchor]:
@@ -1335,12 +1311,13 @@ class GatewayBlockchain(BlockchainInterface):
                 params={identifier_field: scope_id},
             )
             if response.status_code == 404:
-                try:
-                    detail = response.json().get("detail", response.text)
-                except (ValueError, AttributeError):
-                    detail = response.text
-                message = detail.strip() if detail else f"no models found for {scope_key} {scope_id}"
-                logger.info("%s %s", BLOCKCHAIN_LOG_TAG, message)
+                logger.info(
+                    "%s No %s model available yet for %s=%s",
+                    BLOCKCHAIN_LOG_TAG,
+                    scope_key.upper(),
+                    identifier_field,
+                    scope_id,
+                )
                 return None
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

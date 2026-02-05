@@ -161,6 +161,23 @@ Node configs live under `config/nodes/` and are generated automatically from `co
 - This is distinct from `MAX_TRAINING_ROUNDS`, which caps the total number of federated rounds.
 - Set `number_of_nodes` in the same file once so Docker launches know how many node configs/services to generate when you omit `--nodes`.
 
+### Hierarchy Settings (State/Nation)
+- `config/system-config.json` contains `hierarchy_levels`, one object per scope (`state`, `nation`, etc.). Each entry controls:
+  - `scope_name` / `scope_id`: identifier used in logs and blockchain queries
+  - `interval_seconds`: timer cadence for triggering rounds
+  - `wait_seconds`: how long nodes poll for the resulting model before resuming training
+  - `max_aggregators`, `fanout_count`: how many candidates rotate through commits and how many fan-out reporters each lower scope provides
+  - Merge policy knobs (`apply_policy`, `apply_alpha`) that govern how nodes blend high-level models (e.g., replace vs interpolate)
+- Edit these values to speed up/slow down state/nation rounds or change how aggressively nodes mix upstream models. Restart nodes to apply changes.
+
+### Nodes Map (`config/nodes-map.json`)
+- Mirrors the hierarchy structure and enumerates which trainers belong to each scope.
+- Update it when adding/removing nodes or introducing a new hierarchy level. The runtime loads this file at startup to:
+  - Derive aggregator candidate rosters and logged “STATE/NATION aggregator candidates …” lines
+  - Determine which clusters feed each state and which states feed each nation
+  - Drive fan-out routing so bridge services know where to send ECMs
+- Keep the scope IDs (`state_id`, `nation_id`, etc.) aligned with `hierarchy_levels` to avoid mismatches.
+
 ### Global Convergence Settings
 - Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to change `enabled`, `tol_abs`, `tol_rel`, or `patience` without touching every node file. The resolved file is gitignored so you can keep environment-specific thresholds private.
 - Nodes automatically consume this file; override the location with `SYSTEM_CONFIG_PATH=/path/to/system-config.json` when launching services if you need a custom mount.

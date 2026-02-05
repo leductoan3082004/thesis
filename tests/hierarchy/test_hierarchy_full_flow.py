@@ -1,9 +1,10 @@
 import pytest
 import numpy as np
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 from secure_aggregation.communication.hierarchy_mixin import HierarchyMixin, ScopeRoundHandler
+from secure_aggregation.communication.node_service import NodeService
 from secure_aggregation.node.ecm_buffer import ECM, ECMBuffer
 from secure_aggregation.state import HierarchyLevelConfig
 from secure_aggregation.state.aggregation import StateAggregator
@@ -160,9 +161,177 @@ def test_state_hierarchy_full_flow() -> None:
     assert result == ("state", 1, 0)
     assert 1 in runtime.committed_rounds, "Aggregator should mark the round committed after publishing."
 
-    # Step 3: Pull the latest state model via the blockchain endpoint and apply it locally.
-    node._apply_scope_model_from_anchor("state", node.scope_config, is_local_scope=True)
-    assert node._applied_tensors, "Applying the anchored model should record the tensor payload."
-    applied = node._applied_tensors[-1]
+    # Step 3: Aggregator should apply the merged state model immediately after committing.
+    assert node._applied_tensors, "Aggregator should apply its own merged state model without refetching."
+    applied = node._applied_tensors[0]
     expected = np.vstack([cluster_a, cluster_b]).mean(axis=0)
     np.testing.assert_allclose(applied, expected, err_msg="State model should equal the average of cluster contributions.")
+    ready_set = getattr(node, "_ready_scope_fetches", None) or set()
+    assert "state" not in ready_set, "Aggregator should not schedule an extra fetch after committing."
+    queue = getattr(node, "_pending_scope_waits", None) or deque()
+    assert not queue, "Aggregator wait queue should be cleared after committing the state round."
+
+
+def test_state_hierarchy_follower_waits_for_anchor(caplog) -> None:
+    """Ensure non-leader nodes skip aggregation work and explicitly wait for anchors."""
+
+    node = TestHierarchyNode()
+    node.node_id = "trainer-node-002"
+    runtime = node._ensure_scope_runtime(node.scope_name, node.scope_config)
+    runtime.scope_id = node.scope_config.scope_id
+    runtime.candidates = ["trainer-node-001", "trainer-node-002"]
+    runtime.is_candidate = True
+    runtime.ecm_buffer = ECMBuffer(freshness_window=60.0)
+    runtime.aggregator = StateAggregator(node.scope_config, node.ipfs, node.blockchain)
+    runtime.config.wait_seconds = 0.05
+
+    caplog.set_level("INFO", logger="hierarchy")
+    result = node._execute_scope_round(1, 0, runtime)
+    assert result, "Follower nodes should proceed after waiting for the anchor."
+
+    messages = [record.getMessage() for record in caplog.records]
+    wait_logs = [msg for msg in messages if "aggregator=trainer-node-001" in msg and "waiting up to" in msg.lower()]
+    assert wait_logs, "Follower should announce that it is waiting for the elected aggregator."
+    assert all("collected" not in msg for msg in messages), "Follower must not log aggregation progress."
+
+
+def test_drain_scope_rounds_executes_one_scope_per_call() -> None:
+    """Ensure draining scope rounds processes scopes sequentially (state before nation)."""
+
+    class DummyNode:
+        def __init__(self) -> None:
+            self.scope_name = "state"
+            self._scope_execution_order = ["state", "nation"]
+            self.state_results = [("state", 1, 0), None]
+            self.nation_results = [("nation", 1, 0), None]
+            self.completed: list[tuple[str, int, int]] = []
+
+        def _run_next_scope_round(self, scope_name=None):
+            if scope_name is None:
+                return self.state_results.pop(0)
+            return self.nation_results.pop(0)
+
+        def _handle_completed_scope_round(self, scope_name, scope_round, source_round):
+            self.completed.append((scope_name, scope_round, source_round))
+
+    dummy = DummyNode()
+    assert NodeService._drain_scope_rounds(dummy) is True, "State round should execute first."
+    assert not dummy.completed, "State rounds do not invoke higher-scope completion handler."
+
+    assert NodeService._drain_scope_rounds(dummy) is True, "Nation round should run on the next tick."
+    assert dummy.completed == [("nation", 1, 0)], "Nation completion should be recorded once."
+
+    assert NodeService._drain_scope_rounds(dummy) is False, "No additional scope rounds should be pending."
+
+
+def test_state_model_applied_before_nation_round() -> None:
+    """Verify that applying ready state models happens before the next nation round executes."""
+
+    class ScopeFlowHarness:
+        def __init__(self) -> None:
+            self.scope_name = "state"
+            self._scope_execution_order = ["state", "nation"]
+            self.state_queue = [("state", 1, 0), None]
+            self.nation_queue = [("nation", 1, 0), None]
+            self.ready_fetch = False
+            self.state_applied = False
+            self.nation_started = False
+
+        def _drain_scope_rounds(self):
+            return NodeService._drain_scope_rounds(self)
+
+        def _run_next_scope_round(self, scope_name=None):
+            if scope_name is None:
+                return self.state_queue.pop(0)
+            assert scope_name == "nation"
+            if not self.state_applied:
+                raise AssertionError("Nation round started before state model was applied.")
+            self.nation_started = True
+            return self.nation_queue.pop(0)
+
+        def _handle_completed_scope_round(self, scope_name, scope_round, source_round):
+            """No-op in harness."""
+            return None
+
+        def _pause_for_scope_waits(self):
+            if not self.state_applied and not self.ready_fetch:
+                self.ready_fetch = True
+                return True
+            return False
+
+        def _apply_ready_scope_models(self):
+            if self.ready_fetch:
+                self.ready_fetch = False
+                self.state_applied = True
+                return True
+            return False
+
+    harness = ScopeFlowHarness()
+    assert NodeService._process_high_level_rounds(harness) is True, "State round + wait/apply should report work done."
+    assert harness.state_applied, "State model should be applied after the wait window."
+
+    assert NodeService._process_high_level_rounds(harness) is True, "Nation round should execute on the second invocation."
+    assert harness.nation_started, "Nation round must run after the state model was applied."
+
+
+def test_wait_for_scope_anchor_uses_latest_endpoint() -> None:
+    """Ensure anchor wait loop polls the latest endpoint rather than round-specific queries."""
+
+    node = TestHierarchyNode()
+    runtime = node._ensure_scope_runtime(node.scope_name, node.scope_config)
+    runtime.scope_id = node.scope_config.scope_id
+
+    latest_calls = {"count": 0}
+
+    def fake_latest(scope_name: str, scope_id: str):
+        latest_calls["count"] += 1
+        return None
+
+    def fail_get_anchor(*args, **kwargs):
+        raise AssertionError("Round-specific get_anchor should not be invoked for scope waits.")
+
+    node.blockchain.get_latest_scope_model = fake_latest  # type: ignore[method-assign]
+    node.blockchain.get_anchor = fail_get_anchor  # type: ignore[method-assign]
+
+    result = node._wait_for_scope_anchor(1, timeout=0.01, runtime=runtime)
+    assert result is None
+    assert latest_calls["count"] >= 1, "Latest endpoint should be queried at least once during the wait loop."
+
+
+def test_anchor_wait_expedites_ready_fetch() -> None:
+    """Anchors observed during wait windows should unlock immediate fetch cycles."""
+
+    node = TestHierarchyNode()
+    runtime = node._ensure_scope_runtime(node.scope_name, node.scope_config)
+    runtime.scope_id = node.scope_config.scope_id
+    node._queue_scope_wait(node.scope_name, node.scope_config)
+    cid = "cid-new"
+    hash_val = "hash-new"
+    node.blockchain.anchor(runtime.scope_id, 1, cid, hash_val, scope="state")
+
+    result = node._wait_for_scope_anchor(1, timeout=0.1, runtime=runtime, expedite_fetch=True)
+    assert result == (cid, hash_val)
+
+    ready = getattr(node, "_ready_scope_fetches", None) or set()
+    assert "state" in ready, "State scope should be ready to fetch immediately after observing anchor."
+    queue = getattr(node, "_pending_scope_waits", None)
+    if queue:
+        assert all(entry[0] != "state" for entry in queue), "Pending wait window should be removed after early trigger."
+
+
+def test_pending_anchor_skips_latest_query() -> None:
+    """Applying a cached anchor should not re-query the blockchain."""
+
+    node = TestHierarchyNode()
+    runtime = node._ensure_scope_runtime(node.scope_name, node.scope_config)
+    runtime.scope_id = node.scope_config.scope_id
+    tensor = np.array([1.0, 2.0], dtype=np.float32)
+    cid = node.ipfs.add(tensor)
+    runtime.pending_anchor = ModelAnchor(cluster_id=runtime.scope_id, round_num=1, cid=cid, hash=compute_model_hash(tensor))
+
+    def fail_latest(*args, **kwargs):
+        raise AssertionError("Blockchain should not be queried when pending anchor is available")
+
+    node.blockchain.get_latest_scope_model = fail_latest  # type: ignore[method-assign]
+    node._apply_scope_model_from_anchor("state", node.scope_config, is_local_scope=True)
+    assert node._applied_tensors, "Cached anchor should allow immediate model application."

@@ -103,6 +103,23 @@ The system automatically:
 6. Runs federated training with secure aggregation
 7. Logs accuracy improvements after each round
 
+## Hierarchy Warm-Start & Scope Fetch Flow
+
+- **Startup warm-start:** when each node boots it immediately queries the blockchain gateway for every scope it belongs to (cluster/state/nation). If the gateway returns 404 you will now see `~ BLOCKCHAIN ~ No STATE model available yet for state=...`, which simply means there is nothing to merge yet.
+- **Aggregator candidates:** the node logs `STATE/NATION aggregator candidates for <scope_id>` plus their bridge addresses so you can confirm the roster that high-level rounds will rotate through.
+- **Wait windows:** after a state/nation round commits, all participants wait for the configured `wait_seconds` (see `config/system-config.json`) unless a fresh anchor is observed sooner. The committing aggregator now bypasses the rest of the wait window by reusing the CID/hash it just published, but it still refetches the model via the gateway/IPFS path so integrity checks and merge policies remain uniform.
+- **Follower polling:** during the wait window followers poll the latest-model endpoint every 5 seconds. If the CID matches what’s already been applied you will see `No new STATE model available...`; polling continues until a new CID shows up or the window expires.
+
+## Tutorial: Inspecting Hierarchy Activity
+
+1. **Start the stack:** `make start` (or your preferred combination of `make start-*` targets).
+2. **Watch a node:** `make logs-node NODE=0` to tail trainer-node-001.
+3. **Confirm roster discovery:** look for `STATE aggregator candidates for state_alpha: ...` and the companion address log. These come from `NodeService` once the participant map and topology metadata are loaded.
+4. **Observe a high-level round:** when the timer fires you will see `STATE Round N` banners. The assigned aggregator logs `STATE round N committed by trainer-node-XXX ...` followed by `STATE aggregator candidate addresses: ...`.
+5. **Verify warm-start fetches:** after the commit, the node should either log `Applied STATE model round N ...` (new CID) or `No new STATE model available...` (already merged). To shorten or lengthen the delay before these fetches, edit the `wait_seconds` field for the relevant `hierarchy_levels` entry in `config/system-config.json` and restart the nodes.
+
+Following the above steps lets you validate that hierarchy warm-starting, aggregator rotation, and propagation delays behave as expected without diving into the code.
+
 ## Expected Output
 
 ```
@@ -213,6 +230,36 @@ Set the target fleet size via `number_of_nodes` in `config/system-config.json`. 
 Copy `config/system-config.sample.json` to `config/system-config.json` to configure:
 - Convergence detection: `enabled`, `warmup_rounds`, `tol_abs`, `tol_rel`, `patience`
 - Fleet size: `number_of_nodes` for Docker launches
+- Hierarchy behavior: tweak the `hierarchy_levels` array to change scope identifiers, timer intervals, wait windows, and merge policies (`apply_policy`, `apply_alpha`, `fanout_count`, `max_aggregators`). Edit these values to speed up/slow down state or nation rounds or to adjust the interpolation rules applied when nodes pull a high-level model.
+
+### Hierarchy Rosters (`config/nodes-map.json`)
+
+The nodes map mirrors your hierarchy levels and defines which trainers participate in each scope:
+
+```json
+{
+  "nation": [
+    {
+      "nation_id": "nation_0",
+      "states": [
+        {
+          "state_id": "state_alpha",
+          "clusters": [
+            {
+              "cluster_id": "cluster_0",
+              "nodes": ["trainer-node-001", "trainer-node-002"]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+- Update this file when adding/removing nodes or introducing new scopes (e.g., `region`).  
+- The runtime ingests it at startup to build aggregator candidate pools, determine fan-out responsibilities, and map each node to its state/nation IDs.  
+- Keep the keys (`nation_id`, `state_id`, `cluster_id`) in sync with the `scope_id` values declared in `config/system-config.json`.
 
 ### Dataset Configuration
 

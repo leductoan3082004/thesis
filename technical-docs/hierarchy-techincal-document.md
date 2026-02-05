@@ -60,13 +60,13 @@ Every scope reuses the ring topology for peer discovery; extra edges are opened 
 ### 5.1 Waiting Logic
 - Nodes are never globally blocked by a running high-level round.  
 - When a scheduler announces that scope `S` started, every node checks whether it belongs to `S`.  
-- If yes, it waits for `scope.wait_seconds`. During this window the node pauses local training to give aggregators time to publish models.  
-- After the timer elapses, the node proceeds regardless of aggregator status.
+- If yes, it enters the `scope.wait_seconds` window. During this window the node pauses local training but **polls** the blockchain gateway every 5 seconds.  
+- As soon as a fresh anchor is observed (CID differs from the last merged model), the wait window is cleared early and the node proceeds to fetch/merge. If no anchor arrives, the node still resumes once the configured wait time elapses.
 
 ### 5.2 Model Fetch Endpoint
-- Once the wait period ends, nodes call the blockchain/IPFS endpoint for scope `S` with retries as configured.  
-- Endpoints are level-aware: the node must specify `(scope_id, desired_level)` so it receives the latest CID for that scope.  
-- If the endpoint returns `404 / empty`, the node resumes cluster rounds. There is no further blocking; nodes will check again the next time the waiting logic triggers.
+- Each poll issues a request to the level-aware endpoint (cluster/state/nation). The node specifies `(scope_id, scope_name)` so it receives the latest CID for that scope.  
+- If the endpoint returns `404 / empty` or a CID that matches `last_merged_cid`, the node keeps polling until either a new CID appears or the wait window expires.  
+- This repeated polling applies to both followers and the node that just committed the anchor; the committing aggregator immediately enqueues its own CID/hash so it also reuses the common verification/merge path instead of short-circuiting.
 
 ### 5.3 Direct Pull and Merge
 - High-level models are no longer pushed downward tier by tier. Nodes directly pull the scope that was executing.  

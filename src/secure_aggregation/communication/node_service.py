@@ -240,13 +240,12 @@ class NodeService(HierarchyMixin):
         scope_interval = self._scope_interval_seconds(self.scope_config)
         higher_interval = self._scope_interval_seconds(self.higher_scope_config)
         logger.info(
-            "%s aggregation config: enabled=%s, rounds_per_scope=%s, interval_seconds=%.1f, scope_id=%s, approach=%s",
+            "%s aggregation config: enabled=%s, rounds_per_scope=%s, interval_seconds=%.1f, scope_id=%s",
             self._scope_label_upper(),
             self.scope_config.enabled,
             self.scope_config.rounds_per_scope,
             scope_interval,
             self.scope_config.scope_id,
-            self.scope_config.approach.value if hasattr(self.scope_config.approach, "value") else self.scope_config.approach,
         )
         logger.info(
             "%s scheduling config: enabled=%s, rounds_per_scope=%s, interval_seconds=%.1f, apply_policy=%s, apply_alpha=%.3f",
@@ -889,25 +888,18 @@ class NodeService(HierarchyMixin):
         return work_done
 
     def _drain_scope_rounds(self) -> bool:
-        """Execute pending scope rounds (state, nation, etc.) before proceeding."""
-        ran_any = False
+        """Execute at most one pending scope round (state, nation, etc.) per invocation."""
         execution_order = getattr(self, "_scope_execution_order", [self.scope_name])
-        while True:
-            executed = False
-            for scope in execution_order:
-                handler_name = None if scope == self.scope_name else scope
-                result = self._run_next_scope_round(handler_name)
-                if result is None:
-                    continue
-                executed = True
-                ran_any = True
-                scope_name, scope_round, source_round = result
-                if scope_name != self.scope_name:
-                    self._handle_completed_scope_round(scope_name, scope_round, source_round)
-                break
-            if not executed:
-                break
-        return ran_any
+        for scope in execution_order:
+            handler_name = None if scope == self.scope_name else scope
+            result = self._run_next_scope_round(handler_name)
+            if result is None:
+                continue
+            scope_name, scope_round, source_round = result
+            if scope_name != self.scope_name:
+                self._handle_completed_scope_round(scope_name, scope_round, source_round)
+            return True
+        return False
 
     def _build_scope_handlers(self) -> None:
         """Register scope round handlers for every configured hierarchy level."""
@@ -1216,8 +1208,10 @@ class NodeService(HierarchyMixin):
         )
         return False
 
-    def _refresh_central_metadata(self) -> None:
+    def _refresh_central_metadata(self, *, skip_if_cached: bool = False) -> None:
         """Fetch central metadata from blockchain and update coordinator."""
+        if skip_if_cached and self.central_metadata is not None:
+            return
         if not self.blockchain:
             return
         metadata = fetch_central_metadata(self.blockchain)
@@ -1242,14 +1236,16 @@ class NodeService(HierarchyMixin):
         self.central_neighbor_addresses = {}
         if not self.central_metadata or not self.participant_map:
             return
+        scope_label = self._scope_label_upper()
         candidate_nodes = self._preferred_scope_candidates()
         for node_id in candidate_nodes:
             base_address = self.participant_map.get(node_id)
             attempts = 0
             while not base_address and attempts < 5:
                 logger.info(
-                    "Central neighbor %s not registered in map yet; refreshing participant map",
-                    node_id,
+                    "%s aggregator candidate %s not registered in map yet; refreshing participant map",
+                    scope_label,
+                    node_id or "unknown",
                 )
                 time.sleep(1)
                 self.register_with_ttp()
@@ -1257,8 +1253,9 @@ class NodeService(HierarchyMixin):
                 attempts += 1
             if not base_address:
                 logger.warning(
-                    "Could not resolve address for central node %s; excluding from state routing",
-                    node_id,
+                    "Could not resolve address for %s aggregator candidate %s; excluding from state routing",
+                    scope_label,
+                    node_id or "unknown",
                 )
                 continue
             try:
@@ -1266,8 +1263,9 @@ class NodeService(HierarchyMixin):
                 bridge_port = int(port_str) + 2000
             except ValueError:
                 logger.warning(
-                    "Invalid address format for central node %s: %s",
-                    node_id,
+                    "Invalid address format for %s aggregator candidate %s: %s",
+                    scope_label,
+                    node_id or "unknown",
                     base_address,
                 )
                 continue
@@ -1275,11 +1273,32 @@ class NodeService(HierarchyMixin):
 
         if self.central_neighbor_addresses and not self._logged_central_addresses:
             details = ", ".join(f"{node}@{addr}" for node, addr in self.central_neighbor_addresses.items())
-            logger.info(f"Central neighbor addresses: {details}")
+            logger.info(f"{scope_label} aggregator candidate addresses: {details}")
             self._logged_central_addresses = True
 
         if self.scope_config.enabled:
             self._configure_scope_layer()
+
+    def _log_scope_aggregator_candidates(self) -> None:
+        """Log all configured hierarchy-level aggregator candidate rosters."""
+        scope_configs = getattr(self, "scope_configs", None) or {}
+        if not scope_configs:
+            return
+        ordered = sorted(scope_configs.items(), key=lambda item: (item[1].scope_index, item[0]))
+        for scope_key, config in ordered:
+            if not getattr(config, "enabled", True):
+                continue
+            scope_name = getattr(config, "scope_name", scope_key) or scope_key
+            scope_label = scope_name.upper()
+            scope_id = self._node_scope_identifier_for(scope_name, config) or getattr(config, "scope_id", None)
+            roster = self._scope_member_roster(scope_name, scope_id) if scope_id else []
+            candidate_text = ", ".join(roster) if roster else "(dynamic)"
+            logger.info(
+                "%s aggregator candidates for %s: %s",
+                scope_label,
+                scope_id or "(dynamic)",
+                candidate_text,
+            )
 
     def gossip_ecm(self, cid: str, model_hash: str, round_num: int) -> None:
         """Gossip ECM to neighbor cluster bridge nodes."""
@@ -1739,7 +1758,7 @@ class NodeService(HierarchyMixin):
                 "Cluster convergence runtime disabled; training will run fixed %d rounds",
                 max_rounds,
             )
-        self._refresh_central_metadata()
+        self._refresh_central_metadata(skip_if_cached=True)
 
         # Initialize Prometheus metrics and start HTTP server for scraping
         self.prom_metrics = PrometheusMetrics.get_instance(self.node_id, self.clique_id)
@@ -2216,14 +2235,7 @@ class NodeService(HierarchyMixin):
                 self.register_with_ttp()
             logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
 
-        if self.scope_config.enabled:
-            roster = self._state_roster_for() or ["(dynamic)"]
-            logger.info(
-                "%s central candidates for %s: %s",
-                self._scope_label_upper(),
-                getattr(self, "state_id", "unknown_state"),
-                ", ".join(roster),
-            )
+        self._log_scope_aggregator_candidates()
 
         if inter_edges:
             bridge_ready = self._init_bridge_with_retries(inter_edges, fatal=False)
