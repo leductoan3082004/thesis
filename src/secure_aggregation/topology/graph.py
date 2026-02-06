@@ -697,3 +697,59 @@ def generate_preliminary_topology(num_nodes: int, clique_size: int) -> Dict:
         "inter_edges": [],
         "edge_counts": {},
     }
+
+
+def compute_node_degrees(cliques: Sequence[Iterable[str]], inter_edges: Sequence[Tuple[str, str]]) -> Dict[str, int]:
+    """
+    Compute the degree of each node in the topology.
+
+    Args:
+        cliques: List of cliques, each containing node IDs.
+        inter_edges: List of inter-clique edges.
+
+    Returns:
+        Dictionary mapping node_id to its degree (number of connections).
+    """
+    degrees: Dict[str, int] = {}
+
+    for clique in cliques:
+        clique_nodes = list(clique)
+        clique_size = len(clique_nodes)
+        for node in clique_nodes:
+            degrees[node] = clique_size - 1
+
+    for node_a, node_b in inter_edges:
+        degrees[node_a] = degrees.get(node_a, 0) + 1
+        degrees[node_b] = degrees.get(node_b, 0) + 1
+
+    return degrees
+
+
+def compute_max_degree(cliques: Sequence[Iterable[str]], inter_edges: Sequence[Tuple[str, str]]) -> int:
+    """
+    Compute the maximum node degree in the topology (d_max).
+
+    Args:
+        cliques: List of cliques, each containing node IDs.
+        inter_edges: List of inter-clique edges.
+
+    Returns:
+        Maximum degree across all nodes.
+    """
+    degrees = compute_node_degrees(cliques, inter_edges)
+    return max(degrees.values()) if degrees else 0
+
+
+def compute_average_degree(cliques: Sequence[Iterable[str]], inter_edges: Sequence[Tuple[str, str]]) -> float:
+    """
+    Compute the average node degree across the topology.
+
+    Args:
+        cliques: List of cliques, each containing node IDs.
+        inter_edges: List of inter-clique edges.
+
+    Returns:
+        Average degree across all nodes.
+    """
+    degrees = compute_node_degrees(cliques, inter_edges)
+    return sum(degrees.values()) / len(degrees) if degrees else 0.0

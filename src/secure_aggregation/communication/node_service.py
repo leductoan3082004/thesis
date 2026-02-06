@@ -40,7 +40,13 @@ from secure_aggregation.storage.model_store import (
     MockIPFS,
     verify_model_hash,
 )
-from secure_aggregation.topology import elect_clique_aggregator, get_inter_clique_neighbors, is_bridge_node
+from secure_aggregation.topology import (
+    compute_average_degree,
+    compute_max_degree,
+    elect_clique_aggregator,
+    get_inter_clique_neighbors,
+    is_bridge_node,
+)
 from secure_aggregation.utils import (
     configure_logging,
     get_logger,
@@ -1645,6 +1651,9 @@ class NodeService:
             self.prom_metrics.add_messages_sent(comm_stats["messages_sent"])
             self.prom_metrics.add_messages_received(comm_stats["messages_received"])
 
+            total_bytes = comm_stats["bytes_sent"] + comm_stats["bytes_received"]
+            self.prom_metrics.set_total_bytes_per_round(total_bytes)
+
             logger.info(f"Training Round {round_idx + 1} complete. Waiting before next round...")
             time.sleep(5)
             self.current_round += 1
@@ -2081,6 +2090,17 @@ class NodeService:
                 topology_data = json.load(f)
             inter_edges = [(e[0], e[1]) for e in topology_data.get("inter_edges", [])]
             logger.info(f"Loaded {len(inter_edges)} inter-edges from {topology_file}")
+
+            cliques = topology_data.get("cliques", [])
+            if cliques and inter_edges is not None:
+                max_degree = compute_max_degree(cliques, inter_edges)
+                avg_degree = compute_average_degree(cliques, inter_edges)
+                self.metrics.set_topology_max_degree(max_degree)
+                self.metrics.set_topology_average_degree(avg_degree)
+                logger.info(f"Topology metrics: max_degree={max_degree}, avg_degree={avg_degree:.2f}")
+
+            topology_type = topology_data.get("topology_type", "d_cliques")
+            self.metrics.set_topology_type(topology_type)
         else:
             inter_edges_config = self.inter_cluster_config.get("inter_edges", [])
             inter_edges = [(e[0], e[1]) for e in inter_edges_config]
