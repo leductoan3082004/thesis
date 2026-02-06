@@ -316,7 +316,43 @@ def test_anchor_wait_expedites_ready_fetch() -> None:
     assert "state" in ready, "State scope should be ready to fetch immediately after observing anchor."
     queue = getattr(node, "_pending_scope_waits", None)
     if queue:
-        assert all(entry[0] != "state" for entry in queue), "Pending wait window should be removed after early trigger."
+        assert any(entry[0] == "state" for entry in queue), "Wait window should stay queued until the state model is applied."
+
+
+def test_scope_waits_only_progress_when_lower_scope_applied(monkeypatch) -> None:
+    """Ensure nodes do not begin higher-scope waits before applying lower-scope models."""
+
+    node = TestHierarchyNode()
+    runtime_state = node._ensure_scope_runtime(node.scope_name, node.scope_config)
+    runtime_state.scope_id = node.scope_config.scope_id
+
+    tensor = np.ones((2, 2), dtype=np.float32)
+    cid = node.ipfs.add(tensor)
+    hash_val = compute_model_hash(tensor)
+    node.blockchain.anchor(runtime_state.scope_id, 1, cid, hash_val, scope="state")
+
+    node._queue_scope_wait("state", node.scope_config)
+    node._queue_scope_wait("nation", node.higher_scope_config)
+
+    anchor = node.blockchain.get_latest_scope_model("state", runtime_state.scope_id)
+    node._mark_scope_fetch_ready(runtime_state, anchor.cid if anchor else None, anchor)
+
+    ready = getattr(node, "_ready_scope_fetches", None)
+    assert ready is not None and "state" in ready
+
+    monkeypatch.setattr("secure_aggregation.communication.hierarchy_mixin.time.sleep", lambda seconds: None)
+
+    assert node._pause_for_scope_waits() is False, "Wait processing should pause until ready scopes are applied."
+    queue = getattr(node, "_pending_scope_waits", None)
+    assert queue and any(entry[0] == "state" for entry in queue), "State wait window must remain queued before apply."
+
+    assert node._apply_ready_scope_models() is True
+    queue_after_state = getattr(node, "_pending_scope_waits", None)
+    assert queue_after_state and all(entry[0] != "state" for entry in queue_after_state)
+
+    assert node._pause_for_scope_waits() is True, "Next scope wait should run only after state application."
+    ready_after_pause = getattr(node, "_ready_scope_fetches", None)
+    assert ready_after_pause is not None and "nation" in ready_after_pause
 
 
 def test_pending_anchor_skips_latest_query() -> None:

@@ -694,10 +694,6 @@ class HierarchyMixin:
             self._ready_scope_fetches = ready
         if scope_key in ready:
             return
-        queue = getattr(self, "_pending_scope_waits", None)
-        if queue:
-            queue = deque(entry for entry in queue if entry[0] != scope_key)
-            self._pending_scope_waits = queue
         ready.add(scope_key)
         runtime.pending_anchor = anchor
         if anchor_cid:
@@ -730,6 +726,8 @@ class HierarchyMixin:
         if ready is None:
             ready = set()
             self._ready_scope_fetches = ready
+        if ready:
+            return False
         waited = False
         while queue:
             scope_key, wait_seconds, scheduled_at = queue.popleft()
@@ -750,6 +748,8 @@ class HierarchyMixin:
                     elapsed - wait_seconds,
                 )
             ready.add(scope_key)
+            if ready:
+                break
         return waited
 
     def _apply_ready_scope_models(self) -> bool:
@@ -1138,24 +1138,14 @@ class HierarchyMixin:
                 anchor.cid[:12],
             )
             return
-        if is_local_scope:
-            self._apply_scope_policy_tensor(upstream_model)
-        else:
-            self._apply_scope_policy_tensor_for(config, upstream_model, scope_label.upper())
-        runtime.last_model_cid = anchor.cid
-        runtime.last_model_hash = anchor.hash
-        runtime.last_model_data_id = anchor.data_id
-        if is_local_scope:
-            self._last_model_cid = anchor.cid
-            self._last_model_hash = anchor.hash
-            self._last_model_data_id = anchor.data_id
-        scope_progress = getattr(self, "_scope_last_applied_rounds", None)
-        if scope_progress is None:
-            scope_progress = {}
-            setattr(self, "_scope_last_applied_rounds", scope_progress)
-        if anchor.round_num is not None:
-            scope_progress[scope_key] = anchor.round_num
-        last_cids[scope_key] = anchor.cid
+        self._record_scope_model_application(
+            runtime,
+            anchor.round_num,
+            anchor.cid,
+            anchor.hash,
+            anchor.data_id,
+            upstream_model,
+        )
         hierarchy_logger.info(
             "Applied %s model round %s (cid=%s...) from latest-scope endpoint",
             scope_label.upper(),

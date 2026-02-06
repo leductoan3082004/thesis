@@ -851,7 +851,7 @@ class NodeService(HierarchyMixin):
         return aggregator_id
 
     def _handle_completed_scope_round(self, scope_name: str, scope_round: int, source_round: int) -> None:
-        logger.info(
+        logger.debug(
             "Completed %s round %d (scheduled after %s round %d)",
             scope_name.upper(),
             scope_round,
@@ -862,15 +862,27 @@ class NodeService(HierarchyMixin):
             config = self._get_scope_config_entry(scope_name)
             wait_seconds = float(getattr(config, "wait_seconds", 0.0) or 0.0) if config else 0.0
             if wait_seconds > 0:
-                logger.info(
-                    "%s round %d finished; waiting %.0fs before pulling latest %s model",
-                    scope_name.upper(),
-                    scope_round,
-                    wait_seconds,
-                    scope_name.upper(),
-                )
+                scope_key = str(scope_name or "").lower()
+                queue = getattr(self, "_pending_scope_waits", None)
+                ready = getattr(self, "_ready_scope_fetches", None)
+                scope_ready = bool(ready and scope_key in ready)
+                has_pending_wait = bool(queue and any(entry[0] == scope_key for entry in queue))
+                if has_pending_wait and not scope_ready:
+                    logger.debug(
+                        "%s round %d finished; waiting %.0fs before pulling latest %s model",
+                        scope_name.upper(),
+                        scope_round,
+                        wait_seconds,
+                        scope_name.upper(),
+                    )
+                else:
+                    logger.debug(
+                        "%s round %d finished; wait window already satisfied; pulling latest model without delay",
+                        scope_name.upper(),
+                        scope_round,
+                    )
             else:
-                logger.info(
+                logger.debug(
                     "%s round %d finished; no wait window configured before pulling latest model",
                     scope_name.upper(),
                     scope_round,
