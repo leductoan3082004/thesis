@@ -3,7 +3,7 @@
   "ttp_address": "ttp:50051",
   "port": 50052,
   "dataset": {
-    "name": "mnist",
+    "name": "cifar10",
     "num_clients": 12,
     "alpha": 0.5,
     "seed": 42

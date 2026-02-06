@@ -5,25 +5,44 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Optional
-
-from torchvision import datasets, transforms
+from typing import Mapping, Optional
 
 from secure_aggregation.communication.ttp_service import TopologyConfig, serve
-from secure_aggregation.data import dirichlet_partition
+from secure_aggregation.data import dirichlet_partition, load_torchvision_labels
 from secure_aggregation.topology import build_full_topology, compute_node_labels_from_partition
 from secure_aggregation.utils import configure_logging, get_logger
 
 logger = get_logger("ttp_startup")
 
 
-def load_mnist_labels(data_dir: str = "/app/data") -> dict[int, int]:
-    """Load MNIST dataset labels."""
-    logger.info(f"Loading MNIST labels from {data_dir}")
-    tform = transforms.Compose([transforms.ToTensor()])
-    train_ds = datasets.MNIST(root=data_dir, train=True, download=True, transform=tform)
-    labels = {i: int(train_ds[i][1]) for i in range(len(train_ds))}
-    logger.info(f"Loaded {len(labels)} MNIST labels")
+def detect_dataset_name_from_nodes(num_clients: int) -> Optional[str]:
+    """Best-effort detection of dataset name from node configs."""
+    nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+    if not nodes_dir.exists():
+        return None
+    for idx in range(num_clients):
+        node_file = nodes_dir / f"node_{idx}.json"
+        if not node_file.exists():
+            continue
+        try:
+            data = json.loads(node_file.read_text())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to parse %s for dataset detection: %s", node_file, exc)
+            continue
+        dataset_cfg = data.get("dataset")
+        if isinstance(dataset_cfg, Mapping):
+            name = dataset_cfg.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return None
+
+
+def load_dataset_labels(dataset_name: str, data_dir: str = "/app/data") -> dict[int, int]:
+    """Load torchvision dataset labels for topology generation."""
+    normalized = dataset_name.strip().lower()
+    logger.info("Loading %s labels from %s", normalized, data_dir)
+    labels = load_torchvision_labels(normalized, data_dir)
+    logger.info("Loaded %d labels for %s", len(labels), normalized)
     return labels
 
 
@@ -172,6 +191,7 @@ def main():
     parser.add_argument("--edge-mode", type=str, default="ring_extra", help="Inter-clique edge mode")
     parser.add_argument("--iterations", type=int, default=1000, help="Topology iterations")
     parser.add_argument("--data-dir", type=str, default="/app/data", help="Data directory")
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset name (default: detect or mnist)")
     parser.add_argument("--config", type=str, help="JSON config file (overrides CLI args)")
     parser.add_argument("--topology-output", type=str, default="/app/config/topology.json",
                         help="Path to write topology config for nodes")
@@ -204,8 +224,15 @@ def main():
 
     logger.info(f"Starting TTP with topology: num_clients={num_clients}, clique_size={clique_size}, alpha={alpha}")
 
-    # Load MNIST labels
-    labels = load_mnist_labels(args.data_dir)
+    dataset_name = args.dataset or os.environ.get("DATASET_NAME")
+    if not dataset_name:
+        detected = detect_dataset_name_from_nodes(num_clients)
+        if detected:
+            logger.info("Detected dataset '%s' from node configs", detected)
+            dataset_name = detected
+    dataset_name = (dataset_name or "mnist").lower()
+
+    labels = load_dataset_labels(dataset_name, args.data_dir)
 
     # Write topology file for nodes to read inter_edges
     write_topology_file(

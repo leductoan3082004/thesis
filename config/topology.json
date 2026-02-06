@@ -2,56 +2,56 @@
   "num_cliques": 4,
   "cliques": [
     [
-      "trainer-node-001",
       "trainer-node-002",
-      "trainer-node-004"
+      "trainer-node-003",
+      "trainer-node-005"
     ],
     [
-      "trainer-node-003",
-      "trainer-node-005",
+      "trainer-node-001",
+      "trainer-node-004",
       "trainer-node-006"
     ],
     [
       "trainer-node-008",
-      "trainer-node-009",
-      "trainer-node-010"
+      "trainer-node-010",
+      "trainer-node-012"
     ],
     [
       "trainer-node-007",
-      "trainer-node-011",
-      "trainer-node-012"
+      "trainer-node-009",
+      "trainer-node-011"
     ]
   ],
   "inter_edges": [
     [
-      "trainer-node-001",
-      "trainer-node-003"
-    ],
-    [
       "trainer-node-002",
-      "trainer-node-005"
+      "trainer-node-001"
     ],
     [
-      "trainer-node-008",
+      "trainer-node-003",
+      "trainer-node-004"
+    ],
+    [
+      "trainer-node-012",
       "trainer-node-011"
     ],
     [
-      "trainer-node-009",
-      "trainer-node-012"
+      "trainer-node-008",
+      "trainer-node-007"
     ]
   ],
   "edge_counts": {
-    "trainer-node-004": 2,
-    "trainer-node-002": 3,
-    "trainer-node-001": 3,
+    "trainer-node-005": 2,
     "trainer-node-003": 3,
+    "trainer-node-002": 3,
+    "trainer-node-004": 3,
+    "trainer-node-001": 3,
     "trainer-node-006": 2,
-    "trainer-node-005": 3,
-    "trainer-node-009": 3,
     "trainer-node-010": 2,
-    "trainer-node-008": 3,
     "trainer-node-012": 3,
-    "trainer-node-007": 2,
-    "trainer-node-011": 3
+    "trainer-node-008": 3,
+    "trainer-node-011": 3,
+    "trainer-node-007": 3,
+    "trainer-node-009": 2
   }
 }
