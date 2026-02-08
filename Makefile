@@ -47,6 +47,16 @@ override NODES := $(shell $(PYTHON) $(PROJECT_ROOT)/scripts/nodes_map_count.py $
 endif
 
 BUILD_ARG := $(if $(filter 1,$(NO_BUILD)),--no-build,)
+IPFS_MODE ?= docker
+IPFS_PROCESS_CONFIG ?= $(PROJECT_ROOT)/config/ipfs-process.json
+IPFS_PROCESS_CLIENT_HOST ?=
+IPFS_ARGS := --ipfs-mode $(IPFS_MODE)
+ifneq ($(strip $(IPFS_MODE)),docker)
+IPFS_ARGS += --ipfs-process-config $(IPFS_PROCESS_CONFIG)
+ifneq ($(strip $(IPFS_PROCESS_CLIENT_HOST)),)
+IPFS_ARGS += --ipfs-process-client-host $(IPFS_PROCESS_CLIENT_HOST)
+endif
+endif
 
 # Default target
 help:
@@ -145,6 +155,7 @@ generate-configs: setup-deps setup-blockchain
 	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
 		$(STATE_ARG) \
 		--clique-size $(CLIQUE_SIZE) \
+		$(IPFS_ARGS) \
 		$(BUILD_ARG) \
 		--generate-only
 
@@ -163,6 +174,7 @@ start: setup
 	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
 		$(STATE_ARG) \
 		--clique-size $(CLIQUE_SIZE) \
+		$(IPFS_ARGS) \
 		$(BUILD_ARG) \
 		$(if $(filter 1,$(FOREGROUND)),--no-detach,)
 
@@ -177,6 +189,7 @@ start-blockchain: setup
 	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
 		$(STATE_ARG) \
 		--clique-size $(CLIQUE_SIZE) \
+		$(IPFS_ARGS) \
 		$(BUILD_ARG) \
 		--generate-only
 	@cd $(PROJECT_ROOT)/../thesis-blockchain/api-gateway && \

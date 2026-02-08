@@ -92,6 +92,39 @@ python scripts/prepare_data.py
 python scripts/run_docker_with_nodes.py --nodes 6
 ```
 
+### IPFS Deployment Options
+
+By default the Compose file starts IPFS inside Docker (`ipfs-node-1..3`). To run the same cluster as host processes instead:
+
+- Edit `config/ipfs-process.json` if you need different ports or want the daemons to bind only to `localhost`.
+- Launch the processes with `python scripts/run_ipfs_processes.py --config config/ipfs-process.json`. Logs stream to `logs/ipfs/` and Ctrl+C stops every daemon.
+- Run the rest of the stack with `make start IPFS_MODE=process` (or pass `--ipfs-mode process` to `scripts/run_docker_with_nodes.py`). The generator will point node configs at the client URLs derived from the process config instead of the Docker service names.
+
+When running training nodes directly on the host, override the client host with `IPFS_PROCESS_CLIENT_HOST=localhost` (or change the `client_host` fields in the JSON) so configs use `http://127.0.0.1:<api_port>`. Switching back to Docker is as simple as stopping the processes and omitting the override.
+
+#### Quick Test of the Process-Based IPFS Cluster
+
+```bash
+# Terminal A: add a file via ipfs-process-1 (API port 15101)
+echo "hello from process mode" > /tmp/hello.txt
+curl -s -X POST "http://127.0.0.1:15101/api/v0/add" \
+     -F file=@/tmp/hello.txt | tee /tmp/ipfs-add.json
+CID=$(jq -r '.Hash' /tmp/ipfs-add.json)
+echo "Stored CID: $CID"
+
+# (optional) announce it on the routing API so replicas learn about it quickly
+curl -s -X POST "http://127.0.0.1:15101/api/v0/routing/provide?arg=$CID&recursive=true"
+
+# Terminal B: fetch the payload through ipfs-process-2 (port 15102)
+curl -s -X POST "http://127.0.0.1:15102/api/v0/cat?arg=$CID"
+
+# Optional health checks
+curl -s -X POST "http://127.0.0.1:15101/api/v0/swarm/peers?verbose=true" | jq '.Peers | length'
+curl -s -X POST "http://127.0.0.1:15101/api/v0/refs/local" | head
+```
+
+All Kubo HTTP API calls require `-X POST`, even for reads like `cat` or `refs`. You can also point the CLI at one of the host repos (`export IPFS_PATH=data/ipfs/node-1`) and run `ipfs add`, `ipfs cat`, or `ipfs dht provide` directly if you prefer.
+
 ## System Behavior
 
 The system automatically:
