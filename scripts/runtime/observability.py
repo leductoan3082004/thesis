@@ -408,6 +408,11 @@ def start_grafana(
     node_count: int = 0,
     node_ids: Optional[List[str]] = None,
 ) -> ManagedProcess:
+    grafana_dir = runtime_dir / "observability" / "grafana"
+    # Always start from a clean Grafana state to avoid persisting
+    # dashboards/users/sessions between runs.
+    if grafana_dir.exists():
+        shutil.rmtree(grafana_dir)
     grafana_dir = generate_grafana_config(runtime_dir, node_count, node_ids)
     data_dir = grafana_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)

@@ -338,10 +338,72 @@
       "collapsed": true,
       "panels": [
         {
+          "id": 44,
+          "type": "stat",
+          "title": "Total Bytes Sent (All Nodes)",
+          "description": "Cumulative bytes sent by all selected nodes since start",
+          "gridPos": { "x": 0, "y": 42, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "color": { "mode": "palette-classic" }
+            }
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "value",
+            "graphMode": "none"
+          },
+          "targets": [
+            { "expr": "sum(fl_bytes_sent_total{clique_id=~\"$clique\"})", "refId": "A" }
+          ]
+        },
+        {
+          "id": 45,
+          "type": "stat",
+          "title": "Avg Bytes Sent / Node",
+          "description": "Cumulative average bytes sent per selected node",
+          "gridPos": { "x": 8, "y": 42, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "color": { "mode": "palette-classic" }
+            }
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "value",
+            "graphMode": "none"
+          },
+          "targets": [
+            { "expr": "avg(fl_bytes_sent_total{clique_id=~\"$clique\"})", "refId": "A" }
+          ]
+        },
+        {
+          "id": 46,
+          "type": "timeseries",
+          "title": "Node Connections",
+          "description": "Topology degree (number of connections) per node",
+          "gridPos": { "x": 16, "y": 42, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": { "drawStyle": "line", "fillOpacity": 20 },
+              "color": { "mode": "palette-classic" }
+            }
+          },
+          "targets": [
+            { "expr": "fl_node_connections{clique_id=~\"$clique\"}", "refId": "A", "legendFormat": "{{node_id}}" }
+          ]
+        },
+        {
           "id": 41,
           "type": "timeseries",
           "title": "Messages Sent / Received",
-          "gridPos": { "x": 0, "y": 42, "w": 12, "h": 7 },
+          "gridPos": { "x": 0, "y": 46, "w": 12, "h": 7 },
           "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
           "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 }, "color": { "mode": "palette-classic" } } },
           "targets": [
@@ -353,7 +415,7 @@
           "id": 42,
           "type": "timeseries",
           "title": "Bytes Sent / Received",
-          "gridPos": { "x": 12, "y": 42, "w": 12, "h": 7 },
+          "gridPos": { "x": 12, "y": 46, "w": 12, "h": 7 },
           "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
           "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 }, "color": { "mode": "palette-classic" } } },
           "targets": [
@@ -366,7 +428,7 @@
           "type": "timeseries",
           "title": "SAP Phase Duration",
           "description": "Secure Aggregation Protocol phase durations",
-          "gridPos": { "x": 0, "y": 49, "w": 24, "h": 7 },
+          "gridPos": { "x": 0, "y": 53, "w": 24, "h": 7 },
           "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
           "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "bars", "fillOpacity": 30, "stacking": { "mode": "normal" } }, "color": { "mode": "palette-classic" } } },
           "targets": [

@@ -28,7 +28,7 @@ The monitoring tools (Loki, Promtail, Prometheus, Grafana) are installed automat
 
 ### Repository Layout
 
-The blockchain repository must be cloned as a sibling directory:
+The blockchain repository is expected as a sibling directory:
 
 ```
 parent/
@@ -36,9 +36,11 @@ parent/
 └── thesis-blockchain/        # blockchain helper repo
 ```
 
+`make setup` now auto-clones `thesis-blockchain` if missing.
+If you need a different repo URL, set `BLOCKCHAIN_REPO_URL`:
+
 ```bash
-# From the parent directory
-git clone https://github.com/letienthanh364/thesis-blockchain.git
+BLOCKCHAIN_REPO_URL=https://github.com/your-org/thesis-blockchain.git make setup
 ```
 
 ## End-to-End Setup Guide

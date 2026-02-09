@@ -197,6 +197,11 @@ class PrometheusMetrics:
             "Total bytes communicated per round",
             round_labels,
         )
+        self.node_connections = Gauge(
+            "fl_node_connections",
+            "Number of topology connections for this node",
+            labels,
+        )
 
     @classmethod
     def get_instance(cls, node_id: str, clique_id: int) -> "PrometheusMetrics":
@@ -324,3 +329,7 @@ class PrometheusMetrics:
     def set_total_bytes_per_round(self, total_bytes: int) -> None:
         if PROMETHEUS_AVAILABLE:
             self.total_bytes_per_round.labels(**self._round_labels()).set(total_bytes)
+
+    def set_node_connections(self, count: int) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.node_connections.labels(**self._labels()).set(count)

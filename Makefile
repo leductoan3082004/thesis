@@ -21,6 +21,7 @@ SHELL := /bin/bash
 export PATH := $(HOME)/.local/bin:$(PATH)
 PROJECT_ROOT := $(shell pwd)
 BLOCKCHAIN_DIR := $(PROJECT_ROOT)/../thesis-blockchain/api-gateway
+BLOCKCHAIN_REPO_URL ?= https://github.com/letienthanh364/thesis-blockchain.git
 VENV := $(PROJECT_ROOT)/.venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
@@ -59,6 +60,7 @@ help:
 	@echo "  CLIQUE_SIZE=N           Size of each clique (default: 3)"
 	@echo "  NODES_MAP=path          Hierarchical node roster (overrides NODES)"
 	@echo "  STATE_MAP=path          Legacy alias for NODES_MAP"
+	@echo "  BLOCKCHAIN_REPO_URL=... Override thesis-blockchain git URL"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make start NODES=10 CLIQUE_SIZE=5"
@@ -112,8 +114,14 @@ setup-data: setup-deps
 setup-blockchain:
 	@echo "[5/5] Setting up blockchain environment..."
 	@if [ ! -d "$(BLOCKCHAIN_DIR)" ]; then \
-		echo "ERROR: Blockchain repository not found at $(BLOCKCHAIN_DIR)"; \
-		echo "       Clone thesis-blockchain as a sibling directory."; \
+		echo "      Blockchain repository not found. Cloning to ../thesis-blockchain..."; \
+		BLOCKCHAIN_PARENT="$$(dirname "$(BLOCKCHAIN_DIR)")"; \
+		mkdir -p "$$BLOCKCHAIN_PARENT"; \
+		git clone "$(BLOCKCHAIN_REPO_URL)" "$$BLOCKCHAIN_PARENT"; \
+	fi
+	@if [ ! -f "$(BLOCKCHAIN_DIR)/.env.example" ]; then \
+		echo "ERROR: Missing $(BLOCKCHAIN_DIR)/.env.example"; \
+		echo "       Verify thesis-blockchain was cloned correctly."; \
 		exit 1; \
 	fi
 	@if [ ! -f "$(BLOCKCHAIN_DIR)/.env" ]; then \
