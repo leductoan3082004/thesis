@@ -47,6 +47,9 @@ make logs
 
 # Stop all services
 make stop
+
+# Run IPFS + blockchain as host processes, FL stack in Docker
+make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
 ```
 
 ### Available Make Targets
@@ -101,6 +104,26 @@ By default the Compose file starts IPFS inside Docker (`ipfs-node-1..3`). To run
 - Run the rest of the stack with `make start IPFS_MODE=process` (or pass `--ipfs-mode process` to `scripts/run_docker_with_nodes.py`). The generator will point node configs at the client URLs derived from the process config instead of the Docker service names.
 
 When running training nodes directly on the host, override the client host with `IPFS_PROCESS_CLIENT_HOST=localhost` (or change the `client_host` fields in the JSON) so configs use `http://127.0.0.1:<api_port>`. Switching back to Docker is as simple as stopping the processes and omitting the override.
+
+### Hybrid Process Mode (IPFS + Blockchain on Host, Nodes in Docker)
+
+If Docker is restricted on your machine but you still want to run the FL nodes inside containers, the stack now supports a “process mode” for the infrastructure components:
+
+```bash
+make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
+```
+
+- `NODES_MAP=config/nodes-map.json` tells the generator to derive the fleet from the hierarchy-aware roster (trainer IDs, scope assignments, etc.). Omit it to fall back to `config/system-config.json:number_of_nodes`.
+- `PROCESS_MODE=1` switches IPFS + Hyperledger Fabric (orderer, peers, API gateway, IPFS daemons) to host processes. The Makefile automatically points trainer configs at `host.docker.internal` so Dockerized nodes can reach them.
+- `NO_BUILD=1` skips rebuilding the shared trainer image; drop the flag the first time or after Dockerfile changes.
+
+During this flow `scripts/run_process_mode.py`:
+1. Stops any leftover dockerized FL nodes, IPFS daemons, and Fabric processes.
+2. Regenerates node configs/topology/Prometheus files just like the Docker path.
+3. Launches the IPFS daemons and Fabric process runner, signs VCs, builds a bulk registration payload, and whitelists every trainer via `/auth/register-trainers`.
+4. Starts the FL docker compose stack with the freshly generated configuration.
+
+Fabric logs live under `../thesis-blockchain/api-gateway/process-runner/runtime/logs`, IPFS logs under `logs/ipfs`, and the trainer whitelist at `../thesis-blockchain/api-gateway/data/trainers.json`. Run `make stop` to tear everything down.
 
 #### Quick Test of the Process-Based IPFS Cluster
 

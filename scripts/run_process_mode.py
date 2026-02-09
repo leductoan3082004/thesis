@@ -255,6 +255,38 @@ def _clear_blockchain_runtime(paths: Dict[str, Path]) -> None:
     print(f"Cleared blockchain runtime data -> {BLOCKCHAIN_PROCESS_RUNTIME_DIR}")
 
 
+def _start_fl_docker_stack(compose_file: Path, detach: bool, build: bool) -> None:
+    compose_file = compose_file.resolve()
+    if not compose_file.exists():
+        raise SystemExit(f"FL docker compose file not found at {compose_file}.")
+    compose_dir = compose_file.parent
+    compose_name = compose_file.name
+    cmd = ["docker", "compose", "-f", compose_name, "up"]
+    if build:
+        cmd.append("--build")
+    if detach:
+        cmd.append("-d")
+    print(
+        f"Starting FL docker stack via {compose_file} "
+        f"(build={'yes' if build else 'no'}, detach={'yes' if detach else 'no'})...",
+    )
+    result = subprocess.run(cmd, cwd=compose_dir, check=False)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"docker compose up for FL stack exited with code {result.returncode}.",
+        )
+
+
+def _stop_fl_docker_stack(compose_file: Path) -> None:
+    compose_file = compose_file.resolve()
+    if not compose_file.exists():
+        return
+    compose_dir = compose_file.parent
+    compose_name = compose_file.name
+    cmd = ["docker", "compose", "-f", compose_name, "down", "-v"]
+    subprocess.run(cmd, cwd=compose_dir, check=False)
+
+
 def _resolve_gateway_url(cli_value: Optional[str]) -> str:
     return cli_value or os.environ.get("BLOCKCHAIN_GATEWAY_URL") or DOCKER_DEFAULT_GATEWAY_URL
 
@@ -292,6 +324,14 @@ def _start(args: argparse.Namespace) -> None:
             print("Note: IPFS processes were not started; run 'run_process_mode.py start' without --skip-ipfs if needed.")
         else:
             print("IPFS processes are running in the background (managed by run_ipfs_processes.py).")
+        if args.fl_compose_file:
+            print("Ensuring previous FL docker stack is stopped...")
+            _stop_fl_docker_stack(args.fl_compose_file)
+            _start_fl_docker_stack(
+                args.fl_compose_file,
+                detach=args.fl_detach,
+                build=not args.fl_no_build,
+            )
     except Exception:
         if ipfs_started and not args.keep_ipfs_on_failure:
             _stop_ipfs_runner(verbose=False)
@@ -361,6 +401,29 @@ def parse_args() -> argparse.Namespace:
         "--keep-ipfs-on-failure",
         action="store_true",
         help="Do not stop the IPFS process runner if blockchain startup fails.",
+    )
+    start_parser.add_argument(
+        "--fl-compose-file",
+        type=Path,
+        help="Optional docker compose file to start the FL stack after blockchain registration.",
+    )
+    start_parser.add_argument(
+        "--fl-detach",
+        dest="fl_detach",
+        action="store_true",
+        default=True,
+        help="Run the FL docker stack in detached mode (default).",
+    )
+    start_parser.add_argument(
+        "--fl-no-detach",
+        dest="fl_detach",
+        action="store_false",
+        help="Run the FL docker stack in the foreground (implies --fl-detach=0).",
+    )
+    start_parser.add_argument(
+        "--fl-no-build",
+        action="store_true",
+        help="Skip passing --build to docker compose when launching the FL stack.",
     )
 
     stop_parser = subparsers.add_parser("stop", help="Stop IPFS and blockchain process-mode stacks.")

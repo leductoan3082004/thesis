@@ -90,6 +90,20 @@ If Docker is unavailable (or you want to reuse the host’s Kubo binaries), the 
 
 Stop the daemons with Ctrl+C (the script terminates every process). Switching back to Docker simply means rerunning `make start` without `IPFS_MODE=process`.
 
+### Full System with Process-Mode Infrastructure
+
+To launch IPFS and the Hyperledger Fabric stack as host processes (while keeping the FL nodes/monitoring in Docker), use:
+
+```bash
+make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
+```
+
+- `NODES_MAP=config/nodes-map.json` ensures the generator mirrors your hierarchy-aware roster; omit it to fall back to the count inside `config/system-config.json`.
+- `PROCESS_MODE=1` switches orchestration to process mode: `scripts/run_process_mode.py` kills any leftover daemons, clears `thesis-blockchain/api-gateway/process-runner/runtime`, resets `data/trainers.json`, starts IPFS + Fabric processes, signs VCs, builds the bulk payload, registers trainers, and then launches the FL docker compose stack.
+- `NO_BUILD=1` skips rebuilding the shared trainer image—drop it the first time (or whenever Dockerfiles change) so images rebuild as needed.
+
+Fabric logs live under `../thesis-blockchain/api-gateway/process-runner/runtime/logs`, IPFS logs under `logs/ipfs/ipfs-process-*.log`, and the trainer whitelist is written to `../thesis-blockchain/api-gateway/data/trainers.json`. Run `make stop` (or `python scripts/run_process_mode.py stop --skip-ipfs/--skip-blockchain`) to shut everything down cleanly.
+
 ## What You'll See
 
 ### Phase 1: Initialization

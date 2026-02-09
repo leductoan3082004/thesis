@@ -49,11 +49,14 @@ endif
 
 BUILD_ARG := $(if $(filter 1,$(NO_BUILD)),--no-build,)
 IPFS_MODE ?= docker
-ifeq ($(PROCESS_MODE),1)
-override IPFS_MODE := process
-endif
 IPFS_PROCESS_CONFIG ?= $(PROJECT_ROOT)/config/ipfs-process.json
 IPFS_PROCESS_CLIENT_HOST ?=
+ifeq ($(PROCESS_MODE),1)
+override IPFS_MODE := process
+ifeq ($(strip $(IPFS_PROCESS_CLIENT_HOST)),)
+override IPFS_PROCESS_CLIENT_HOST := host.docker.internal
+endif
+endif
 IPFS_ARGS := --ipfs-mode $(IPFS_MODE)
 ifneq ($(strip $(IPFS_MODE)),docker)
 IPFS_ARGS += --ipfs-process-config $(IPFS_PROCESS_CONFIG)
@@ -185,9 +188,11 @@ start: setup
 			$(BUILD_ARG) \
 			--generate-only; \
 		$(PYTHON) $(PROJECT_ROOT)/scripts/run_process_mode.py start \
-			--ipfs-config $(IPFS_PROCESS_CONFIG); \
-		echo "[process-mode] IPFS + blockchain stacks are running as host processes."; \
-		echo "[process-mode] FL node processes will be handled in a future update."; \
+			--ipfs-config $(IPFS_PROCESS_CONFIG) \
+			--fl-compose-file $(COMPOSE_FILE) \
+			$(if $(filter 1,$(NO_BUILD)),--fl-no-build,) \
+			$(if $(filter 1,$(FOREGROUND)),--fl-no-detach,); \
+		echo "[process-mode] Infrastructure is running (IPFS + blockchain on host, FL stack in Docker)."; \
 	else \
 		$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
 			$(STATE_ARG) \
