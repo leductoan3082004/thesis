@@ -1,7 +1,8 @@
 {
   "role": "hybrid",
-  "ttp_address": "ttp:50051",
+  "ttp_address": "127.0.0.1:50051",
   "port": 50052,
+  "metrics_port": 8000,
   "dataset": {
     "name": "mnist",
     "num_clients": 12,
@@ -20,16 +21,16 @@
   "inter_cluster": {
     "enabled": true,
     "use_mock": false,
-    "topology_file": "/app/config/topology.json",
+    "topology_file": "config/topology.json",
     "ipfs": {
-      "api_url": "http://ipfs-node-1:5001",
+      "api_url": "http://127.0.0.1:15101",
       "replica_api_urls": [],
       "timeout": 30.0,
       "max_retries": 5,
       "retry_delay": 2.0
     },
     "blockchain": {
-      "gateway_url": "http://host.docker.internal:9000",
+      "gateway_url": "http://127.0.0.1:9000",
       "identity": "",
       "private_key_path": "",
       "state_path": "",

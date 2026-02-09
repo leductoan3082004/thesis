@@ -180,7 +180,7 @@ docker compose logs > training.log
 | [src/.../node_service.py](src/secure_aggregation/communication/node_service.py) | Node training + aggregation logic |
 | [config/nodes/](config/nodes/) | Node configurations (4 files) |
 | [docker/docker-compose.yml](docker/docker-compose.yml) | Docker orchestration |
-| [RUN_INSTRUCTIONS.md](RUN_INSTRUCTIONS.md) | Detailed usage guide |
+| [README.md](README.md) | End-to-end setup and usage guide |
 
 ## 🔐 Security Properties
 

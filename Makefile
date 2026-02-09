@@ -1,24 +1,21 @@
-# Makefile for Secure Aggregation Federated Learning System
+# Makefile for Secure Aggregation Federated Learning System (Process-Only Runtime)
 #
 # Usage:
 #   make setup          - Install dependencies and generate gRPC code
 #   make start          - Start the system (infrastructure + training)
-#   make start-training - Restart only training nodes (keeps infrastructure)
 #   make stop           - Stop all services
-#   make logs           - View logs from all containers
-#   make clean          - Remove generated files and containers
+#   make status         - Show status of all managed processes
+#   make logs           - View logs (via Loki or file fallback)
+#   make clean          - Stop processes and remove generated files
 #   make test           - Run tests
 #
 # Configuration:
 #   NODES=6             - Number of training nodes (default: 6)
 #   CLIQUE_SIZE=3       - Size of each clique in D-Cliques topology (default: 3)
-#   DETACH=1            - Run in background (default: foreground)
 
-.PHONY: setup start start-training stop logs clean test help
-.PHONY: setup-venv setup-deps setup-grpc setup-data setup-blockchain
-.PHONY: generate-configs generate-dashboard
-.PHONY: start-blockchain start-monitoring start-storage
-.PHONY: stop-training clean-state
+.PHONY: setup start stop status logs clean test help
+.PHONY: setup-venv setup-deps setup-grpc setup-data setup-blockchain setup-monitoring
+.PHONY: logs-node logs-errors clean-all
 
 SHELL := /bin/bash
 export PATH := $(HOME)/.local/bin:$(PATH)
@@ -27,18 +24,13 @@ BLOCKCHAIN_DIR := $(PROJECT_ROOT)/../thesis-blockchain/api-gateway
 VENV := $(PROJECT_ROOT)/.venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
-COMPOSE_FILE := $(PROJECT_ROOT)/docker/docker-compose.auto.yml
-COMPOSE_TEMPLATE := $(PROJECT_ROOT)/docker/docker-compose.yml
 
 NODES ?= 6
 CLIQUE_SIZE ?= 3
-FOREGROUND ?= 0
 NODES_MAP ?=
 STATE_MAP ?=
-NO_BUILD ?= 0
 
 MAP_PATH := $(strip $(if $(NODES_MAP),$(NODES_MAP),$(STATE_MAP)))
-PROCESS_MODE ?= 0
 
 ifeq ($(strip $(MAP_PATH)),)
 STATE_ARG := --nodes $(NODES)
@@ -47,35 +39,19 @@ STATE_ARG := --nodes-map $(MAP_PATH)
 override NODES := $(shell $(PYTHON) $(PROJECT_ROOT)/scripts/nodes_map_count.py $(MAP_PATH))
 endif
 
-BUILD_ARG := $(if $(filter 1,$(NO_BUILD)),--no-build,)
-IPFS_MODE ?= docker
-IPFS_PROCESS_CONFIG ?= $(PROJECT_ROOT)/config/ipfs-process.json
-IPFS_PROCESS_CLIENT_HOST ?=
-ifeq ($(PROCESS_MODE),1)
-override IPFS_MODE := process
-ifeq ($(strip $(IPFS_PROCESS_CLIENT_HOST)),)
-override IPFS_PROCESS_CLIENT_HOST := host.docker.internal
-endif
-endif
-IPFS_ARGS := --ipfs-mode $(IPFS_MODE)
-ifneq ($(strip $(IPFS_MODE)),docker)
-IPFS_ARGS += --ipfs-process-config $(IPFS_PROCESS_CONFIG)
-ifneq ($(strip $(IPFS_PROCESS_CLIENT_HOST)),)
-IPFS_ARGS += --ipfs-process-client-host $(IPFS_PROCESS_CLIENT_HOST)
-endif
-endif
-
 # Default target
 help:
-	@echo "Secure Aggregation FL System"
+	@echo "Secure Aggregation FL System (Process-Only Runtime)"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make setup              Install dependencies and generate gRPC code"
 	@echo "  make start              Start full system (blockchain + monitoring + training)"
-	@echo "  make start-training     Restart training nodes only (keeps infrastructure)"
-	@echo "  make stop               Stop all services"
-	@echo "  make logs               View container logs"
-	@echo "  make clean              Remove generated files and stop containers"
+	@echo "  make stop               Stop all managed processes"
+	@echo "  make status             Show status of all managed processes"
+	@echo "  make logs               View aggregated logs (Loki or file fallback)"
+	@echo "  make logs-node NODE=X   View logs for a specific node"
+	@echo "  make logs-errors        View error-level logs only"
+	@echo "  make clean              Stop processes and remove generated files"
 	@echo "  make test               Run unit tests"
 	@echo ""
 	@echo "Options:"
@@ -83,23 +59,19 @@ help:
 	@echo "  CLIQUE_SIZE=N           Size of each clique (default: 3)"
 	@echo "  NODES_MAP=path          Hierarchical node roster (overrides NODES)"
 	@echo "  STATE_MAP=path          Legacy alias for NODES_MAP"
-	@echo "  NO_BUILD=1              Skip rebuilding the shared node image"
-	@echo "  FOREGROUND=1            Run containers in foreground (default: background)"
-	@echo "  PROCESS_MODE=1          Launch IPFS + blockchain as host processes (experimental)"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make start NODES=10 CLIQUE_SIZE=5    Start with 10 nodes in cliques of 5"
+	@echo "  make start NODES=10 CLIQUE_SIZE=5"
 	@echo "  make start NODES_MAP=config/nodes-map.json CLIQUE_SIZE=4"
-	@echo "  make start NO_BUILD=1                Reuse previously built images"
-	@echo "  make start FOREGROUND=1              Start in foreground (watch logs)"
-	@echo "  make start-training NODES=8          Restart training with 8 nodes"
+	@echo "  make logs-node NODE=trainer-node-001"
+	@echo "  make logs-errors"
 
 
 # ------------------------------------------------------------------------------
 # Setup targets
 # ------------------------------------------------------------------------------
 
-setup: setup-venv setup-deps setup-grpc setup-data setup-blockchain
+setup: setup-venv setup-deps setup-grpc setup-data setup-blockchain setup-monitoring
 	@echo ""
 	@echo "Setup complete. Run 'make start' to launch the system."
 
@@ -153,138 +125,52 @@ setup-blockchain:
 		echo "      Blockchain .env already exists"; \
 	fi
 
-
-# ------------------------------------------------------------------------------
-# Generate targets
-# ------------------------------------------------------------------------------
-
-generate-configs: setup-deps setup-blockchain
-	@echo "Generating node configurations for $(NODES) nodes (clique_size=$(CLIQUE_SIZE))..."
-	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
-		$(STATE_ARG) \
-		--clique-size $(CLIQUE_SIZE) \
-		$(IPFS_ARGS) \
-		$(BUILD_ARG) \
-		--generate-only
-
-generate-dashboard: setup-deps
-	@echo "Generating Grafana dashboard..."
-	@$(PYTHON) $(PROJECT_ROOT)/scripts/generate_grafana_dashboard.py
+setup-monitoring:
+	@echo "[6/6] Installing monitoring tools (Loki, Promtail, Prometheus, Grafana)..."
+	@bash $(PROJECT_ROOT)/scripts/install_monitoring.sh
+	@echo "      Monitoring tools installed"
 
 
 # ------------------------------------------------------------------------------
-# Start targets
+# Runtime targets (process-only via secureagg_ctl.py)
 # ------------------------------------------------------------------------------
 
 start: setup
 	@echo ""
 	@echo "Starting full system with $(NODES) nodes (clique_size=$(CLIQUE_SIZE))..."
-	@if [ "$(PROCESS_MODE)" = "1" ]; then \
-		echo "[process-mode] Generating configs and blockchain artifacts..."; \
-		$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
-			$(STATE_ARG) \
-			--clique-size $(CLIQUE_SIZE) \
-			$(IPFS_ARGS) \
-			$(BUILD_ARG) \
-			--generate-only; \
-		$(PYTHON) $(PROJECT_ROOT)/scripts/run_process_mode.py start \
-			--ipfs-config $(IPFS_PROCESS_CONFIG) \
-			--fl-compose-file $(COMPOSE_FILE) \
-			$(if $(filter 1,$(NO_BUILD)),--fl-no-build,) \
-			$(if $(filter 1,$(FOREGROUND)),--fl-no-detach,); \
-		echo "[process-mode] Infrastructure is running (IPFS + blockchain on host, FL stack in Docker)."; \
-	else \
-		$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
-			$(STATE_ARG) \
-			--clique-size $(CLIQUE_SIZE) \
-			$(IPFS_ARGS) \
-			$(BUILD_ARG) \
-			$(if $(filter 1,$(FOREGROUND)),--no-detach,); \
-	fi
-
-start-training: setup generate-configs stop-training clean-state
-	@echo ""
-	@echo "Starting training services with $(NODES) nodes..."
-	@docker compose -f $(COMPOSE_FILE) up --build -d \
-		ttp $(shell for i in $$(seq 0 $$(($(NODES)-1))); do echo "node_$$i"; done)
-
-start-blockchain: setup
-	@echo "Starting blockchain infrastructure..."
-	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
+	@$(PYTHON) $(PROJECT_ROOT)/scripts/secureagg_ctl.py start \
 		$(STATE_ARG) \
-		--clique-size $(CLIQUE_SIZE) \
-		$(IPFS_ARGS) \
-		$(BUILD_ARG) \
-		--generate-only
-	@cd $(PROJECT_ROOT)/../thesis-blockchain/api-gateway && \
-		docker compose up -d --build
-
-start-monitoring: generate-dashboard
-	@echo "Starting monitoring services..."
-	@docker compose -f $(COMPOSE_FILE) up -d prometheus grafana
-	@echo ""
-	@echo "Grafana:    http://localhost:3000 (admin/admin)"
-	@echo "Prometheus: http://localhost:9090"
-
-start-storage:
-	@echo "Starting storage services..."
-	@docker compose -f $(COMPOSE_FILE) up -d --build ipfs-node-1 registry
-
-
-# ------------------------------------------------------------------------------
-# Stop targets
-# ------------------------------------------------------------------------------
+		--clique-size $(CLIQUE_SIZE)
 
 stop:
-	@echo "Stopping all services..."
-	@if [ -x "$(PYTHON)" ]; then \
-		$(PYTHON) $(PROJECT_ROOT)/scripts/run_process_mode.py stop >/dev/null 2>&1 || true; \
-	fi
-	@if [ -f "$(COMPOSE_FILE)" ]; then \
-		docker compose -f $(COMPOSE_FILE) down -v; \
-	fi
-	@if [ -f "$(PROJECT_ROOT)/../thesis-blockchain/api-gateway/docker-compose.yaml" ]; then \
-		cd $(PROJECT_ROOT)/../thesis-blockchain/api-gateway && docker compose down -v 2>/dev/null || true; \
-	fi
-	@echo "All services stopped"
+	@$(PYTHON) $(PROJECT_ROOT)/scripts/secureagg_ctl.py stop
 
-stop-training:
-	@echo "Stopping training services..."
-	@docker rm -f ttp 2>/dev/null || true
-	@for i in $$(seq 0 $$(($(NODES)-1))); do \
-		docker rm -f "node_$$i" 2>/dev/null || true; \
-	done
-
-
-# ------------------------------------------------------------------------------
-# Utility targets
-# ------------------------------------------------------------------------------
+status:
+	@$(PYTHON) $(PROJECT_ROOT)/scripts/secureagg_ctl.py status
 
 logs:
-	@if [ -f "$(COMPOSE_FILE)" ]; then \
-		docker compose -f $(COMPOSE_FILE) logs -f; \
-	else \
-		echo "No compose file found. Run 'make start' first."; \
-	fi
+	@$(PYTHON) $(PROJECT_ROOT)/scripts/secureagg_ctl.py logs
 
 logs-node:
 	@if [ -z "$(NODE)" ]; then \
-		echo "Usage: make logs-node NODE=0"; \
+		echo "Usage: make logs-node NODE=trainer-node-001"; \
 	else \
-		docker compose -f $(COMPOSE_FILE) logs -f node_$(NODE); \
+		$(PYTHON) $(PROJECT_ROOT)/scripts/secureagg_ctl.py logs --node $(NODE); \
 	fi
 
-clean-state:
-	@echo "Clearing training state..."
-	@rm -rf $(PROJECT_ROOT)/logs/* 2>/dev/null || true
-	@rm -rf $(PROJECT_ROOT)/checkpoints/* 2>/dev/null || true
-	@rm -f $(PROJECT_ROOT)/config/topology.json 2>/dev/null || true
-	@rm -rf $(PROJECT_ROOT)/data/blockchain/* 2>/dev/null || true
+logs-errors:
+	@$(PYTHON) $(PROJECT_ROOT)/scripts/secureagg_ctl.py logs --errors
 
-clean: stop
-	@echo "Cleaning generated files..."
+
+# ------------------------------------------------------------------------------
+# Cleanup targets
+# ------------------------------------------------------------------------------
+
+clean:
+	@echo "Stopping processes and cleaning generated files..."
+	@$(PYTHON) $(PROJECT_ROOT)/scripts/secureagg_ctl.py cleanup --purge-logs 2>/dev/null || true
+	@rm -rf $(PROJECT_ROOT)/process-runtime 2>/dev/null || true
 	@rm -rf $(PROJECT_ROOT)/config/nodes/*.json 2>/dev/null || true
-	@rm -f $(COMPOSE_FILE) 2>/dev/null || true
 	@rm -rf $(PROJECT_ROOT)/logs/* 2>/dev/null || true
 	@rm -rf $(PROJECT_ROOT)/checkpoints/* 2>/dev/null || true
 	@rm -f $(PROJECT_ROOT)/config/topology.json 2>/dev/null || true
@@ -293,9 +179,8 @@ clean: stop
 	@echo "Clean complete"
 
 clean-all: clean
-	@echo "Removing virtual environment and Docker resources..."
+	@echo "Removing virtual environment..."
 	@rm -rf $(VENV)
-	@docker system prune -f 2>/dev/null || true
 	@echo "Full clean complete"
 
 

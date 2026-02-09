@@ -784,7 +784,7 @@ class HierarchyMixin:
                 ready.add(scope_key)
 
     @staticmethod
-    def _trainer_to_container(trainer_id: str) -> Optional[str]:
+    def _trainer_to_canonical_id(trainer_id: str) -> Optional[str]:
         suffix = "".join(ch for ch in str(trainer_id) if ch.isdigit())
         if not suffix:
             return None
@@ -818,7 +818,7 @@ class HierarchyMixin:
             seen: Set[str] = set()
             clusters: List[str] = []
             for trainer_id in nodes:
-                container = self._trainer_to_container(trainer_id)
+                container = self._trainer_to_canonical_id(trainer_id)
                 if not container:
                     continue
                 clique_idx = container_to_clique.get(container)

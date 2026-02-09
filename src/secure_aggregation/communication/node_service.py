@@ -160,6 +160,7 @@ class NodeService(HierarchyMixin):
     """Node service that coordinates training and secure aggregation."""
 
     def __init__(self, config_path: str) -> None:
+        self._config_path = config_path
         self.config = self._load_config(config_path)
         self.system_config, self.system_config_path = load_system_config(Path(config_path))
         self.node_id = self.config["node_id"]
@@ -579,7 +580,9 @@ class NodeService(HierarchyMixin):
         """Setup dataset using config-driven loader with indices assigned by TTP or local partition."""
         dataset_name = self.dataset_config.get("name", "mnist")
         self.dataset_name = dataset_name
-        datasets_config_path = self.dataset_config.get("config_path", "/app/config/datasets.json")
+        # Resolve datasets config: explicit config value, then relative to node config file, then Docker fallback.
+        _default_datasets = str(Path(self._config_path).resolve().parent.parent / "datasets.json") if hasattr(self, "_config_path") else "/app/config/datasets.json"
+        datasets_config_path = self.dataset_config.get("config_path", _default_datasets)
         logger.info(f"Setting up dataset: {dataset_name}")
 
         train_ds = load_dataset(dataset_name, datasets_config_path, train=True)
@@ -1780,9 +1783,17 @@ class NodeService(HierarchyMixin):
 
         # Initialize Prometheus metrics and start HTTP server for scraping
         self.prom_metrics = PrometheusMetrics.get_instance(self.node_id, self.clique_id)
-        self.prom_metrics.start_server(port=8000)
+        metrics_port = self.config.get("metrics_port", 8000)
+        self.prom_metrics.start_server(port=metrics_port)
         self.prom_metrics.set_training_samples(len(self.train_indices))
         self.prom_metrics.set_model_parameters(sum(p.numel() for p in self.model.parameters()))
+        pending = getattr(self, "_pending_topology_metrics", None)
+        if pending:
+            self.prom_metrics.set_topology_max_degree(pending["max_degree"])
+            self.prom_metrics.set_topology_average_degree(pending["avg_degree"])
+        pending_type = getattr(self, "_pending_topology_type", None)
+        if pending_type:
+            self.prom_metrics.set_topology_type(pending_type)
         self.comm_tracker = CommunicationTracker(self.node_id)
 
         logger.info(
@@ -2240,12 +2251,15 @@ class NodeService(HierarchyMixin):
             if cliques and inter_edges is not None:
                 max_degree = compute_max_degree(cliques, inter_edges)
                 avg_degree = compute_average_degree(cliques, inter_edges)
-                self.metrics.set_topology_max_degree(max_degree)
-                self.metrics.set_topology_average_degree(avg_degree)
                 logger.info(f"Topology metrics: max_degree={max_degree}, avg_degree={avg_degree:.2f}")
+                # Store for deferred export once prom_metrics is initialized.
+                self._pending_topology_metrics = {
+                    "max_degree": max_degree,
+                    "avg_degree": avg_degree,
+                }
 
             topology_type = topology_data.get("topology_type", "d_cliques")
-            self.metrics.set_topology_type(topology_type)
+            self._pending_topology_type = topology_type
         else:
             inter_edges_config = self.inter_cluster_config.get("inter_edges", [])
             inter_edges = [(e[0], e[1]) for e in inter_edges_config]

@@ -12,7 +12,7 @@
       "swarm_host": "0.0.0.0",
       "advertise_host": "127.0.0.1",
       "advertise_proto": "ip4",
-      "client_host": "host.docker.internal"
+      "client_host": "127.0.0.1"
     },
     {
       "name": "ipfs-process-2",
@@ -25,7 +25,7 @@
       "swarm_host": "0.0.0.0",
       "advertise_host": "127.0.0.1",
       "advertise_proto": "ip4",
-      "client_host": "host.docker.internal"
+      "client_host": "127.0.0.1"
     },
     {
       "name": "ipfs-process-3",
@@ -38,7 +38,7 @@
       "swarm_host": "0.0.0.0",
       "advertise_host": "127.0.0.1",
       "advertise_proto": "ip4",
-      "client_host": "host.docker.internal"
+      "client_host": "127.0.0.1"
     }
   ]
 }

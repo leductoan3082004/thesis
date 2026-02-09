@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from secure_aggregation.communication.ttp_service import TopologyConfig, serve
-from secure_aggregation.data import dirichlet_partition, load_torchvision_labels
+from secure_aggregation.data import dirichlet_partition, get_labels, load_dataset
 from secure_aggregation.topology import build_full_topology, compute_node_labels_from_partition
 from secure_aggregation.utils import configure_logging, get_logger
 
@@ -38,10 +38,14 @@ def detect_dataset_name_from_nodes(num_clients: int) -> Optional[str]:
 
 
 def load_dataset_labels(dataset_name: str, data_dir: str = "/app/data") -> dict[int, int]:
-    """Load torchvision dataset labels for topology generation."""
+    """Load dataset labels for topology generation."""
     normalized = dataset_name.strip().lower()
     logger.info("Loading %s labels from %s", normalized, data_dir)
-    labels = load_torchvision_labels(normalized, data_dir)
+    config_path = Path(os.environ.get("DATASETS_CONFIG", "/app/config/datasets.json"))
+    if not config_path.exists():
+        config_path = Path(__file__).resolve().parent.parent / "config" / "datasets.json"
+    dataset = load_dataset(normalized, config_path, train=True, root_override=data_dir)
+    labels = get_labels(dataset)
     logger.info("Loaded %d labels for %s", len(labels), normalized)
     return labels
 

@@ -1,0 +1,294 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Training Nodes",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "logs",
+      "title": "All Node Logs",
+      "description": "Live log stream from all FL training nodes",
+      "gridPos": { "x": 0, "y": 1, "w": 24, "h": 10 },
+      "datasource": { "type": "loki", "uid": "${loki_ds}" },
+      "targets": [
+        {
+          "expr": "{service=\"fl_node\", node_id=~\"$node\"} |= \"$filter\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 3,
+      "type": "logs",
+      "title": "Accuracy & Convergence",
+      "description": "Accuracy reports and convergence signals from training nodes",
+      "gridPos": { "x": 0, "y": 11, "w": 24, "h": 8 },
+      "datasource": { "type": "loki", "uid": "${loki_ds}" },
+      "targets": [
+        {
+          "expr": "{service=\"fl_node\", node_id=~\"$node\"} |~ \"(?i)(accuracy|convergence|round.*complete)\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "SAP Protocol Phases",
+      "description": "Secure Aggregation Protocol phase progression",
+      "gridPos": { "x": 0, "y": 19, "w": 24, "h": 7 },
+      "datasource": { "type": "loki", "uid": "${loki_ds}" },
+      "targets": [
+        {
+          "expr": "{service=\"fl_node\", node_id=~\"$node\"} |~ \"SAP-Round|masked model|unmasking|consistency\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "IPFS & Blockchain",
+      "description": "Model storage (IPFS) and anchoring (blockchain) activity",
+      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 7 },
+      "datasource": { "type": "loki", "uid": "${loki_ds}" },
+      "targets": [
+        {
+          "expr": "{service=\"fl_node\", node_id=~\"$node\"} |~ \"(?i)(ipfs|CID|blockchain|anchor|published)\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 6,
+      "type": "logs",
+      "title": "Errors & Warnings",
+      "description": "Error and warning messages across all nodes",
+      "gridPos": { "x": 0, "y": 33, "w": 24, "h": 7 },
+      "datasource": { "type": "loki", "uid": "${loki_ds}" },
+      "targets": [
+        {
+          "expr": "{service=\"fl_node\", node_id=~\"$node\"} |~ \"(?i)(ERROR|WARN|exception|traceback|failed)\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Infrastructure",
+      "gridPos": { "x": 0, "y": 40, "w": 24, "h": 1 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 8,
+          "type": "logs",
+          "title": "TTP Service Logs",
+          "description": "Trusted Third Party service logs",
+          "gridPos": { "x": 0, "y": 41, "w": 24, "h": 8 },
+          "datasource": { "type": "loki", "uid": "${loki_ds}" },
+          "targets": [
+            {
+              "expr": "{service=\"ttp\"}",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "showCommonLabels": false,
+            "wrapLogMessage": true,
+            "prettifyLogMessage": false,
+            "enableLogDetails": true,
+            "sortOrder": "Descending",
+            "dedupStrategy": "none"
+          }
+        },
+        {
+          "id": 9,
+          "type": "logs",
+          "title": "IPFS Cluster Logs",
+          "description": "IPFS node logs",
+          "gridPos": { "x": 0, "y": 49, "w": 24, "h": 8 },
+          "datasource": { "type": "loki", "uid": "${loki_ds}" },
+          "targets": [
+            {
+              "expr": "{service=\"ipfs\"}",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "showCommonLabels": false,
+            "wrapLogMessage": true,
+            "prettifyLogMessage": false,
+            "enableLogDetails": true,
+            "sortOrder": "Descending",
+            "dedupStrategy": "none"
+          }
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Log Volume",
+      "gridPos": { "x": 0, "y": 57, "w": 24, "h": 1 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 11,
+          "type": "timeseries",
+          "title": "Log Volume by Node",
+          "description": "Rate of log lines per node over time",
+          "gridPos": { "x": 0, "y": 58, "w": 24, "h": 8 },
+          "datasource": { "type": "loki", "uid": "${loki_ds}" },
+          "targets": [
+            {
+              "expr": "sum by (node_id) (rate({service=\"fl_node\"}[1m]))",
+              "refId": "A",
+              "legendFormat": "{{node_id}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "bars",
+                "fillOpacity": 30,
+                "stacking": { "mode": "normal" }
+              },
+              "unit": "short"
+            }
+          }
+        },
+        {
+          "id": 12,
+          "type": "timeseries",
+          "title": "Error Rate by Node",
+          "description": "Rate of error/warning log lines per node",
+          "gridPos": { "x": 0, "y": 66, "w": 24, "h": 8 },
+          "datasource": { "type": "loki", "uid": "${loki_ds}" },
+          "targets": [
+            {
+              "expr": "sum by (node_id) (rate({service=\"fl_node\"} |~ \"(?i)(ERROR|WARN|exception)\" [1m]))",
+              "refId": "A",
+              "legendFormat": "{{node_id}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10
+              },
+              "unit": "short",
+              "color": { "mode": "palette-classic" }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["federated-learning", "logs", "loki"],
+  "templating": {
+    "list": [
+      {
+        "name": "loki_ds",
+        "type": "datasource",
+        "query": "loki",
+        "current": {},
+        "hide": 2
+      },
+      {
+        "name": "node",
+        "type": "query",
+        "label": "Node",
+        "datasource": { "type": "loki", "uid": "${loki_ds}" },
+        "query": "label_values({service=\"fl_node\"}, node_id)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "filter",
+        "type": "textbox",
+        "label": "Text Filter",
+        "current": { "text": "", "value": "" },
+        "description": "Free-text filter applied to All Node Logs panel"
+      }
+    ]
+  },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Federated Learning - Logs",
+  "uid": "fl-logs",
+  "version": 1
+}
