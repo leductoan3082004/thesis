@@ -38,6 +38,7 @@ STATE_MAP ?=
 NO_BUILD ?= 0
 
 MAP_PATH := $(strip $(if $(NODES_MAP),$(NODES_MAP),$(STATE_MAP)))
+PROCESS_MODE ?= 0
 
 ifeq ($(strip $(MAP_PATH)),)
 STATE_ARG := --nodes $(NODES)
@@ -47,6 +48,22 @@ override NODES := $(shell $(PYTHON) $(PROJECT_ROOT)/scripts/nodes_map_count.py $
 endif
 
 BUILD_ARG := $(if $(filter 1,$(NO_BUILD)),--no-build,)
+IPFS_MODE ?= docker
+IPFS_PROCESS_CONFIG ?= $(PROJECT_ROOT)/config/ipfs-process.json
+IPFS_PROCESS_CLIENT_HOST ?=
+ifeq ($(PROCESS_MODE),1)
+override IPFS_MODE := process
+ifeq ($(strip $(IPFS_PROCESS_CLIENT_HOST)),)
+override IPFS_PROCESS_CLIENT_HOST := host.docker.internal
+endif
+endif
+IPFS_ARGS := --ipfs-mode $(IPFS_MODE)
+ifneq ($(strip $(IPFS_MODE)),docker)
+IPFS_ARGS += --ipfs-process-config $(IPFS_PROCESS_CONFIG)
+ifneq ($(strip $(IPFS_PROCESS_CLIENT_HOST)),)
+IPFS_ARGS += --ipfs-process-client-host $(IPFS_PROCESS_CLIENT_HOST)
+endif
+endif
 
 # Default target
 help:
@@ -68,6 +85,7 @@ help:
 	@echo "  STATE_MAP=path          Legacy alias for NODES_MAP"
 	@echo "  NO_BUILD=1              Skip rebuilding the shared node image"
 	@echo "  FOREGROUND=1            Run containers in foreground (default: background)"
+	@echo "  PROCESS_MODE=1          Launch IPFS + blockchain as host processes (experimental)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make start NODES=10 CLIQUE_SIZE=5    Start with 10 nodes in cliques of 5"
@@ -145,6 +163,7 @@ generate-configs: setup-deps setup-blockchain
 	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
 		$(STATE_ARG) \
 		--clique-size $(CLIQUE_SIZE) \
+		$(IPFS_ARGS) \
 		$(BUILD_ARG) \
 		--generate-only
 
@@ -160,11 +179,28 @@ generate-dashboard: setup-deps
 start: setup
 	@echo ""
 	@echo "Starting full system with $(NODES) nodes (clique_size=$(CLIQUE_SIZE))..."
-	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
-		$(STATE_ARG) \
-		--clique-size $(CLIQUE_SIZE) \
-		$(BUILD_ARG) \
-		$(if $(filter 1,$(FOREGROUND)),--no-detach,)
+	@if [ "$(PROCESS_MODE)" = "1" ]; then \
+		echo "[process-mode] Generating configs and blockchain artifacts..."; \
+		$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
+			$(STATE_ARG) \
+			--clique-size $(CLIQUE_SIZE) \
+			$(IPFS_ARGS) \
+			$(BUILD_ARG) \
+			--generate-only; \
+		$(PYTHON) $(PROJECT_ROOT)/scripts/run_process_mode.py start \
+			--ipfs-config $(IPFS_PROCESS_CONFIG) \
+			--fl-compose-file $(COMPOSE_FILE) \
+			$(if $(filter 1,$(NO_BUILD)),--fl-no-build,) \
+			$(if $(filter 1,$(FOREGROUND)),--fl-no-detach,); \
+		echo "[process-mode] Infrastructure is running (IPFS + blockchain on host, FL stack in Docker)."; \
+	else \
+		$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
+			$(STATE_ARG) \
+			--clique-size $(CLIQUE_SIZE) \
+			$(IPFS_ARGS) \
+			$(BUILD_ARG) \
+			$(if $(filter 1,$(FOREGROUND)),--no-detach,); \
+	fi
 
 start-training: setup generate-configs stop-training clean-state
 	@echo ""
@@ -177,6 +213,7 @@ start-blockchain: setup
 	@$(PYTHON) $(PROJECT_ROOT)/scripts/run_docker_with_nodes.py \
 		$(STATE_ARG) \
 		--clique-size $(CLIQUE_SIZE) \
+		$(IPFS_ARGS) \
 		$(BUILD_ARG) \
 		--generate-only
 	@cd $(PROJECT_ROOT)/../thesis-blockchain/api-gateway && \
@@ -200,6 +237,9 @@ start-storage:
 
 stop:
 	@echo "Stopping all services..."
+	@if [ -x "$(PYTHON)" ]; then \
+		$(PYTHON) $(PROJECT_ROOT)/scripts/run_process_mode.py stop >/dev/null 2>&1 || true; \
+	fi
 	@if [ -f "$(COMPOSE_FILE)" ]; then \
 		docker compose -f $(COMPOSE_FILE) down -v; \
 	fi

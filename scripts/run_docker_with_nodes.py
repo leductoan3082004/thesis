@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import shlex
+from dataclasses import dataclass
 from copy import deepcopy
 from http import client as http_client
 from pathlib import Path
@@ -87,6 +88,14 @@ GATEWAY_HEALTH_PATH = "/health"
 GATEWAY_BULK_PATH = "/auth/register-trainers"
 NODE_IMAGE_TAG = os.environ.get("SECUREAGG_NODE_IMAGE", "secureagg-node:latest")
 NODE_DOCKERFILE = ROOT_DIR / "docker" / "node.Dockerfile"
+DEFAULT_IPFS_PROCESS_CONFIG = ROOT_DIR / "config" / "ipfs-process.json"
+
+
+@dataclass(frozen=True)
+class IPFSTarget:
+    name: str
+    api_url: str
+    dependency: Optional[str] = None
 
 
 DEFAULT_NODE_SERVICE: Dict[str, Any] = {
@@ -181,6 +190,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Prepare artifacts and start only the blockchain/api-gateway stack.",
     )
+    parser.add_argument(
+        "--ipfs-mode",
+        choices=("docker", "process"),
+        default=os.environ.get("IPFS_MODE", "docker"),
+        help="Select how IPFS endpoints are provisioned: docker containers (default) or host processes.",
+    )
+    parser.add_argument(
+        "--ipfs-process-config",
+        type=Path,
+        default=DEFAULT_IPFS_PROCESS_CONFIG,
+        help="When --ipfs-mode=process, path to the JSON definition for IPFS processes.",
+    )
+    parser.add_argument(
+        "--ipfs-process-client-host",
+        type=str,
+        help="Override the client-facing host for IPFS API URLs when --ipfs-mode=process "
+        "(defaults to the per-node 'client_host' in the config file).",
+    )
     return parser.parse_args()
 
 
@@ -203,21 +230,17 @@ def _ipfs_sort_key(service_name: str) -> Tuple[int, str]:
         return sys.maxsize, service_name
 
 
-def _select_ipfs_service(node_index: int, services: List[str]) -> str:
-    if not services:
-        raise SystemExit("No IPFS services defined in docker-compose template.")
-    return services[node_index % len(services)]
+def _select_ipfs_target(node_index: int, targets: List[IPFSTarget]) -> IPFSTarget:
+    if not targets:
+        raise SystemExit("No IPFS endpoints defined. Check your docker-compose template or IPFS process config.")
+    return targets[node_index % len(targets)]
 
 
-def _apply_ipfs_distribution(ipfs_service: str, config: Dict[str, Any], all_services: List[str]) -> None:
+def _apply_ipfs_distribution(ipfs_target: IPFSTarget, config: Dict[str, Any], all_targets: List[IPFSTarget]) -> None:
     inter_cluster = config.setdefault("inter_cluster", {})
     ipfs_section = inter_cluster.setdefault("ipfs", {})
-    ipfs_section["api_url"] = f"http://{ipfs_service}:5001"
-    replicas = [
-        f"http://{service}:5001"
-        for service in all_services
-        if service != ipfs_service
-    ]
+    ipfs_section["api_url"] = ipfs_target.api_url
+    replicas = [target.api_url for target in all_targets if target is not ipfs_target]
     if replicas:
         ipfs_section["replica_api_urls"] = replicas
     elif "replica_api_urls" in ipfs_section:
@@ -1297,6 +1320,51 @@ def _extract_ipfs_services(compose_data: Dict[str, Any]) -> List[str]:
     return sorted(ipfs_services, key=_ipfs_sort_key)
 
 
+def _build_docker_ipfs_targets(service_names: List[str]) -> List[IPFSTarget]:
+    return [IPFSTarget(name=name, api_url=f"http://{name}:5001", dependency=name) for name in service_names]
+
+
+def _remove_ipfs_services(compose_data: Dict[str, Any]) -> None:
+    services = compose_data.get("services", {})
+    for service_name in list(services.keys()):
+        if service_name.startswith("ipfs-node"):
+            services.pop(service_name, None)
+
+
+def _load_process_ipfs_targets(
+    config_path: Path,
+    client_host_override: Optional[str] = None,
+) -> List[IPFSTarget]:
+    if not config_path.exists():
+        raise SystemExit(f"IPFS process config not found at {config_path}")
+    try:
+        data = json.loads(config_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Failed to parse {config_path}: {exc}") from exc
+    nodes = data.get("nodes") or []
+    if not nodes:
+        raise SystemExit(f"IPFS process config {config_path} must define at least one node entry.")
+    targets: List[IPFSTarget] = []
+    for idx, node in enumerate(nodes):
+        name = str(node.get("name") or f"ipfs-process-{idx + 1}")
+        api_port = node.get("api_port")
+        if api_port is None:
+            raise SystemExit(f"IPFS process entry '{name}' missing required field 'api_port'.")
+        api_port_int = int(api_port)
+        scheme = str(node.get("api_scheme") or "http").strip() or "http"
+        client_host = (
+            (client_host_override.strip() if client_host_override else None)
+            or str(node.get("client_host") or "").strip()
+            or str(node.get("api_host") or "").strip()
+            or "127.0.0.1"
+        )
+        api_url = str(node.get("api_url") or "").strip()
+        if not api_url:
+            api_url = f"{scheme}://{client_host}:{api_port_int}"
+        targets.append(IPFSTarget(name=name, api_url=api_url))
+    return targets
+
+
 def _apply_shared_node_image(service: Optional[Dict[str, Any]], image_tag: Optional[str]) -> None:
     """Ensure a service reuses the shared node image to avoid redundant builds."""
     if not service or not image_tag:
@@ -1357,7 +1425,7 @@ def _locate_node_template(compose_data: Dict[str, Any]) -> Dict[str, Any]:
 def _merge_node_service(
     node_name: str,
     base_template: Dict[str, Any],
-    ipfs_service: str,
+    ipfs_dependency: Optional[str],
     image_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     service = deepcopy(base_template)
@@ -1371,8 +1439,14 @@ def _merge_node_service(
     depends_on = {k: v for k, v in service.get("depends_on", {}).items() if not k.startswith("ipfs-node")}
     depends_on.setdefault("ttp", {"condition": "service_healthy"})
     depends_on.setdefault("registry", {"condition": "service_healthy"})
-    depends_on[ipfs_service] = {"condition": "service_healthy"}
-    service["depends_on"] = depends_on
+    if ipfs_dependency:
+        depends_on[ipfs_dependency] = {"condition": "service_healthy"}
+    elif "ipfs" in depends_on:
+        depends_on.pop("ipfs", None)
+    if depends_on:
+        service["depends_on"] = depends_on
+    elif "depends_on" in service:
+        service.pop("depends_on", None)
     if image_tag is None:
         service.setdefault("build", DEFAULT_NODE_SERVICE["build"])
     service.setdefault("networks", DEFAULT_NODE_SERVICE["networks"])
@@ -1452,7 +1526,7 @@ def _update_ttp_service(
 def update_compose_file(
     compose_data: Dict[str, Any],
     node_names: List[str],
-    ipfs_services: List[str],
+    ipfs_targets: List[IPFSTarget],
     clique_size: int = 3,
     node_image: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1465,8 +1539,13 @@ def update_compose_file(
     if "node" in services:
         _apply_shared_node_image(services.get("node"), node_image)
     for idx, node_name in enumerate(node_names):
-        ipfs_service = _select_ipfs_service(idx, ipfs_services)
-        services[node_name] = _merge_node_service(node_name, base_node_service, ipfs_service, node_image)
+        ipfs_target = _select_ipfs_target(idx, ipfs_targets)
+        services[node_name] = _merge_node_service(
+            node_name,
+            base_node_service,
+            ipfs_target.dependency,
+            node_image,
+        )
     _update_ttp_service(services, len(node_names), clique_size, node_image)
     return compose_data
 
@@ -1558,7 +1637,25 @@ def main() -> None:
 
     template_config = load_node_template()
     compose_template = load_compose_template(compose_template_path)
-    ipfs_services = _extract_ipfs_services(compose_template)
+    ipfs_mode = args.ipfs_mode
+    if ipfs_mode == "docker":
+        ipfs_service_names = _extract_ipfs_services(compose_template)
+        if not ipfs_service_names:
+            raise SystemExit(
+                f"No IPFS services found in {compose_template_path}. "
+                "Either add ipfs-node services to the compose template or use --ipfs-mode=process.",
+            )
+        ipfs_targets = _build_docker_ipfs_targets(ipfs_service_names)
+    else:
+        _remove_ipfs_services(compose_template)
+        ipfs_targets = _load_process_ipfs_targets(
+            args.ipfs_process_config,
+            client_host_override=args.ipfs_process_client_host,
+        )
+        print(
+            f"Configured {len(ipfs_targets)} external IPFS endpoint(s) from {args.ipfs_process_config} "
+            f"(client host override={args.ipfs_process_client_host or 'auto'})"
+        )
 
     blockchain_paths = _require_blockchain_repo_paths()
     auth_secret = _resolve_auth_secret(blockchain_paths)
@@ -1588,8 +1685,8 @@ def main() -> None:
                 config[scope_key] = scope_value
         if scope_names:
             config["scope_hierarchy"] = list(scope_names)
-        ipfs_service = _select_ipfs_service(idx, ipfs_services)
-        _apply_ipfs_distribution(ipfs_service, config, ipfs_services)
+        ipfs_target = _select_ipfs_target(idx, ipfs_targets)
+        _apply_ipfs_distribution(ipfs_target, config, ipfs_targets)
         _apply_blockchain_identity(idx, config, identity_override=trainer_id)
         config_path = NODES_DIR / f"{container_name}.json"
         config_path.write_text(json.dumps(config, indent=2) + "\n")
@@ -1597,7 +1694,7 @@ def main() -> None:
     updated_compose = update_compose_file(
         compose_template,
         node_names,
-        ipfs_services,
+        ipfs_targets,
         args.clique_size,
         shared_node_image,
     )

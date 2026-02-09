@@ -1,0 +1,44 @@
+{
+  "peer_registry": "data/ipfs/peers",
+  "nodes": [
+    {
+      "name": "ipfs-process-1",
+      "repo": "data/ipfs/node-1",
+      "api_port": 15101,
+      "gateway_port": 18101,
+      "swarm_port": 14101,
+      "api_host": "0.0.0.0",
+      "gateway_host": "0.0.0.0",
+      "swarm_host": "0.0.0.0",
+      "advertise_host": "127.0.0.1",
+      "advertise_proto": "ip4",
+      "client_host": "host.docker.internal"
+    },
+    {
+      "name": "ipfs-process-2",
+      "repo": "data/ipfs/node-2",
+      "api_port": 15102,
+      "gateway_port": 18102,
+      "swarm_port": 14102,
+      "api_host": "0.0.0.0",
+      "gateway_host": "0.0.0.0",
+      "swarm_host": "0.0.0.0",
+      "advertise_host": "127.0.0.1",
+      "advertise_proto": "ip4",
+      "client_host": "host.docker.internal"
+    },
+    {
+      "name": "ipfs-process-3",
+      "repo": "data/ipfs/node-3",
+      "api_port": 15103,
+      "gateway_port": 18103,
+      "swarm_port": 14103,
+      "api_host": "0.0.0.0",
+      "gateway_host": "0.0.0.0",
+      "swarm_host": "0.0.0.0",
+      "advertise_host": "127.0.0.1",
+      "advertise_proto": "ip4",
+      "client_host": "host.docker.internal"
+    }
+  ]
+}

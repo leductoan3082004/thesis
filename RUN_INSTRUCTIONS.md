@@ -80,6 +80,30 @@ docker compose -f docker-compose.auto.yml down -v
 (cd docker && docker compose -f docker-compose.auto.yml down -v && docker compose -f docker-compose.auto.yml up --build -d)
 ```
 
+## Running IPFS Without Docker
+
+If Docker is unavailable (or you want to reuse the host’s Kubo binaries), the IPFS cluster can run as regular processes:
+
+1. Adjust `config/ipfs-process.json` if you need different ports or want the daemons to listen only on `localhost`. Each entry defines the data directory, API/Gateway/Swarm ports, and the client host used inside node configs.
+2. Start the daemons: `python scripts/run_ipfs_processes.py --config config/ipfs-process.json`. Logs stream to `logs/ipfs/ipfs-process-*.log`.
+3. Launch the rest of the system with `make start IPFS_MODE=process` (or call `scripts/run_docker_with_nodes.py --ipfs-mode process ...`). When running the trainer nodes directly on the host, set `IPFS_PROCESS_CLIENT_HOST=localhost` so configs point to `http://127.0.0.1:<api_port>`.
+
+Stop the daemons with Ctrl+C (the script terminates every process). Switching back to Docker simply means rerunning `make start` without `IPFS_MODE=process`.
+
+## Full System with Process-Mode Infrastructure
+
+To launch IPFS and the Hyperledger Fabric stack as host processes (while keeping the FL nodes/monitoring in Docker), use:
+
+```bash
+make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
+```
+
+- `NODES_MAP=config/nodes-map.json` ensures the generator mirrors your hierarchy-aware roster; omit it to fall back to the count inside `config/system-config.json`.
+- `PROCESS_MODE=1` switches orchestration to process mode: `scripts/run_process_mode.py` kills any leftover daemons, clears `thesis-blockchain/api-gateway/process-runner/runtime`, resets `data/trainers.json`, starts IPFS + Fabric processes, signs VCs, builds the bulk payload, registers trainers, and then launches the FL docker compose stack.
+- `NO_BUILD=1` skips rebuilding the shared trainer image—drop it the first time (or whenever Dockerfiles change) so images rebuild as needed.
+
+Fabric logs live under `../thesis-blockchain/api-gateway/process-runner/runtime/logs`, IPFS logs under `logs/ipfs/ipfs-process-*.log`, and the trainer whitelist is written to `../thesis-blockchain/api-gateway/data/trainers.json`. Run `make stop` (or `python scripts/run_process_mode.py stop --skip-ipfs/--skip-blockchain`) to shut everything down cleanly.
+
 ## What You'll See
 
 ### Phase 1: Initialization
