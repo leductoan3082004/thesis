@@ -80,7 +80,7 @@ docker compose -f docker-compose.auto.yml down -v
 (cd docker && docker compose -f docker-compose.auto.yml down -v && docker compose -f docker-compose.auto.yml up --build -d)
 ```
 
-### Running IPFS Without Docker
+## Running IPFS Without Docker
 
 If Docker is unavailable (or you want to reuse the host’s Kubo binaries), the IPFS cluster can run as regular processes:
 
@@ -90,7 +90,7 @@ If Docker is unavailable (or you want to reuse the host’s Kubo binaries), the 
 
 Stop the daemons with Ctrl+C (the script terminates every process). Switching back to Docker simply means rerunning `make start` without `IPFS_MODE=process`.
 
-### Full System with Process-Mode Infrastructure
+## Full System with Process-Mode Infrastructure
 
 To launch IPFS and the Hyperledger Fabric stack as host processes (while keeping the FL nodes/monitoring in Docker), use:
 

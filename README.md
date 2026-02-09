@@ -105,7 +105,7 @@ By default the Compose file starts IPFS inside Docker (`ipfs-node-1..3`). To run
 
 When running training nodes directly on the host, override the client host with `IPFS_PROCESS_CLIENT_HOST=localhost` (or change the `client_host` fields in the JSON) so configs use `http://127.0.0.1:<api_port>`. Switching back to Docker is as simple as stopping the processes and omitting the override.
 
-### Hybrid Process Mode (IPFS + Blockchain on Host, Nodes in Docker)
+## Hybrid Process Mode (IPFS + Blockchain on Host, Nodes in Docker)
 
 If Docker is restricted on your machine but you still want to run the FL nodes inside containers, the stack now supports a “process mode” for the infrastructure components:
 
