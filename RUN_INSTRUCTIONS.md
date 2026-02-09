@@ -80,6 +80,30 @@ docker compose -f docker-compose.auto.yml down -v
 (cd docker && docker compose -f docker-compose.auto.yml down -v && docker compose -f docker-compose.auto.yml up --build -d)
 ```
 
+## Running IPFS Without Docker
+
+If Docker is unavailable (or you want to reuse the host’s Kubo binaries), the IPFS cluster can run as regular processes:
+
+1. Adjust `config/ipfs-process.json` if you need different ports or want the daemons to listen only on `localhost`. Each entry defines the data directory, API/Gateway/Swarm ports, and the client host used inside node configs.
+2. Start the daemons: `python scripts/run_ipfs_processes.py --config config/ipfs-process.json`. Logs stream to `logs/ipfs/ipfs-process-*.log`.
+3. Launch the rest of the system with `make start IPFS_MODE=process` (or call `scripts/run_docker_with_nodes.py --ipfs-mode process ...`). When running the trainer nodes directly on the host, set `IPFS_PROCESS_CLIENT_HOST=localhost` so configs point to `http://127.0.0.1:<api_port>`.
+
+Stop the daemons with Ctrl+C (the script terminates every process). Switching back to Docker simply means rerunning `make start` without `IPFS_MODE=process`.
+
+## Full System with Process-Mode Infrastructure
+
+To launch IPFS and the Hyperledger Fabric stack as host processes (while keeping the FL nodes/monitoring in Docker), use:
+
+```bash
+make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
+```
+
+- `NODES_MAP=config/nodes-map.json` ensures the generator mirrors your hierarchy-aware roster; omit it to fall back to the count inside `config/system-config.json`.
+- `PROCESS_MODE=1` switches orchestration to process mode: `scripts/run_process_mode.py` kills any leftover daemons, clears `thesis-blockchain/api-gateway/process-runner/runtime`, resets `data/trainers.json`, starts IPFS + Fabric processes, signs VCs, builds the bulk payload, registers trainers, and then launches the FL docker compose stack.
+- `NO_BUILD=1` skips rebuilding the shared trainer image—drop it the first time (or whenever Dockerfiles change) so images rebuild as needed.
+
+Fabric logs live under `../thesis-blockchain/api-gateway/process-runner/runtime/logs`, IPFS logs under `logs/ipfs/ipfs-process-*.log`, and the trainer whitelist is written to `../thesis-blockchain/api-gateway/data/trainers.json`. Run `make stop` (or `python scripts/run_process_mode.py stop --skip-ipfs/--skip-blockchain`) to shut everything down cleanly.
+
 ## What You'll See
 
 ### Phase 1: Initialization
@@ -160,6 +184,23 @@ Node configs live under `config/nodes/` and are generated automatically from `co
 - Lower it to `0` to start convergence checks immediately or raise it to defer signals; this replaces the deprecated `CONVERGENCE_WARMUP_ROUNDS` environment override.
 - This is distinct from `MAX_TRAINING_ROUNDS`, which caps the total number of federated rounds.
 - Set `number_of_nodes` in the same file once so Docker launches know how many node configs/services to generate when you omit `--nodes`.
+
+### Hierarchy Settings (State/Nation)
+- `config/system-config.json` contains `hierarchy_levels`, one object per scope (`state`, `nation`, etc.). Each entry controls:
+  - `scope_name` / `scope_id`: identifier used in logs and blockchain queries
+  - `interval_seconds`: timer cadence for triggering rounds
+  - `wait_seconds`: how long nodes poll for the resulting model before resuming training
+  - `max_aggregators`, `fanout_count`: how many candidates rotate through commits and how many fan-out reporters each lower scope provides
+  - Merge policy knobs (`apply_policy`, `apply_alpha`) that govern how nodes blend high-level models (e.g., replace vs interpolate)
+- Edit these values to speed up/slow down state/nation rounds or change how aggressively nodes mix upstream models. Restart nodes to apply changes.
+
+### Nodes Map (`config/nodes-map.json`)
+- Mirrors the hierarchy structure and enumerates which trainers belong to each scope.
+- Update it when adding/removing nodes or introducing a new hierarchy level. The runtime loads this file at startup to:
+  - Derive aggregator candidate rosters and logged “STATE/NATION aggregator candidates …” lines
+  - Determine which clusters feed each state and which states feed each nation
+  - Drive fan-out routing so bridge services know where to send ECMs
+- Keep the scope IDs (`state_id`, `nation_id`, etc.) aligned with `hierarchy_levels` to avoid mismatches.
 
 ### Global Convergence Settings
 - Copy `config/system-config.sample.json` to `config/system-config.json` and edit it to change `enabled`, `tol_abs`, `tol_rel`, or `patience` without touching every node file. The resolved file is gitignored so you can keep environment-specific thresholds private.

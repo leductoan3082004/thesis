@@ -23,6 +23,7 @@
     "topology_file": "/app/config/topology.json",
     "ipfs": {
       "api_url": "http://ipfs-node-1:5001",
+      "replica_api_urls": [],
       "timeout": 30.0,
       "max_retries": 5,
       "retry_delay": 2.0

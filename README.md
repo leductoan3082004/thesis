@@ -12,7 +12,7 @@ A complete implementation of privacy-preserving federated learning using the sec
 - **Blockchain Integration**: Hyperledger Fabric for trainer identity and model registry
 - **Docker Deployment**: One-command launch of entire federated network
 - **Monitoring**: Prometheus metrics and Grafana dashboards
-- **gRPC Communication**: Efficient, type-safe distributed protocol
+- **gRPC Communication**: Efficient, type-safe distributed protocol with 200MB message budgets (override via `GRPC_MAX_MESSAGE_MB`) so large model updates flow without truncation
 - **MNIST Demonstration**: Complete end-to-end training example
 
 ## Prerequisites
@@ -47,6 +47,9 @@ make logs
 
 # Stop all services
 make stop
+
+# Run IPFS + blockchain as host processes, FL stack in Docker
+make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
 ```
 
 ### Available Make Targets
@@ -92,6 +95,59 @@ python scripts/prepare_data.py
 python scripts/run_docker_with_nodes.py --nodes 6
 ```
 
+### IPFS Deployment Options
+
+By default the Compose file starts IPFS inside Docker (`ipfs-node-1..3`). To run the same cluster as host processes instead:
+
+- Edit `config/ipfs-process.json` if you need different ports or want the daemons to bind only to `localhost`.
+- Launch the processes with `python scripts/run_ipfs_processes.py --config config/ipfs-process.json`. Logs stream to `logs/ipfs/` and Ctrl+C stops every daemon.
+- Run the rest of the stack with `make start IPFS_MODE=process` (or pass `--ipfs-mode process` to `scripts/run_docker_with_nodes.py`). The generator will point node configs at the client URLs derived from the process config instead of the Docker service names.
+
+When running training nodes directly on the host, override the client host with `IPFS_PROCESS_CLIENT_HOST=localhost` (or change the `client_host` fields in the JSON) so configs use `http://127.0.0.1:<api_port>`. Switching back to Docker is as simple as stopping the processes and omitting the override.
+
+## Hybrid Process Mode (IPFS + Blockchain on Host, Nodes in Docker)
+
+If Docker is restricted on your machine but you still want to run the FL nodes inside containers, the stack now supports a “process mode” for the infrastructure components:
+
+```bash
+make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
+```
+
+- `NODES_MAP=config/nodes-map.json` tells the generator to derive the fleet from the hierarchy-aware roster (trainer IDs, scope assignments, etc.). Omit it to fall back to `config/system-config.json:number_of_nodes`.
+- `PROCESS_MODE=1` switches IPFS + Hyperledger Fabric (orderer, peers, API gateway, IPFS daemons) to host processes. The Makefile automatically points trainer configs at `host.docker.internal` so Dockerized nodes can reach them.
+- `NO_BUILD=1` skips rebuilding the shared trainer image; drop the flag the first time or after Dockerfile changes.
+
+During this flow `scripts/run_process_mode.py`:
+1. Stops any leftover dockerized FL nodes, IPFS daemons, and Fabric processes.
+2. Regenerates node configs/topology/Prometheus files just like the Docker path.
+3. Launches the IPFS daemons and Fabric process runner, signs VCs, builds a bulk registration payload, and whitelists every trainer via `/auth/register-trainers`.
+4. Starts the FL docker compose stack with the freshly generated configuration.
+
+Fabric logs live under `../thesis-blockchain/api-gateway/process-runner/runtime/logs`, IPFS logs under `logs/ipfs`, and the trainer whitelist at `../thesis-blockchain/api-gateway/data/trainers.json`. Run `make stop` to tear everything down.
+
+#### Quick Test of the Process-Based IPFS Cluster
+
+```bash
+# Terminal A: add a file via ipfs-process-1 (API port 15101)
+echo "hello from process mode" > /tmp/hello.txt
+curl -s -X POST "http://127.0.0.1:15101/api/v0/add" \
+     -F file=@/tmp/hello.txt | tee /tmp/ipfs-add.json
+CID=$(jq -r '.Hash' /tmp/ipfs-add.json)
+echo "Stored CID: $CID"
+
+# (optional) announce it on the routing API so replicas learn about it quickly
+curl -s -X POST "http://127.0.0.1:15101/api/v0/routing/provide?arg=$CID&recursive=true"
+
+# Terminal B: fetch the payload through ipfs-process-2 (port 15102)
+curl -s -X POST "http://127.0.0.1:15102/api/v0/cat?arg=$CID"
+
+# Optional health checks
+curl -s -X POST "http://127.0.0.1:15101/api/v0/swarm/peers?verbose=true" | jq '.Peers | length'
+curl -s -X POST "http://127.0.0.1:15101/api/v0/refs/local" | head
+```
+
+All Kubo HTTP API calls require `-X POST`, even for reads like `cat` or `refs`. You can also point the CLI at one of the host repos (`export IPFS_PATH=data/ipfs/node-1`) and run `ipfs add`, `ipfs cat`, or `ipfs dht provide` directly if you prefer.
+
 ## System Behavior
 
 The system automatically:
@@ -102,6 +158,23 @@ The system automatically:
 5. Spawns N federated nodes with partitioned MNIST data
 6. Runs federated training with secure aggregation
 7. Logs accuracy improvements after each round
+
+## Hierarchy Warm-Start & Scope Fetch Flow
+
+- **Startup warm-start:** when each node boots it immediately queries the blockchain gateway for every scope it belongs to (cluster/state/nation). If the gateway returns 404 you will now see `~ BLOCKCHAIN ~ No STATE model available yet for state=...`, which simply means there is nothing to merge yet.
+- **Aggregator candidates:** the node logs `STATE/NATION aggregator candidates for <scope_id>` plus their bridge addresses so you can confirm the roster that high-level rounds will rotate through.
+- **Wait windows:** after a state/nation round commits, all participants wait for the configured `wait_seconds` (see `config/system-config.json`) unless a fresh anchor is observed sooner. The committing aggregator now bypasses the rest of the wait window by reusing the CID/hash it just published, but it still refetches the model via the gateway/IPFS path so integrity checks and merge policies remain uniform.
+- **Follower polling:** during the wait window followers poll the latest-model endpoint every 5 seconds. If the CID matches what’s already been applied you will see `No new STATE model available...`; polling continues until a new CID shows up or the window expires.
+
+## Tutorial: Inspecting Hierarchy Activity
+
+1. **Start the stack:** `make start` (or your preferred combination of `make start-*` targets).
+2. **Watch a node:** `make logs-node NODE=0` to tail trainer-node-001.
+3. **Confirm roster discovery:** look for `STATE aggregator candidates for state_alpha: ...` and the companion address log. These come from `NodeService` once the participant map and topology metadata are loaded.
+4. **Observe a high-level round:** when the timer fires you will see `STATE Round N` banners. The assigned aggregator logs `STATE round N committed by trainer-node-XXX ...` followed by `STATE aggregator candidate addresses: ...`.
+5. **Verify warm-start fetches:** after the commit, the node should either log `Applied STATE model round N ...` (new CID) or `No new STATE model available...` (already merged). To shorten or lengthen the delay before these fetches, edit the `wait_seconds` field for the relevant `hierarchy_levels` entry in `config/system-config.json` and restart the nodes.
+
+Following the above steps lets you validate that hierarchy warm-starting, aggregator rotation, and propagation delays behave as expected without diving into the code.
 
 ## Expected Output
 
@@ -213,6 +286,36 @@ Set the target fleet size via `number_of_nodes` in `config/system-config.json`. 
 Copy `config/system-config.sample.json` to `config/system-config.json` to configure:
 - Convergence detection: `enabled`, `warmup_rounds`, `tol_abs`, `tol_rel`, `patience`
 - Fleet size: `number_of_nodes` for Docker launches
+- Hierarchy behavior: tweak the `hierarchy_levels` array to change scope identifiers, timer intervals, wait windows, and merge policies (`apply_policy`, `apply_alpha`, `fanout_count`, `max_aggregators`). Edit these values to speed up/slow down state or nation rounds or to adjust the interpolation rules applied when nodes pull a high-level model.
+
+### Hierarchy Rosters (`config/nodes-map.json`)
+
+The nodes map mirrors your hierarchy levels and defines which trainers participate in each scope:
+
+```json
+{
+  "nation": [
+    {
+      "nation_id": "nation_0",
+      "states": [
+        {
+          "state_id": "state_alpha",
+          "clusters": [
+            {
+              "cluster_id": "cluster_0",
+              "nodes": ["trainer-node-001", "trainer-node-002"]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+- Update this file when adding/removing nodes or introducing new scopes (e.g., `region`).  
+- The runtime ingests it at startup to build aggregator candidate pools, determine fan-out responsibilities, and map each node to its state/nation IDs.  
+- Keep the keys (`nation_id`, `state_id`, `cluster_id`) in sync with the `scope_id` values declared in `config/system-config.json`.
 
 ### Dataset Configuration
 
@@ -350,6 +453,10 @@ If you see `ModuleNotFoundError: No module named 'secureagg_pb2'`:
 sed -i '' 's/^import secureagg_pb2/from . import secureagg_pb2/' \
     src/secure_aggregation/communication/secureagg_pb2_grpc.py
 ```
+
+### gRPC Message Size Configuration
+
+Aggregator RPC servers and clients now set `grpc.max_send_message_length` and `grpc.max_receive_message_length` to 200 MB so CIFAR-scale models fit inside SAP Round 2 payloads. Export `GRPC_MAX_MESSAGE_MB=<megabytes>` before starting services to customize this ceiling.
 
 ### Port Conflicts
 

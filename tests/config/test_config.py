@@ -15,7 +15,7 @@ def test_scenario_defaults_and_validation() -> None:
         "timeouts": {"advertise_keys": 10},
     }
     scenario = ScenarioConfig.from_dict(data)
-    assert scenario.inter_clique_edges == "small_world"
+    assert scenario.inter_clique_edges == "ring_extra"
     assert scenario.timeouts.advertise_keys == 10.0
     assert scenario.timeouts.share_keys == 5.0  # default
 

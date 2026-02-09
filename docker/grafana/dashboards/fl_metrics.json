@@ -1417,24 +1417,6 @@
           "expr": "fl_accuracy{clique_id=\"0\", node_id=\"node_2\", dataset=\"test\"} * 100",
           "refId": "node_2",
           "legendFormat": "node_2"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"0\", node_id=\"node_3\", dataset=\"test\"} * 100",
-          "refId": "node_3",
-          "legendFormat": "node_3"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"0\", node_id=\"node_4\", dataset=\"test\"} * 100",
-          "refId": "node_4",
-          "legendFormat": "node_4"
         }
       ]
     },
@@ -1532,24 +1514,6 @@
           "expr": "fl_delta_norm{clique_id=\"0\", node_id=\"node_2\"}",
           "refId": "node_2",
           "legendFormat": "node_2"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"0\", node_id=\"node_3\"}",
-          "refId": "node_3",
-          "legendFormat": "node_3"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"0\", node_id=\"node_4\"}",
-          "refId": "node_4",
-          "legendFormat": "node_4"
         }
       ]
     },
@@ -2230,45 +2194,27 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
+          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_3\", dataset=\"test\"} * 100",
+          "refId": "node_3",
+          "legendFormat": "node_3"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_4\", dataset=\"test\"} * 100",
+          "refId": "node_4",
+          "legendFormat": "node_4"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
           "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_5\", dataset=\"test\"} * 100",
           "refId": "node_5",
           "legendFormat": "node_5"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_6\", dataset=\"test\"} * 100",
-          "refId": "node_6",
-          "legendFormat": "node_6"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_7\", dataset=\"test\"} * 100",
-          "refId": "node_7",
-          "legendFormat": "node_7"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_8\", dataset=\"test\"} * 100",
-          "refId": "node_8",
-          "legendFormat": "node_8"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"1\", node_id=\"node_9\", dataset=\"test\"} * 100",
-          "refId": "node_9",
-          "legendFormat": "node_9"
         }
       ]
     },
@@ -2345,45 +2291,27 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
+          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_3\"}",
+          "refId": "node_3",
+          "legendFormat": "node_3"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
+          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_4\"}",
+          "refId": "node_4",
+          "legendFormat": "node_4"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "DS_PROMETHEUS"
+          },
           "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_5\"}",
           "refId": "node_5",
           "legendFormat": "node_5"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_6\"}",
-          "refId": "node_6",
-          "legendFormat": "node_6"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_7\"}",
-          "refId": "node_7",
-          "legendFormat": "node_7"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_8\"}",
-          "refId": "node_8",
-          "legendFormat": "node_8"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"1\", node_id=\"node_9\"}",
-          "refId": "node_9",
-          "legendFormat": "node_9"
         }
       ]
     },
@@ -3064,45 +2992,27 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_10\", dataset=\"test\"} * 100",
-          "refId": "node_10",
-          "legendFormat": "node_10"
+          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_6\", dataset=\"test\"} * 100",
+          "refId": "node_6",
+          "legendFormat": "node_6"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_11\", dataset=\"test\"} * 100",
-          "refId": "node_11",
-          "legendFormat": "node_11"
+          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_7\", dataset=\"test\"} * 100",
+          "refId": "node_7",
+          "legendFormat": "node_7"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_12\", dataset=\"test\"} * 100",
-          "refId": "node_12",
-          "legendFormat": "node_12"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_13\", dataset=\"test\"} * 100",
-          "refId": "node_13",
-          "legendFormat": "node_13"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_14\", dataset=\"test\"} * 100",
-          "refId": "node_14",
-          "legendFormat": "node_14"
+          "expr": "fl_accuracy{clique_id=\"2\", node_id=\"node_8\", dataset=\"test\"} * 100",
+          "refId": "node_8",
+          "legendFormat": "node_8"
         }
       ]
     },
@@ -3179,45 +3089,27 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_10\"}",
-          "refId": "node_10",
-          "legendFormat": "node_10"
+          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_6\"}",
+          "refId": "node_6",
+          "legendFormat": "node_6"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_11\"}",
-          "refId": "node_11",
-          "legendFormat": "node_11"
+          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_7\"}",
+          "refId": "node_7",
+          "legendFormat": "node_7"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_12\"}",
-          "refId": "node_12",
-          "legendFormat": "node_12"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_13\"}",
-          "refId": "node_13",
-          "legendFormat": "node_13"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_14\"}",
-          "refId": "node_14",
-          "legendFormat": "node_14"
+          "expr": "fl_delta_norm{clique_id=\"2\", node_id=\"node_8\"}",
+          "refId": "node_8",
+          "legendFormat": "node_8"
         }
       ]
     },
@@ -3898,45 +3790,27 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_15\", dataset=\"test\"} * 100",
-          "refId": "node_15",
-          "legendFormat": "node_15"
+          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_10\", dataset=\"test\"} * 100",
+          "refId": "node_10",
+          "legendFormat": "node_10"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_16\", dataset=\"test\"} * 100",
-          "refId": "node_16",
-          "legendFormat": "node_16"
+          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_11\", dataset=\"test\"} * 100",
+          "refId": "node_11",
+          "legendFormat": "node_11"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_17\", dataset=\"test\"} * 100",
-          "refId": "node_17",
-          "legendFormat": "node_17"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_18\", dataset=\"test\"} * 100",
-          "refId": "node_18",
-          "legendFormat": "node_18"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_19\", dataset=\"test\"} * 100",
-          "refId": "node_19",
-          "legendFormat": "node_19"
+          "expr": "fl_accuracy{clique_id=\"3\", node_id=\"node_9\", dataset=\"test\"} * 100",
+          "refId": "node_9",
+          "legendFormat": "node_9"
         }
       ]
     },
@@ -4013,45 +3887,27 @@
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_15\"}",
-          "refId": "node_15",
-          "legendFormat": "node_15"
+          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_10\"}",
+          "refId": "node_10",
+          "legendFormat": "node_10"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_16\"}",
-          "refId": "node_16",
-          "legendFormat": "node_16"
+          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_11\"}",
+          "refId": "node_11",
+          "legendFormat": "node_11"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "DS_PROMETHEUS"
           },
-          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_17\"}",
-          "refId": "node_17",
-          "legendFormat": "node_17"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_18\"}",
-          "refId": "node_18",
-          "legendFormat": "node_18"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "DS_PROMETHEUS"
-          },
-          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_19\"}",
-          "refId": "node_19",
-          "legendFormat": "node_19"
+          "expr": "fl_delta_norm{clique_id=\"3\", node_id=\"node_9\"}",
+          "refId": "node_9",
+          "legendFormat": "node_9"
         }
       ]
     },

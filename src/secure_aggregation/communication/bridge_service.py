@@ -7,7 +7,7 @@ Bridge nodes use this service to:
 """
 
 from concurrent import futures
-from typing import Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import grpc
 
@@ -16,15 +16,29 @@ from secure_aggregation.node import ECM, ECMBuffer
 from secure_aggregation.utils import get_logger
 
 logger = get_logger("bridge_service")
+STATE_CHANNEL_PREFIX = "state::"
 
 
 class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
     """gRPC servicer for receiving ECMs from neighbor clusters."""
 
-    def __init__(self, node_id: str, ecm_buffer: ECMBuffer) -> None:
+    def __init__(
+        self,
+        node_id: str,
+        ecm_buffer: ECMBuffer,
+        ecm_hooks: Optional[Iterable[Callable[[ECM], None]]] = None,
+    ) -> None:
         self.node_id = node_id
         self.ecm_buffer = ecm_buffer
+        self._ecm_hooks = list(ecm_hooks or [])
         logger.info(f"BridgeServicer initialized for node {node_id}")
+
+    def _emit_hooks(self, ecm: ECM) -> None:
+        for hook in self._ecm_hooks:
+            try:
+                hook(ecm)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Bridge ECM hook raised error: %s", exc)
 
     def SubmitECMs(
         self,
@@ -39,6 +53,7 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
                 source_cluster=ecm_msg.source_cluster,
             )
             self.ecm_buffer.add(ecm)
+            self._emit_hooks(ecm)
             logger.debug(f"Received ECM submission: cid={ecm.cid[:8]}...")
 
         return secureagg_pb2.ECMSubmitResponse(
@@ -51,9 +66,10 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
         request: secureagg_pb2.ECMBroadcast,
         context,
     ) -> secureagg_pb2.ECMSubmitResponse:
-        """Receive ECM broadcast from neighbor cluster with convergence status."""
+        """Receive ECM broadcast from neighbor cluster."""
         cid = request.cid or f"signal::{request.cluster_id}::{request.round}"
-        if request.convergence_data_id and not request.cid:
+        is_state_channel = request.cluster_id.startswith(STATE_CHANNEL_PREFIX)
+        if request.convergence_data_id and not request.cid and not is_state_channel:
             cid = f"signal::convergence::{request.convergence_data_id}"
         is_signal = cid.startswith("signal::")
         ecm = ECM(
@@ -67,11 +83,12 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
             convergence_data_id=request.convergence_data_id or None,
         )
         self.ecm_buffer.add(ecm)
-        logger.info(
-            f"Received ECM from cluster {request.cluster_id} "
-            f"round {request.round}: cid={request.cid[:8]}... "
-            f"(converged={request.cluster_converged}, data_id={request.convergence_data_id or 'N/A'})"
-        )
+        self._emit_hooks(ecm)
+        if not is_signal:
+            logger.info(
+                f"Received ECM from cluster {request.cluster_id} "
+                f"round {request.round}: cid={request.cid[:8]}..."
+            )
 
         return secureagg_pb2.ECMSubmitResponse(
             accepted=True,
@@ -151,24 +168,28 @@ class BridgeClient:
             if self.send_ecm(addr, cluster_id, round_num, cid, model_hash):
                 accepted += 1
 
-        logger.info(
-            f"Broadcast ECM to {accepted}/{len(neighbor_addresses)} neighbors "
-            f"(cluster={cluster_id}, round={round_num})"
-        )
+        if cluster_id.startswith(STATE_CHANNEL_PREFIX):
+            logger.info(
+                f"Broadcast state artifact to {accepted}/{len(neighbor_addresses)} neighbors "
+                f"(state={cluster_id}, round={round_num})"
+            )
+        else:
+            logger.info(
+                f"Broadcast ECM to {accepted}/{len(neighbor_addresses)} neighbors "
+                f"(cluster={cluster_id}, round={round_num})"
+            )
         return accepted
 
-    def send_ecm_with_convergence(
+    def send_ecm_with_metadata(
         self,
         neighbor_address: str,
         cluster_id: str,
         round_num: int,
         cid: str,
         model_hash: str,
-        cluster_converged: bool,
-        cluster_delta_norm: float,
-        convergence_data_id: Optional[str] = None,
+        metadata: Optional[str] = None,
     ) -> bool:
-        """Send ECM with convergence status to a neighbor cluster bridge node."""
+        """Send ECM with auxiliary metadata (used for state artifacts)."""
         try:
             stub = self._get_stub(neighbor_address)
             request = secureagg_pb2.ECMBroadcast(
@@ -176,54 +197,55 @@ class BridgeClient:
                 round=round_num,
                 cid=cid,
                 hash=model_hash,
-                cluster_converged=cluster_converged,
-                cluster_delta_norm=cluster_delta_norm,
-                convergence_data_id=convergence_data_id or "",
+                convergence_data_id=metadata or "",
             )
             response = stub.ReceiveECM(request, timeout=10)
             if response.accepted:
-                logger.debug(f"ECM with convergence sent to {neighbor_address}")
+                logger.debug(f"ECM with metadata sent to {neighbor_address}")
             return response.accepted
         except grpc.RpcError as e:
             logger.warning(f"Failed to send ECM to {neighbor_address}: {e}")
             return False
 
-    def broadcast_ecm_with_convergence(
+    def broadcast_ecm_with_metadata(
         self,
         neighbor_addresses: List[str],
         cluster_id: str,
         round_num: int,
         cid: str,
         model_hash: str,
-        cluster_converged: bool,
-        cluster_delta_norm: float,
-        convergence_data_id: Optional[str] = None,
+        metadata: Optional[str] = None,
     ) -> int:
-        """
-        Broadcast ECM with convergence status to all neighbor cluster bridge nodes.
-
-        Returns:
-            Number of neighbors that accepted the ECM.
-        """
+        """Broadcast ECM with optional metadata to all neighbor bridge nodes."""
         accepted = 0
         for addr in neighbor_addresses:
-            if self.send_ecm_with_convergence(
+            if self.send_ecm_with_metadata(
                 addr,
                 cluster_id,
                 round_num,
                 cid,
                 model_hash,
-                cluster_converged,
-                cluster_delta_norm,
-                convergence_data_id=convergence_data_id,
+                metadata=metadata,
             ):
                 accepted += 1
-
-        logger.info(
-            f"Broadcast ECM with convergence to {accepted}/{len(neighbor_addresses)} neighbors "
-            f"(cluster={cluster_id}, round={round_num}, converged={cluster_converged})"
-        )
         return accepted
+
+    def wait_for_ready(self, address: str, timeout: float = 2.0) -> bool:
+        """Return True if the target bridge endpoint responds within timeout."""
+        try:
+            stub = self._get_stub(address)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to create bridge stub for %s: %s", address, exc)
+            return False
+        channel = self._channels.get(address)
+        if channel is None:
+            return False
+        try:
+            grpc.channel_ready_future(channel).result(timeout=timeout)
+            return True
+        except grpc.FutureTimeoutError:
+            logger.warning("Bridge peer %s not ready after %.1fs", address, timeout)
+            return False
 
     def close(self) -> None:
         """Close all channels."""
@@ -237,9 +259,10 @@ def serve_bridge(
     node_id: str,
     port: int,
     ecm_buffer: ECMBuffer,
+    ecm_hooks: Optional[Iterable[Callable[[ECM], None]]] = None,
 ) -> grpc.Server:
     """Start the bridge gRPC server."""
-    servicer = BridgeServicer(node_id, ecm_buffer)
+    servicer = BridgeServicer(node_id, ecm_buffer, ecm_hooks=ecm_hooks)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     secureagg_pb2_grpc.add_BridgeServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")

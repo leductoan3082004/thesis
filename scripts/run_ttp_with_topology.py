@@ -5,25 +5,118 @@ import argparse
 import json
 import os
 from pathlib import Path
-
-from torchvision import datasets, transforms
+from typing import Mapping, Optional
 
 from secure_aggregation.communication.ttp_service import TopologyConfig, serve
-from secure_aggregation.data import dirichlet_partition
+from secure_aggregation.data import dirichlet_partition, load_torchvision_labels
 from secure_aggregation.topology import build_full_topology, compute_node_labels_from_partition
 from secure_aggregation.utils import configure_logging, get_logger
 
 logger = get_logger("ttp_startup")
 
 
-def load_mnist_labels(data_dir: str = "/app/data") -> dict[int, int]:
-    """Load MNIST dataset labels."""
-    logger.info(f"Loading MNIST labels from {data_dir}")
-    tform = transforms.Compose([transforms.ToTensor()])
-    train_ds = datasets.MNIST(root=data_dir, train=True, download=True, transform=tform)
-    labels = {i: int(train_ds[i][1]) for i in range(len(train_ds))}
-    logger.info(f"Loaded {len(labels)} MNIST labels")
+def detect_dataset_name_from_nodes(num_clients: int) -> Optional[str]:
+    """Best-effort detection of dataset name from node configs."""
+    nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+    if not nodes_dir.exists():
+        return None
+    for idx in range(num_clients):
+        node_file = nodes_dir / f"node_{idx}.json"
+        if not node_file.exists():
+            continue
+        try:
+            data = json.loads(node_file.read_text())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to parse %s for dataset detection: %s", node_file, exc)
+            continue
+        dataset_cfg = data.get("dataset")
+        if isinstance(dataset_cfg, Mapping):
+            name = dataset_cfg.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return None
+
+
+def load_dataset_labels(dataset_name: str, data_dir: str = "/app/data") -> dict[int, int]:
+    """Load torchvision dataset labels for topology generation."""
+    normalized = dataset_name.strip().lower()
+    logger.info("Loading %s labels from %s", normalized, data_dir)
+    labels = load_torchvision_labels(normalized, data_dir)
+    logger.info("Loaded %d labels for %s", len(labels), normalized)
     return labels
+
+
+def load_node_alias_map(num_clients: int) -> dict[str, str]:
+    """
+    Load mapping from canonical node_X identifiers to runtime node IDs.
+
+    This mirrors the logic in the TTP service so that auxiliary artifacts
+    (like the topology file) use the same identifiers that nodes expect.
+    """
+    nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+    if not nodes_dir.exists():
+        logger.warning("NODE_CONFIG_DIR %s does not exist; topology will use canonical IDs", nodes_dir)
+        return {}
+    alias_map: dict[str, str] = {}
+    for idx in range(num_clients):
+        node_file = nodes_dir / f"node_{idx}.json"
+        if not node_file.exists():
+            continue
+        try:
+            data = json.loads(node_file.read_text())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to parse node config %s: %s", node_file, exc)
+            continue
+        alias = data.get("node_id") or data.get("trainer_id")
+        if alias:
+            alias_map[f"node_{idx}"] = str(alias)
+    if alias_map:
+        logger.info("Loaded %d node aliases for topology remapping", len(alias_map))
+    else:
+        logger.warning("No node aliases found; topology will use canonical node_X identifiers")
+    return alias_map
+
+
+def load_node_scope_assignments(num_clients: int) -> dict[str, str]:
+    """Load mapping from canonical node_X identifiers to their primary scope."""
+    nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+    if not nodes_dir.exists():
+        return {}
+    assignments: dict[str, str] = {}
+    for idx in range(num_clients):
+        node_file = nodes_dir / f"node_{idx}.json"
+        if not node_file.exists():
+            continue
+        try:
+            data = json.loads(node_file.read_text())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to parse node config %s for scope metadata: %s", node_file, exc)
+            continue
+        hierarchy = data.get("scope_hierarchy")
+        primary_scope: Optional[str] = None
+        if isinstance(hierarchy, list) and hierarchy:
+            candidate = str(hierarchy[0]).strip()
+            if candidate:
+                primary_scope = candidate.lower()
+        scopes = data.get("scope_assignments") or {}
+        scope_value: Optional[str] = None
+        search_keys = [primary_scope] if primary_scope else []
+        if "state" not in search_keys:
+            search_keys.append("state")
+        for key in search_keys:
+            if not key:
+                continue
+            value = scopes.get(key)
+            if value:
+                scope_value = str(value).strip()
+                break
+        if not scope_value:
+            fallback = data.get("state_id") or data.get("state")
+            if fallback:
+                scope_value = str(fallback).strip()
+        if scope_value:
+            assignments[f"node_{idx}"] = scope_value
+    return assignments
 
 
 def write_topology_file(
@@ -49,19 +142,31 @@ def write_topology_file(
     partition = {f"node_{key.split('_')[-1]}": value for key, value in partition.items()}
     node_labels = compute_node_labels_from_partition(partition, labels)
 
+    scope_assignments = load_node_scope_assignments(num_clients)
+
     cliques, intra_edges, inter_edges, edge_counts = build_full_topology(
         node_labels=node_labels,
         clique_size=clique_size,
         iterations=iterations,
         edge_mode=edge_mode,
         seed=seed,
+        node_scope_assignments=scope_assignments,
     )
 
+    alias_map = load_node_alias_map(num_clients)
+
+    def _remap(node_id: str) -> str:
+        return alias_map.get(node_id, node_id)
+
+    remapped_cliques = [sorted(_remap(node) for node in clique) for clique in cliques]
+    remapped_edges = [(_remap(a), _remap(b)) for a, b in inter_edges]
+    remapped_edge_counts = {_remap(node): count for node, count in edge_counts.items()}
+
     topology_data = {
-        "num_cliques": len(cliques),
-        "cliques": [sorted(list(c)) for c in cliques],
-        "inter_edges": [[e[0], e[1]] for e in inter_edges],
-        "edge_counts": edge_counts,
+        "num_cliques": len(remapped_cliques),
+        "cliques": remapped_cliques,
+        "inter_edges": [[a, b] for a, b in remapped_edges],
+        "edge_counts": remapped_edge_counts,
         "topology_type": "d_cliques",
     }
 
@@ -84,9 +189,10 @@ def main():
     parser.add_argument("--clique-size", type=int, default=4, help="Clique size")
     parser.add_argument("--alpha", type=float, default=0.5, help="Dirichlet alpha")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--edge-mode", type=str, default="small_world", help="Inter-clique edge mode")
+    parser.add_argument("--edge-mode", type=str, default="ring_extra", help="Inter-clique edge mode")
     parser.add_argument("--iterations", type=int, default=1000, help="Topology iterations")
     parser.add_argument("--data-dir", type=str, default="/app/data", help="Data directory")
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset name (default: detect or mnist)")
     parser.add_argument("--config", type=str, help="JSON config file (overrides CLI args)")
     parser.add_argument("--topology-output", type=str, default="/app/config/topology.json",
                         help="Path to write topology config for nodes")
@@ -119,8 +225,15 @@ def main():
 
     logger.info(f"Starting TTP with topology: num_clients={num_clients}, clique_size={clique_size}, alpha={alpha}")
 
-    # Load MNIST labels
-    labels = load_mnist_labels(args.data_dir)
+    dataset_name = args.dataset or os.environ.get("DATASET_NAME")
+    if not dataset_name:
+        detected = detect_dataset_name_from_nodes(num_clients)
+        if detected:
+            logger.info("Detected dataset '%s' from node configs", detected)
+            dataset_name = detected
+    dataset_name = (dataset_name or "mnist").lower()
+
+    labels = load_dataset_labels(dataset_name, args.data_dir)
 
     # Write topology file for nodes to read inter_edges
     write_topology_file(

@@ -54,7 +54,9 @@ Thumbs.db
 # Config
 config/keys/
 config/system-config.json
+config/nodes-map.json
 docker/docker-compose.auto.yml
 nodes/
 
 pr-not-push.md
+report/

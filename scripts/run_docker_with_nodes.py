@@ -7,15 +7,17 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import shlex
+from dataclasses import dataclass
 from copy import deepcopy
 from http import client as http_client
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -30,6 +32,7 @@ except ImportError as exc:  # pragma: no cover - dependency guard
 # Add src to path for topology import
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from secure_aggregation.topology import generate_preliminary_topology
+from secure_aggregation.state.nodes_map import load_nodes_map
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -40,6 +43,7 @@ NODE_TEMPLATE_PATH = ROOT_DIR / "config" / "node.config.template.json"
 NODES_DIR = ROOT_DIR / "config" / "nodes"
 KEYS_DIR = ROOT_DIR / "config" / "keys"
 TOPOLOGY_FILE = ROOT_DIR / "config" / "topology.json"
+NODES_MAP_FILE = ROOT_DIR / "config" / "nodes-map.json"
 PROMETHEUS_CONFIG = ROOT_DIR / "docker" / "prometheus" / "prometheus.yml"
 SYSTEM_CONFIG_FILENAME = "system-config.json"
 SYSTEM_CONFIG_ENV_VAR = "SYSTEM_CONFIG_PATH"
@@ -82,6 +86,16 @@ CA_PORT = "7054"
 DEFAULT_GATEWAY_URL = os.environ.get("BLOCKCHAIN_GATEWAY_URL", "http://localhost:9000")
 GATEWAY_HEALTH_PATH = "/health"
 GATEWAY_BULK_PATH = "/auth/register-trainers"
+NODE_IMAGE_TAG = os.environ.get("SECUREAGG_NODE_IMAGE", "secureagg-node:latest")
+NODE_DOCKERFILE = ROOT_DIR / "docker" / "node.Dockerfile"
+DEFAULT_IPFS_PROCESS_CONFIG = ROOT_DIR / "config" / "ipfs-process.json"
+
+
+@dataclass(frozen=True)
+class IPFSTarget:
+    name: str
+    api_url: str
+    dependency: Optional[str] = None
 
 
 DEFAULT_NODE_SERVICE: Dict[str, Any] = {
@@ -162,6 +176,38 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Size of each clique in the D-Cliques topology (default: 3).",
     )
+    parser.add_argument(
+        "--nodes-map",
+        "--state-map",
+        dest="nodes_map",
+        type=Path,
+        help="Optional JSON file describing hierarchical scope membership "
+        "(legacy flag --state-map retained for backward compatibility). "
+        "Overrides --nodes and system-config counts when provided.",
+    )
+    parser.add_argument(
+        "--blockchain-only",
+        action="store_true",
+        help="Prepare artifacts and start only the blockchain/api-gateway stack.",
+    )
+    parser.add_argument(
+        "--ipfs-mode",
+        choices=("docker", "process"),
+        default=os.environ.get("IPFS_MODE", "docker"),
+        help="Select how IPFS endpoints are provisioned: docker containers (default) or host processes.",
+    )
+    parser.add_argument(
+        "--ipfs-process-config",
+        type=Path,
+        default=DEFAULT_IPFS_PROCESS_CONFIG,
+        help="When --ipfs-mode=process, path to the JSON definition for IPFS processes.",
+    )
+    parser.add_argument(
+        "--ipfs-process-client-host",
+        type=str,
+        help="Override the client-facing host for IPFS API URLs when --ipfs-mode=process "
+        "(defaults to the per-node 'client_host' in the config file).",
+    )
     return parser.parse_args()
 
 
@@ -184,21 +230,30 @@ def _ipfs_sort_key(service_name: str) -> Tuple[int, str]:
         return sys.maxsize, service_name
 
 
-def _select_ipfs_service(node_index: int, services: List[str]) -> str:
-    if not services:
-        raise SystemExit("No IPFS services defined in docker-compose template.")
-    return services[node_index % len(services)]
+def _select_ipfs_target(node_index: int, targets: List[IPFSTarget]) -> IPFSTarget:
+    if not targets:
+        raise SystemExit("No IPFS endpoints defined. Check your docker-compose template or IPFS process config.")
+    return targets[node_index % len(targets)]
 
 
-def _apply_ipfs_distribution(ipfs_service: str, config: Dict[str, Any]) -> None:
+def _apply_ipfs_distribution(ipfs_target: IPFSTarget, config: Dict[str, Any], all_targets: List[IPFSTarget]) -> None:
     inter_cluster = config.setdefault("inter_cluster", {})
     ipfs_section = inter_cluster.setdefault("ipfs", {})
-    ipfs_section["api_url"] = f"http://{ipfs_service}:5001"
+    ipfs_section["api_url"] = ipfs_target.api_url
+    replicas = [target.api_url for target in all_targets if target is not ipfs_target]
+    if replicas:
+        ipfs_section["replica_api_urls"] = replicas
+    elif "replica_api_urls" in ipfs_section:
+        del ipfs_section["replica_api_urls"]
 
 
-def _apply_blockchain_identity(node_index: int, config: Dict[str, Any]) -> None:
+def _apply_blockchain_identity(
+    node_index: int,
+    config: Dict[str, Any],
+    identity_override: Optional[str] = None,
+) -> None:
     suffix = f"{node_index + 1:03d}"
-    identity = f"trainer-node-{suffix}"
+    identity = identity_override or f"trainer-node-{suffix}"
     inter_cluster = config.setdefault("inter_cluster", {})
     blockchain = inter_cluster.setdefault("blockchain", {})
     blockchain["identity"] = identity
@@ -905,6 +960,55 @@ def _wait_for_gateway_health(base_url: str, timeout: int = 240, interval: int = 
     raise SystemExit(f"Gateway at {url} did not become healthy within {timeout} seconds.")
 
 
+def _trainer_identifier(entry: Dict[str, Any]) -> str:
+    """Resolve a consistent identifier for trainer payloads/results."""
+    for key in (
+        "jwt_sub",
+        "jwtSub",
+        "JWTSub",
+        "nodeId",
+        "NodeID",
+        "node_id",
+        "did",
+        "DID",
+        "trainerId",
+        "trainer_id",
+        "subject",
+        "Subject",
+    ):
+        value = entry.get(key)
+        if value:
+            return str(value)
+    return "unknown"
+
+
+def _parse_bulk_errors(body: str) -> List[Dict[str, Any]]:
+    """Return the failing entries from a bulk registration response body."""
+    if not body.strip():
+        return []
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return []
+    errors: List[Dict[str, Any]] = []
+    for result in results:
+        status_raw = result.get("status") or result.get("Status") or ""
+        if str(status_raw).lower() == "ok":
+            continue
+        identifier = _trainer_identifier(result)
+        errors.append(
+            {
+                "id": identifier,
+                "error": result.get("error") or result.get("Error") or "unknown error",
+                "http_status": result.get("status_code") or result.get("HTTPStatus"),
+            },
+        )
+    return errors
+
+
 def _bulk_register_trainers(paths: Dict[str, Path], base_url: str) -> None:
     if not paths["admin_jwt_path"].exists():
         raise SystemExit(f"Admin JWT not found at {paths['admin_jwt_path']}.")
@@ -920,48 +1024,78 @@ def _bulk_register_trainers(paths: Dict[str, Path], base_url: str) -> None:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+    total_batches = (len(entries) + batch_size - 1) // batch_size
     for offset in range(0, len(entries), batch_size):
         batch = entries[offset : offset + batch_size]
-        trainer_ids = [
-            entry.get("nodeId") or entry.get("trainerId") or entry.get("did") or "unknown"
-            for entry in batch
-        ]
-        payload = json.dumps(batch).encode()
-        request = urllib_request.Request(url, data=payload, headers=headers, method="POST")
+        batch_index = offset // batch_size + 1
+        trainer_ids = [_trainer_identifier(entry) for entry in batch]
         print(
-            f"Registering trainers {', '.join(trainer_ids)} (batch "
-            f"{offset // batch_size + 1}/{(len(entries) + batch_size - 1) // batch_size})",
+            f"Registering trainers {', '.join(trainer_ids)} (batch {batch_index}/{total_batches})",
         )
-        for attempt in range(1, 4):
+        pending = list(batch)
+        attempt = 1
+        last_errors: List[str] = []
+        while pending and attempt <= 3:
+            pending_ids = [_trainer_identifier(entry) for entry in pending]
+            payload = json.dumps(pending).encode()
+            request = urllib_request.Request(url, data=payload, headers=headers, method="POST")
             try:
                 with urllib_request.urlopen(request, timeout=60) as response:
-                    response.read()  # body unused
-                    print(f"Registered trainers {', '.join(trainer_ids)} successfully.")
+                    body = response.read().decode("utf-8", errors="replace")
+                errors = _parse_bulk_errors(body)
+                if not errors:
+                    print(f"Registered trainers {', '.join(pending_ids)} successfully.")
+                    pending = []
                     break
+                last_errors = [
+                    f"{err['id']}: {err['error']} (HTTP {err.get('http_status') or 'unknown'})"
+                    for err in errors
+                ]
+                print(
+                    f"Batch {batch_index} attempt {attempt} encountered {len(errors)} errors; "
+                    "retrying the affected trainers.",
+                )
+                entry_map = {_trainer_identifier(entry): entry for entry in pending}
+                pending = [
+                    entry_map[err["id"]]
+                    for err in errors
+                    if err["id"] in entry_map
+                ]
             except urllib_error.HTTPError as exc:
                 if exc.code == 409:
                     print(
-                        f"Trainers {', '.join(trainer_ids)} were already registered (HTTP 409).",
+                        f"Trainers {', '.join(pending_ids)} were already registered (HTTP 409).",
                     )
+                    pending = []
                     break
                 body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+                last_errors = [f"HTTP {exc.code}: {body.strip()}"]
                 if attempt >= 3:
                     raise SystemExit(
-                        f"Bulk registration batch {offset // batch_size + 1} failed "
+                        f"Bulk registration batch {batch_index} failed "
                         f"(HTTP {exc.code}): {body.strip()}",
                     )
                 print(
-                    f"Batch {offset // batch_size + 1} attempt {attempt} failed with HTTP {exc.code}; retrying...",
+                    f"Batch {batch_index} attempt {attempt} failed with HTTP {exc.code}; retrying...",
                 )
             except (urllib_error.URLError, http_client.RemoteDisconnected) as err:
+                last_errors = [str(err)]
                 if attempt >= 3:
                     raise SystemExit(
-                        f"Batch {offset // batch_size + 1} failed: {err}",
+                        f"Batch {batch_index} failed: {err}",
                     ) from err
                 print(
-                    f"Batch {offset // batch_size + 1} attempt {attempt} failed: {err}. Retrying...",
+                    f"Batch {batch_index} attempt {attempt} failed: {err}. Retrying...",
                 )
-            time.sleep(5)
+            attempt += 1
+            if pending and attempt <= 3:
+                time.sleep(5)
+        if pending:
+            detail = "; ".join(last_errors) or "unknown error"
+            failed_ids = ", ".join(_trainer_identifier(entry) for entry in pending)
+            raise SystemExit(
+                f"Bulk registration batch {batch_index} failed for trainers {failed_ids}: {detail}",
+            )
 
 
 def _start_blockchain_stack(paths: Dict[str, Path], auth_secret: str) -> str:
@@ -1021,6 +1155,44 @@ def resolve_system_config_path(cli_path: Optional[Path]) -> Path:
     return (ROOT_DIR / "config" / SYSTEM_CONFIG_FILENAME).resolve()
 
 
+def _load_system_config_data(system_config_path: Path) -> Dict[str, Any]:
+    if not system_config_path.exists():
+        raise SystemExit(
+            f"System config not found at {system_config_path}. "
+            "Pass --nodes or create the file with hierarchy/roster settings.",
+        )
+    try:
+        return json.loads(system_config_path.read_text())
+    except json.JSONDecodeError as exc:  # noqa: TRY003
+        raise SystemExit(f"Invalid JSON in system config {system_config_path}: {exc}") from exc
+
+
+def _extract_scope_names(config_data: Dict[str, Any]) -> List[str]:
+    levels = config_data.get("hierarchy_levels")
+    if not isinstance(levels, list):
+        return ["state"]
+
+    def _order(level: Dict[str, Any]) -> int:
+        try:
+            return int(level.get("scope_index") or level.get("scopeIndex"))
+        except (TypeError, ValueError):
+            return sys.maxsize
+
+    ordered = sorted(levels, key=_order)
+    scopes: List[str] = []
+    seen: set[str] = set()
+    for level in ordered:
+        scope_name = level.get("scope_name") or level.get("scopeName")
+        if not scope_name:
+            continue
+        scope_str = str(scope_name)
+        if scope_str in seen:
+            continue
+        seen.add(scope_str)
+        scopes.append(scope_str)
+    return scopes or ["state"]
+
+
 def _extract_node_count(config_data: Dict[str, Any]) -> Optional[int]:
     candidate = config_data.get("number_of_nodes")
     if candidate is not None:
@@ -1031,22 +1203,18 @@ def _extract_node_count(config_data: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def determine_node_count(cli_nodes: Optional[int], system_config_path: Path) -> int:
+def determine_node_count(
+    cli_nodes: Optional[int],
+    system_config_path: Path,
+    config_data: Optional[Dict[str, Any]] = None,
+) -> int:
     if cli_nodes is not None:
         if cli_nodes < 1:
             raise SystemExit("Number of nodes must be >= 1")
         return cli_nodes
 
-    if not system_config_path.exists():
-        raise SystemExit(
-            f"System config not found at {system_config_path}. "
-            "Pass --nodes or create the file with number_of_nodes defined.",
-        )
-
-    try:
-        config_data = json.loads(system_config_path.read_text())
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"Invalid JSON in system config {system_config_path}: {exc}") from exc
+    if config_data is None:
+        config_data = _load_system_config_data(system_config_path)
 
     node_count = _extract_node_count(config_data)
     if node_count is None:
@@ -1068,6 +1236,78 @@ def determine_node_count(cli_nodes: Optional[int], system_config_path: Path) -> 
     return node_count_int
 
 
+def _resolve_nodes_map_path(cli_path: Optional[Path]) -> Optional[Path]:
+    if cli_path:
+        return _resolve_repo_path(cli_path).resolve()
+    default_path = NODES_MAP_FILE
+    if default_path.exists():
+        return default_path
+    return None
+
+
+def _normalize_trainer_id(raw: Optional[str], seq_index: int) -> str:
+    base = (raw or "").strip()
+    if base:
+        match = re.search(r"(\d+)(?!.*\d)", base)
+        if match:
+            number = int(match.group(1))
+            return f"trainer-node-{number:03d}"
+        sanitized = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+        if sanitized:
+            return sanitized
+    return f"trainer-node-{seq_index + 1:03d}"
+
+
+def _load_nodes_map_assignments(
+    nodes_map_path: Optional[Path],
+    scope_names: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Load node assignments from the hierarchical nodes map."""
+    if nodes_map_path is None:
+        return []
+    if not nodes_map_path.exists():
+        raise SystemExit(f"Nodes map file not found: {nodes_map_path}")
+    scope_chain = [name.lower() for name in reversed(scope_names or ["state"])]
+    if not scope_chain:
+        scope_chain = ["state"]
+    try:
+        metadata = load_nodes_map(nodes_map_path, scope_chain)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    lowest_scope = scope_names[0] if scope_names else scope_chain[-1]
+    roster = metadata.rosters.get(lowest_scope.lower())
+    if not roster:
+        raise SystemExit(
+            f"Nodes map {nodes_map_path} must define at least one '{lowest_scope}' entry."
+        )
+    assignments: List[Dict[str, Any]] = []
+    next_index = 0
+    for scope_id, node_aliases in roster.items():
+        for alias in node_aliases:
+            alias_str = str(alias).strip()
+            if not alias_str:
+                raise SystemExit(f"Invalid node alias under scope {scope_id!r}: {alias!r}")
+            container_name = f"node_{next_index}"
+            trainer_id = _normalize_trainer_id(alias_str, next_index)
+            membership = metadata.memberships.get(alias_str, {})
+            scope_map: Dict[str, str] = {}
+            for scope in scope_names:
+                scope_value = membership.get(scope.lower())
+                if scope_value:
+                    scope_map[scope] = scope_value
+            state_identifier = scope_map.get("state") or scope_map.get(lowest_scope.lower()) or scope_id
+            assignments.append(
+                {
+                    "container_name": container_name,
+                    "state_id": str(state_identifier),
+                    "trainer_id": trainer_id,
+                    "scopes": scope_map,
+                }
+            )
+            next_index += 1
+    return assignments
+
+
 def load_compose_template(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise SystemExit(f"Docker compose template not found at {path}")
@@ -1078,6 +1318,100 @@ def _extract_ipfs_services(compose_data: Dict[str, Any]) -> List[str]:
     services = compose_data.get("services", {})
     ipfs_services = [name for name in services if name.startswith("ipfs-node")]
     return sorted(ipfs_services, key=_ipfs_sort_key)
+
+
+def _build_docker_ipfs_targets(service_names: List[str]) -> List[IPFSTarget]:
+    return [IPFSTarget(name=name, api_url=f"http://{name}:5001", dependency=name) for name in service_names]
+
+
+def _remove_ipfs_services(compose_data: Dict[str, Any]) -> None:
+    services = compose_data.get("services", {})
+    for service_name in list(services.keys()):
+        if service_name.startswith("ipfs-node"):
+            services.pop(service_name, None)
+
+
+def _load_process_ipfs_targets(
+    config_path: Path,
+    client_host_override: Optional[str] = None,
+) -> List[IPFSTarget]:
+    if not config_path.exists():
+        raise SystemExit(f"IPFS process config not found at {config_path}")
+    try:
+        data = json.loads(config_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Failed to parse {config_path}: {exc}") from exc
+    nodes = data.get("nodes") or []
+    if not nodes:
+        raise SystemExit(f"IPFS process config {config_path} must define at least one node entry.")
+    targets: List[IPFSTarget] = []
+    for idx, node in enumerate(nodes):
+        name = str(node.get("name") or f"ipfs-process-{idx + 1}")
+        api_port = node.get("api_port")
+        if api_port is None:
+            raise SystemExit(f"IPFS process entry '{name}' missing required field 'api_port'.")
+        api_port_int = int(api_port)
+        scheme = str(node.get("api_scheme") or "http").strip() or "http"
+        client_host = (
+            (client_host_override.strip() if client_host_override else None)
+            or str(node.get("client_host") or "").strip()
+            or str(node.get("api_host") or "").strip()
+            or "127.0.0.1"
+        )
+        api_url = str(node.get("api_url") or "").strip()
+        if not api_url:
+            api_url = f"{scheme}://{client_host}:{api_port_int}"
+        targets.append(IPFSTarget(name=name, api_url=api_url))
+    return targets
+
+
+def _apply_shared_node_image(service: Optional[Dict[str, Any]], image_tag: Optional[str]) -> None:
+    """Ensure a service reuses the shared node image to avoid redundant builds."""
+    if not service or not image_tag:
+        return
+    service["image"] = image_tag
+    service.pop("build", None)
+
+
+def _docker_image_exists(image_tag: str) -> bool:
+    result = subprocess.run(
+        ["docker", "image", "inspect", image_tag],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _build_shared_node_image(image_tag: str) -> None:
+    print(f"Building shared training node image '{image_tag}' from {NODE_DOCKERFILE}...")
+    cmd = [
+        "docker",
+        "build",
+        "-t",
+        image_tag,
+        "-f",
+        str(NODE_DOCKERFILE),
+        str(ROOT_DIR),
+    ]
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"docker build failed with exit code {result.returncode}; "
+            "see the logs above for details.",
+        )
+
+
+def _ensure_shared_node_image(image_tag: str, skip_build: bool) -> None:
+    if skip_build:
+        if not _docker_image_exists(image_tag):
+            raise SystemExit(
+                f"Shared node image '{image_tag}' not found. "
+                "Run without --no-build (or build it manually) before skipping builds.",
+            )
+        print(f"Skipping rebuild of '{image_tag}' (already present, --no-build specified).")
+        return
+    _build_shared_node_image(image_tag)
 
 
 def _locate_node_template(compose_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1091,9 +1425,11 @@ def _locate_node_template(compose_data: Dict[str, Any]) -> Dict[str, Any]:
 def _merge_node_service(
     node_name: str,
     base_template: Dict[str, Any],
-    ipfs_service: str,
+    ipfs_dependency: Optional[str],
+    image_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     service = deepcopy(base_template)
+    _apply_shared_node_image(service, image_tag)
     service["container_name"] = node_name
     service["command"] = [
         "sh",
@@ -1103,9 +1439,16 @@ def _merge_node_service(
     depends_on = {k: v for k, v in service.get("depends_on", {}).items() if not k.startswith("ipfs-node")}
     depends_on.setdefault("ttp", {"condition": "service_healthy"})
     depends_on.setdefault("registry", {"condition": "service_healthy"})
-    depends_on[ipfs_service] = {"condition": "service_healthy"}
-    service["depends_on"] = depends_on
-    service.setdefault("build", DEFAULT_NODE_SERVICE["build"])
+    if ipfs_dependency:
+        depends_on[ipfs_dependency] = {"condition": "service_healthy"}
+    elif "ipfs" in depends_on:
+        depends_on.pop("ipfs", None)
+    if depends_on:
+        service["depends_on"] = depends_on
+    elif "depends_on" in service:
+        service.pop("depends_on", None)
+    if image_tag is None:
+        service.setdefault("build", DEFAULT_NODE_SERVICE["build"])
     service.setdefault("networks", DEFAULT_NODE_SERVICE["networks"])
     service.setdefault("env_file", DEFAULT_NODE_SERVICE["env_file"])
     service.setdefault("environment", DEFAULT_NODE_SERVICE["environment"])
@@ -1162,11 +1505,17 @@ def _update_environment_section(section: Any, key: str, value: int) -> Any:
     return section
 
 
-def _update_ttp_service(services: Dict[str, Any], num_nodes: int, clique_size: int) -> None:
+def _update_ttp_service(
+    services: Dict[str, Any],
+    num_nodes: int,
+    clique_size: int,
+    image_tag: Optional[str] = None,
+) -> None:
     """Propagate the generated node count and clique size to the TTP service config."""
     service = services.get("ttp")
     if not service:
         return
+    _apply_shared_node_image(service, image_tag)
     if "command" in service:
         service["command"] = _update_ttp_command(service["command"], num_nodes, clique_size)
     if "environment" in service:
@@ -1176,9 +1525,10 @@ def _update_ttp_service(services: Dict[str, Any], num_nodes: int, clique_size: i
 
 def update_compose_file(
     compose_data: Dict[str, Any],
-    num_nodes: int,
-    ipfs_services: List[str],
+    node_names: List[str],
+    ipfs_targets: List[IPFSTarget],
     clique_size: int = 3,
+    node_image: Optional[str] = None,
 ) -> Dict[str, Any]:
     services = compose_data.setdefault("services", {})
     base_node_service = _locate_node_template(compose_data)
@@ -1186,11 +1536,17 @@ def update_compose_file(
     for key in list(services.keys()):
         if key.startswith("node_"):
             services.pop(key)
-    for idx in range(num_nodes):
-        node_name = f"node_{idx}"
-        ipfs_service = _select_ipfs_service(idx, ipfs_services)
-        services[node_name] = _merge_node_service(node_name, base_node_service, ipfs_service)
-    _update_ttp_service(services, num_nodes, clique_size)
+    if "node" in services:
+        _apply_shared_node_image(services.get("node"), node_image)
+    for idx, node_name in enumerate(node_names):
+        ipfs_target = _select_ipfs_target(idx, ipfs_targets)
+        services[node_name] = _merge_node_service(
+            node_name,
+            base_node_service,
+            ipfs_target.dependency,
+            node_image,
+        )
+    _update_ttp_service(services, len(node_names), clique_size, node_image)
     return compose_data
 
 
@@ -1198,9 +1554,9 @@ def write_compose_file(data: Dict[str, Any], path: Path) -> None:
     path.write_text(yaml.safe_dump(data, sort_keys=False))
 
 
-def generate_prometheus_config(num_nodes: int) -> None:
+def generate_prometheus_config(node_names: List[str]) -> None:
     """Generate prometheus.yml with targets for all nodes."""
-    targets = [f"node_{i}:8000" for i in range(num_nodes)]
+    targets = [f"{name}:8000" for name in node_names]
     config = {
         "global": {
             "scrape_interval": "5s",
@@ -1220,7 +1576,7 @@ def generate_prometheus_config(num_nodes: int) -> None:
     }
     PROMETHEUS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     PROMETHEUS_CONFIG.write_text(yaml.safe_dump(config, sort_keys=False))
-    print(f"Generated Prometheus config for {num_nodes} nodes -> {PROMETHEUS_CONFIG}")
+    print(f"Generated Prometheus config for {len(node_names)} nodes -> {PROMETHEUS_CONFIG}")
 
 
 def run_docker_compose(compose_path: Path, detach: bool, build: bool) -> int:
@@ -1235,15 +1591,71 @@ def run_docker_compose(compose_path: Path, detach: bool, build: bool) -> int:
 
 def main() -> None:
     args = parse_args()
+    if args.blockchain_only and args.generate_only:
+        raise SystemExit("--blockchain-only cannot be combined with --generate-only.")
 
     compose_template_path = _resolve_repo_path(args.compose_template)
     compose_output_path = _resolve_repo_path(args.compose_output)
     system_config_path = resolve_system_config_path(args.system_config)
-    node_count = determine_node_count(args.nodes, system_config_path)
+    nodes_map_path = _resolve_nodes_map_path(args.nodes_map)
+
+    system_config_data: Dict[str, Any] = {}
+    if system_config_path.exists():
+        system_config_data = _load_system_config_data(system_config_path)
+    scope_names = _extract_scope_names(system_config_data) if system_config_data else ["state"]
+    primary_scope_name = scope_names[0] if scope_names else "state"
+
+    state_assignments = _load_nodes_map_assignments(nodes_map_path, scope_names)
+    if state_assignments:
+        node_names = [assignment["container_name"] for assignment in state_assignments]
+        node_count = len(node_names)
+        state_counts: Dict[str, int] = {}
+        for assignment in state_assignments:
+            state_id = assignment.get("state_id")
+            scope_key = assignment.get("scopes", {}).get(primary_scope_name, "")
+            label = state_id or scope_key or "unassigned"
+            state_counts[label] = state_counts.get(label, 0) + 1
+        state_summary = ", ".join(f"{state}: {count}" for state, count in state_counts.items())
+        print(f"Loaded nodes map {nodes_map_path} ({state_summary})")
+    else:
+        node_count = determine_node_count(args.nodes, system_config_path, system_config_data or None)
+        node_names = [f"node_{i}" for i in range(node_count)]
+        state_assignments = [
+            {
+                "container_name": name,
+                "trainer_id": _normalize_trainer_id(None, idx),
+                "state_id": "",
+                "scopes": {},
+            }
+            for idx, name in enumerate(node_names)
+        ]
+        print(
+            f"Using node count {node_count} from "
+            f"{'--nodes CLI' if args.nodes is not None else system_config_path}"
+        )
+    shared_node_image = NODE_IMAGE_TAG
 
     template_config = load_node_template()
     compose_template = load_compose_template(compose_template_path)
-    ipfs_services = _extract_ipfs_services(compose_template)
+    ipfs_mode = args.ipfs_mode
+    if ipfs_mode == "docker":
+        ipfs_service_names = _extract_ipfs_services(compose_template)
+        if not ipfs_service_names:
+            raise SystemExit(
+                f"No IPFS services found in {compose_template_path}. "
+                "Either add ipfs-node services to the compose template or use --ipfs-mode=process.",
+            )
+        ipfs_targets = _build_docker_ipfs_targets(ipfs_service_names)
+    else:
+        _remove_ipfs_services(compose_template)
+        ipfs_targets = _load_process_ipfs_targets(
+            args.ipfs_process_config,
+            client_host_override=args.ipfs_process_client_host,
+        )
+        print(
+            f"Configured {len(ipfs_targets)} external IPFS endpoint(s) from {args.ipfs_process_config} "
+            f"(client host override={args.ipfs_process_client_host or 'auto'})"
+        )
 
     blockchain_paths = _require_blockchain_repo_paths()
     auth_secret = _resolve_auth_secret(blockchain_paths)
@@ -1252,23 +1664,49 @@ def main() -> None:
     _clear_runtime_state(blockchain_paths)
     _reset_nodes_dir()
     # Generate configs with the correct IPFS/blockchain layout.
-    for idx in range(node_count):
+    for idx, assignment in enumerate(state_assignments):
+        container_name = assignment["container_name"]
+        trainer_id = assignment["trainer_id"]
+        state_id = assignment.get("state_id") or ""
+        scopes = dict(assignment.get("scopes") or {})
         config = deepcopy(template_config)
-        node_id = f"node_{idx}"
-        config["node_id"] = node_id
-        ipfs_service = _select_ipfs_service(idx, ipfs_services)
-        _apply_ipfs_distribution(ipfs_service, config)
-        _apply_blockchain_identity(idx, config)
-        config_path = NODES_DIR / f"{node_id}.json"
+        config["node_id"] = trainer_id
+        config["trainer_id"] = trainer_id
+        config["network_host"] = container_name
+        if state_id:
+            config["state_id"] = state_id
+        else:
+            fallback_state = scopes.get("state") or scopes.get(primary_scope_name)
+            if fallback_state:
+                config["state_id"] = fallback_state
+        if scopes:
+            config["scope_assignments"] = scopes
+            for scope_key, scope_value in scopes.items():
+                config[scope_key] = scope_value
+        if scope_names:
+            config["scope_hierarchy"] = list(scope_names)
+        ipfs_target = _select_ipfs_target(idx, ipfs_targets)
+        _apply_ipfs_distribution(ipfs_target, config, ipfs_targets)
+        _apply_blockchain_identity(idx, config, identity_override=trainer_id)
+        config_path = NODES_DIR / f"{container_name}.json"
         config_path.write_text(json.dumps(config, indent=2) + "\n")
 
-    updated_compose = update_compose_file(compose_template, node_count, ipfs_services, args.clique_size)
+    updated_compose = update_compose_file(
+        compose_template,
+        node_names,
+        ipfs_targets,
+        args.clique_size,
+        shared_node_image,
+    )
     compose_output_path.parent.mkdir(parents=True, exist_ok=True)
     write_compose_file(updated_compose, compose_output_path)
     print(f"Generated docker compose file with {node_count} nodes, clique_size={args.clique_size} -> {compose_output_path}")
-    print(f"(node count source: {'--nodes CLI' if args.nodes is not None else system_config_path})")
+    if nodes_map_path:
+        print(f"(node count source: {nodes_map_path})")
+    else:
+        print(f"(node count source: {'--nodes CLI' if args.nodes is not None else system_config_path})")
 
-    generate_prometheus_config(node_count)
+    generate_prometheus_config(node_names)
 
     topology_data = generate_preliminary_topology(node_count, args.clique_size)
     TOPOLOGY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1285,11 +1723,23 @@ def main() -> None:
     if args.generate_only:
         print("Skipped docker compose up (generate-only mode).")
         print(f"Run: (cd docker && docker compose -f {compose_output_path.name} up --build)")
+        print(
+            f"Build the shared node image with: docker build -t {shared_node_image} "
+            f"-f docker/node.Dockerfile {ROOT_DIR}",
+        )
         return
+
+    if not args.blockchain_only:
+        _ensure_shared_node_image(shared_node_image, skip_build=args.no_build)
 
     gateway_base_url = _start_blockchain_stack(blockchain_paths, auth_secret)
     _wait_for_gateway_health(gateway_base_url)
     _bulk_register_trainers(blockchain_paths, gateway_base_url)
+
+    if args.blockchain_only:
+        print("Blockchain network and API gateway are running. Skipping IPFS/FL stack (--blockchain-only).")
+        print(f"Gateway URL: {gateway_base_url}")
+        return
 
     build = not args.no_build
     detach = args.detach and not args.no_detach

@@ -16,12 +16,12 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class CommitRequest(BaseModel):
-    """Request model for data commit."""
+    """Request model for generic data commit."""
 
     payload: Dict[str, Any]
 
@@ -46,6 +46,48 @@ class DataResponse(BaseModel):
 
     payload: Dict[str, Any]
     submitted_at: str
+
+
+class ClusterModelRequest(BaseModel):
+    """Request body for committing cluster-level models."""
+
+    cluster_id: str
+    payload: Dict[str, Any]
+    round: Optional[int] = None
+
+
+class ClusterModelResponse(BaseModel):
+    """Response body for retrieving cluster-level models."""
+
+    cluster_id: str
+    round: int
+    payload: Dict[str, Any]
+    submitted_at: str
+
+
+class ScopeModelRequest(BaseModel):
+    """Request body for committing generic hierarchy models."""
+
+    payload: Dict[str, Any]
+    round: Optional[int] = None
+    scope_round: Optional[int] = None
+    scope_id: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
+class ScopeModelResponse(BaseModel):
+    """Response body for retrieving hierarchy models."""
+
+    round: int
+    payload: Dict[str, Any]
+    submitted_at: str
+    data_id: str
+    scope_id: Optional[str] = None
+
+    class Config:
+        extra = "allow"
 
 
 class DataStore:
@@ -103,6 +145,24 @@ class DataStore:
                 {"data_id": k, **v}
                 for k, v in self._data.items()
             ]
+
+    def find_scope_record(self, scope_key: str, scope_id: str, scope_round: int) -> Optional[Dict[str, Any]]:
+        scope_type = f"{scope_key}_model"
+        with self._lock:
+            for data_id, record in self._data.items():
+                payload = record.get("payload", {})
+                if payload.get("type") != scope_type:
+                    continue
+                payload_scope_id = payload.get("scope_id") or payload.get(f"{scope_key}_id")
+                if payload_scope_id != scope_id:
+                    continue
+                payload_round = payload.get("round")
+                if payload_round is None:
+                    payload_round = payload.get("scope_round")
+                if payload_round != scope_round:
+                    continue
+                return {"data_id": data_id, **record}
+        return None
 
     def clear(self) -> None:
         with self._lock:
@@ -211,6 +271,153 @@ async def commit_data(
     """Commit data payload to the blockchain."""
     data_id, submitted_at = store.commit(request.payload)
     return CommitResponse(data_id=data_id, submitted_at=submitted_at)
+
+
+def _get_typed_payload(data_id: str, expected_type: str) -> tuple[Dict[str, Any], str]:
+    record = store.get(data_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Data not found")
+    payload = record.get("payload", {})
+    if payload.get("type") != expected_type:
+        raise HTTPException(status_code=404, detail="Data not found")
+    return payload, record["submitted_at"]
+
+
+@app.post("/cluster/models", response_model=CommitResponse)
+async def commit_cluster_model(
+    request: ClusterModelRequest,
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> CommitResponse:
+    """Commit cluster-level model metadata."""
+    round_num = request.round if request.round is not None else request.payload.get("round")
+    if round_num is None:
+        raise HTTPException(status_code=422, detail="'round' field is required")
+    payload_copy = dict(request.payload)
+    payload_copy.pop("round", None)
+    payload = {
+        "type": "cluster_model",
+        "cluster_id": request.cluster_id,
+        "round": int(round_num),
+        "payload": payload_copy,
+    }
+    data_id, submitted_at = store.commit(payload)
+    return CommitResponse(data_id=data_id, submitted_at=submitted_at)
+
+
+@app.get("/cluster/models/{data_id}", response_model=ClusterModelResponse)
+async def get_cluster_model(
+    data_id: str,
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> ClusterModelResponse:
+    """Retrieve cluster-level model metadata."""
+    payload, submitted_at = _get_typed_payload(data_id, "cluster_model")
+    round_val = payload.get("round")
+    if round_val is None:
+        round_val = payload.get("payload", {}).get("round")
+    if round_val is None:
+        raise HTTPException(status_code=500, detail="Cluster record missing 'round'")
+    return ClusterModelResponse(
+        cluster_id=payload["cluster_id"],
+        round=int(round_val),
+        payload=payload["payload"],
+        submitted_at=submitted_at,
+    )
+
+
+@app.post("/{scope_name}/models", response_model=CommitResponse)
+async def commit_scope_model(
+    request: ScopeModelRequest,
+    scope_name: str = Path(..., regex="^(?!cluster$).+"),
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> CommitResponse:
+    """Commit hierarchy-level model metadata."""
+    scope_key = scope_name.lower()
+    if scope_key == "cluster":
+        raise HTTPException(status_code=400, detail="Use /cluster/models for cluster commits")
+    round_num = request.round if request.round is not None else request.scope_round
+    if round_num is None:
+        raise HTTPException(status_code=422, detail="'round' field is required")
+    identifier_field = f"{scope_key}_id"
+    scope_identifier = getattr(request, identifier_field, None) or request.scope_id
+    if not scope_identifier:
+        raise HTTPException(status_code=422, detail=f"'{identifier_field}' field is required")
+    payload_copy = dict(request.payload)
+    payload_copy.pop("round", None)
+    payload_copy.pop("scope_round", None)
+    payload = {
+        "type": f"{scope_key}_model",
+        "scope": scope_key,
+        "scope_id": scope_identifier,
+        identifier_field: scope_identifier,
+        "round": int(round_num),
+        "payload": payload_copy,
+    }
+    data_id, submitted_at = store.commit(payload)
+    return CommitResponse(data_id=data_id, submitted_at=submitted_at)
+
+
+@app.get("/{scope_name}/models/{data_id}", response_model=ScopeModelResponse)
+async def get_scope_model_by_id(
+    data_id: str,
+    scope_name: str = Path(..., regex="^(?!cluster$).+"),
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> ScopeModelResponse:
+    """Retrieve hierarchy-level model metadata by data_id."""
+    scope_key = scope_name.lower()
+    payload, submitted_at = _get_typed_payload(data_id, f"{scope_key}_model")
+    identifier_field = f"{scope_key}_id"
+    identifier_value = payload.get(identifier_field) or payload.get("scope_id")
+    round_val = payload.get("round")
+    if round_val is None:
+        round_val = payload.get("scope_round")
+    if round_val is None:
+        raise HTTPException(status_code=500, detail="Scope record missing 'round'")
+    response_kwargs: Dict[str, Any] = {
+        "round": int(round_val),
+        "payload": payload["payload"],
+        "submitted_at": submitted_at,
+        "data_id": data_id,
+        "scope_id": payload.get("scope_id"),
+    }
+    if identifier_value and identifier_field != "scope_id":
+        response_kwargs[identifier_field] = identifier_value
+    return ScopeModelResponse(
+        **response_kwargs,
+    )
+
+
+@app.get("/{scope_name}/models", response_model=ScopeModelResponse)
+async def get_scope_model(
+    scope_name: str = Path(..., regex="^(?!cluster$).+"),
+    round_num: int = Query(..., alias="round"),
+    request: Request,
+    claims: Dict[str, Any] = Depends(verify_jwt),
+) -> ScopeModelResponse:
+    """Retrieve hierarchy-level model metadata by scope identifier and round."""
+    scope_key = scope_name.lower()
+    identifier_field = f"{scope_key}_id"
+    query_params = request.query_params if request is not None else {}
+    scope_identifier = query_params.get(identifier_field) or query_params.get("scope_id")
+    if not scope_identifier:
+        raise HTTPException(status_code=422, detail=f"Query parameter '{identifier_field}' is required")
+    record = store.find_scope_record(scope_key, scope_identifier, round_num)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    payload = record["payload"]
+    response_kwargs: Dict[str, Any] = {
+        "round": payload.get("round") or payload.get("scope_round"),
+        "payload": payload["payload"],
+        "submitted_at": record["submitted_at"],
+        "data_id": record["data_id"],
+        "scope_id": payload.get("scope_id"),
+    }
+    identifier_value = payload.get(identifier_field) or payload.get("scope_id")
+    if response_kwargs["round"] is None:
+        raise HTTPException(status_code=500, detail="Stored scope model missing 'round'")
+    response_kwargs["round"] = int(response_kwargs["round"])
+    if identifier_value and identifier_field != "scope_id":
+        response_kwargs[identifier_field] = identifier_value
+    return ScopeModelResponse(**response_kwargs)
 
 
 @app.get("/data/{data_id}", response_model=DataResponse)

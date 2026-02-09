@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-from secure_aggregation.storage.model_store import BlockchainInterface, ModelAnchor
+from secure_aggregation.storage.model_store import AnchorScope, BlockchainInterface, ModelAnchor
 
 CENTRAL_METADATA_CLUSTER_ID = "__central_metadata__"
 CENTRAL_HEALTH_CLUSTER_ID = "__central_checker_health__"
@@ -23,6 +23,8 @@ class CentralMetadata:
     total_cliques: int
     cluster_ids: list[str]
     version: int = 0
+    scope_central_nodes: dict[str, list[str]] = field(default_factory=dict)
+    scope_cluster_ids: dict[str, list[str]] = field(default_factory=dict)
 
     def to_payload(self) -> str:
         return json.dumps(asdict(self))
@@ -30,6 +32,18 @@ class CentralMetadata:
     @classmethod
     def from_payload(cls, payload: str) -> "CentralMetadata":
         data = json.loads(payload)
+        raw_scope_nodes = data.get("scope_central_nodes") or {}
+        scope_central_nodes = {
+            str(scope): [str(node) for node in nodes]
+            for scope, nodes in raw_scope_nodes.items()
+            if isinstance(nodes, list)
+        }
+        raw_scope_clusters = data.get("scope_cluster_ids") or {}
+        scope_cluster_ids = {
+            str(scope): [str(cluster) for cluster in clusters]
+            for scope, clusters in raw_scope_clusters.items()
+            if isinstance(clusters, list)
+        }
         return cls(
             central_clique_idx=data["central_clique_idx"],
             central_nodes=list(data["central_nodes"]),
@@ -37,6 +51,8 @@ class CentralMetadata:
             total_cliques=data.get("total_cliques", len(data.get("cluster_ids", []))),
             cluster_ids=list(data.get("cluster_ids", [])),
             version=data.get("version", 0),
+            scope_central_nodes=scope_central_nodes,
+            scope_cluster_ids=scope_cluster_ids,
         )
 
 
@@ -65,6 +81,7 @@ def publish_central_metadata(blockchain: BlockchainInterface, metadata: CentralM
         metadata.version,
         cid=payload,
         hash_val=str(metadata.version),
+        scope=AnchorScope.CONTROL,
     )
 
 
@@ -72,7 +89,7 @@ def fetch_central_metadata(blockchain: Optional[BlockchainInterface]) -> Optiona
     """Retrieve the most recent central metadata."""
     if blockchain is None:
         return None
-    anchor = blockchain.get_latest_anchor(CENTRAL_METADATA_CLUSTER_ID)
+    anchor = blockchain.get_latest_anchor(CENTRAL_METADATA_CLUSTER_ID, scope=AnchorScope.CONTROL)
     if anchor is None:
         return None
     return CentralMetadata.from_payload(anchor.cid)
@@ -86,6 +103,7 @@ def publish_checker_health(blockchain: BlockchainInterface, health: CheckerHealt
         health.round_idx,
         cid=payload,
         hash_val=str(health.priority),
+        scope=AnchorScope.CONTROL,
     )
 
 
@@ -93,7 +111,7 @@ def fetch_checker_health(blockchain: Optional[BlockchainInterface]) -> list[Chec
     """Fetch all checker health anchors."""
     if blockchain is None:
         return []
-    latest = blockchain.get_latest_anchor(CENTRAL_HEALTH_CLUSTER_ID)
+    latest = blockchain.get_latest_anchor(CENTRAL_HEALTH_CLUSTER_ID, scope=AnchorScope.CONTROL)
     if latest is None:
         return []
     return [CheckerHealth.from_anchor(latest)]

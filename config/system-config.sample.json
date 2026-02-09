@@ -1,10 +1,39 @@
 {
-  "number_of_nodes": 20,
-  "convergence": {
-    "warmup_rounds": 3,
-    "enabled": true,
-    "tol_abs": 1e-05,
-    "tol_rel": 0.001,
-    "patience": 3
-  }
+  "hierarchy_defaults": {
+    "collection_timeout_seconds": 30.0,
+    "digest_timeout_seconds": 5.0,
+    "consensus_timeout_seconds": 30.0,
+    "commit_timeout_seconds": 10.0,
+    "rounds_per_scope": 0,
+    "interval_seconds": 0,
+    "wait_seconds": 10
+  },
+  "hierarchy_levels": [
+    {
+      "scope_index": 1,
+      "scope_name": "state",
+      "scope_id": "state_0",
+      "enabled": true,
+      "approach": "ring_star",
+      "rounds_per_scope": 0,
+      "interval_seconds": 120,
+      "wait_seconds": 20,
+      "max_aggregators": 2,
+      "fanout_count": 2,
+      "apply_policy": "replace"
+    },
+    {
+      "scope_index": 2,
+      "scope_name": "nation",
+      "scope_id": "nation_0",
+      "enabled": true,
+      "rounds_per_scope": 0,
+      "interval_seconds": 300,
+      "wait_seconds": 30,
+      "max_aggregators": 2,
+      "fanout_count": 2,
+      "apply_policy": "interpolate",
+      "apply_alpha": 0.2
+    }
+  ]
 }

@@ -7,6 +7,7 @@
 - **Aggregator Service** ([aggregator_service.py](src/secure_aggregation/communication/aggregator_service.py)): Coordinates 4-round protocol
 - **Node Service** ([node_service.py](src/secure_aggregation/communication/node_service.py)): Full training + aggregation logic
 - **Protocol Definitions** ([secureagg.proto](protos/secureagg.proto)): gRPC message definitions
+- **Large Payload Budget**: Aggregator servers/clients raise `grpc.max_{send,receive}_message_length` to 200 MB (configurable via `GRPC_MAX_MESSAGE_MB`) so CIFAR-scale masked models transfer safely
 
 ### 2. Secure Aggregation Protocol (Bonawitz et al. CCS'17)
 **Round 0 - Advertise Keys:**
@@ -65,6 +66,16 @@
 - **4 Node Configs**: [config/nodes/node_0-3.json](config/nodes/)
 - **Centralized Settings**: Dataset, training, secure aggregation parameters
 - **Easy Tuning**: Change alpha, rounds, epochs, threshold in JSON
+
+### 8. Hierarchical State Aggregation
+- **Hierarchy Config**: `config/system-config.json` now defines `hierarchy_levels` (level 1 = state, level 2 = nation) with per-scope intervals, identifiers, and election/time-out knobs.
+- **Candidate Pool**: In ring-star mode, central clique nodes automatically become state aggregators.
+- **ECM Mirroring**: Bridge servers mirror every ECM into a dedicated buffer so central nodes can collect per-cluster snapshots without draining clique-level buffers.
+- **State Aggregator**: New helper (see [`state/aggregation.py`](src/secure_aggregation/state/aggregation.py)) fetches all cluster models from IPFS, averages them, and can publish the merged state model.
+- **Digest Consensus**: Central nodes broadcast lightweight “state::” signals containing hashes of their merged model; quorum is reached when all hashes match.
+- **Round-Robin Commit**: Once consensus is achieved, the round-robin leader anchors the aggregated state model on-chain, with automatic failover if a leader is down.
+- **Scope Rosters**: `config/nodes-map.json` (plus `.sample`) now controls how many sequential `node_i` instances each scope owns; the generator reads this file to assign per-scope IDs per node and to derive the total node count automatically.
+- **Higher-Level Scheduling**: Level-2 hierarchy entries reserve space for a “nation” tier—after every N state rounds the system logs the higher-round trigger so future nation-level aggregation code can hook in.
 
 ## 🔧 How It Works (End-to-End Flow)
 

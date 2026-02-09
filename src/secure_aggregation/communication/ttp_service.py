@@ -1,9 +1,12 @@
 """Trusted Third Party (TTP) service for key distribution and topology management."""
 
+import json
 import logging
 import os
+from collections import defaultdict
 from concurrent import futures
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import grpc
@@ -23,6 +26,7 @@ from secure_aggregation.topology import (
     compute_node_labels_from_partition,
     find_node_clique,
     identify_central_clique,
+    identify_central_cliques_by_scope,
     build_interclique_edges,
 )
 from secure_aggregation.utils import get_logger
@@ -38,7 +42,7 @@ class TopologyConfig:
     clique_size: int
     alpha: float = 0.5
     seed: int = 42
-    inter_clique_edges: str = "small_world"
+    inter_clique_edges: str = "ring_extra"
     topology_iterations: int = 1000
     small_world_c: int = 2
 
@@ -52,6 +56,8 @@ class TopologyState:
     partition: Dict[str, List[int]] = field(default_factory=dict)
     thresholds: Dict[int, int] = field(default_factory=dict)
     inter_edges: List[Tuple[str, str]] = field(default_factory=list)
+    node_scopes: Dict[str, str] = field(default_factory=dict)
+    scope_label: str = "state"
 
 
 class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
@@ -114,7 +120,10 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             alpha=config.alpha,
             seed=config.seed,
         )
-        partition = self._map_clients_to_node_ids(partition)
+        alias_map = self._load_node_alias_map(config.num_clients)
+        scope_label, canonical_scopes = self._load_node_scope_assignments(config.num_clients)
+        partition = self._map_clients_to_node_ids(partition, alias_map)
+        node_scope_assignments = self._remap_scope_assignments(canonical_scopes, alias_map)
 
         node_labels = compute_node_labels_from_partition(partition, labels)
 
@@ -125,6 +134,7 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             edge_mode=config.inter_clique_edges,
             small_world_c=config.small_world_c,
             seed=config.seed,
+            node_scope_assignments=node_scope_assignments,
         )
 
         node_to_clique: Dict[str, int] = {}
@@ -142,9 +152,11 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             partition=partition,
             thresholds=thresholds,
             inter_edges=inter_edges,
+            node_scopes=node_scope_assignments,
+            scope_label=scope_label,
         )
 
-        self._publish_central_metadata(cliques, config)
+        self._publish_central_metadata(cliques, config, node_scope_assignments)
 
         logger.info(
             f"Topology built: {len(cliques)} cliques, "
@@ -153,18 +165,108 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             f"inter_edges: {len(inter_edges)}"
         )
 
+    def _load_node_alias_map(self, expected_nodes: int) -> Dict[str, str]:
+        """Load mapping from canonical node_X identifiers to logical node IDs."""
+        nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+        if not nodes_dir.exists():
+            return {}
+        alias_map: Dict[str, str] = {}
+        for idx in range(expected_nodes):
+            node_file = nodes_dir / f"node_{idx}.json"
+            if not node_file.exists():
+                continue
+            try:
+                data = json.loads(node_file.read_text())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to parse node config %s: %s", node_file, exc)
+                continue
+            alias = data.get("node_id") or data.get("trainer_id")
+            if alias:
+                alias_map[f"node_{idx}"] = str(alias)
+        return alias_map
+
+    def _load_node_scope_assignments(self, expected_nodes: int) -> Tuple[str, Dict[str, str]]:
+        """
+        Load mapping from canonical node identifiers to their primary scope (e.g., state).
+
+        Returns:
+            Tuple of (scope_name, {node_id -> scope_value}).
+        """
+        nodes_dir = Path(os.environ.get("NODE_CONFIG_DIR", "/app/config/nodes"))
+        if not nodes_dir.exists():
+            return "state", {}
+        scope_name: Optional[str] = None
+        assignments: Dict[str, str] = {}
+        for idx in range(expected_nodes):
+            node_file = nodes_dir / f"node_{idx}.json"
+            if not node_file.exists():
+                continue
+            try:
+                data = json.loads(node_file.read_text())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to parse node config %s for scope metadata: %s", node_file, exc)
+                continue
+            hierarchy = data.get("scope_hierarchy")
+            primary_scope: Optional[str] = None
+            if isinstance(hierarchy, list) and hierarchy:
+                candidate = str(hierarchy[0]).strip()
+                if candidate:
+                    primary_scope = candidate.lower()
+                    if scope_name is None:
+                        scope_name = primary_scope
+            scopes = data.get("scope_assignments") or {}
+            scope_value: Optional[str] = None
+            search_keys = [primary_scope] if primary_scope else []
+            if "state" not in search_keys:
+                search_keys.append("state")
+            for key in search_keys:
+                if not key:
+                    continue
+                value = scopes.get(key)
+                if value:
+                    scope_value = str(value).strip()
+                    break
+            if not scope_value:
+                fallback = data.get("state_id") or data.get("state")
+                if fallback:
+                    scope_value = str(fallback).strip()
+            if scope_value:
+                assignments[f"node_{idx}"] = scope_value
+        return scope_name or "state", assignments
+
     @staticmethod
-    def _map_clients_to_node_ids(partition: Dict[str, List[int]]) -> Dict[str, List[int]]:
-        """Rename generic client IDs to match node_<idx> identifiers."""
+    def _remap_scope_assignments(
+        scope_assignments: Mapping[str, str],
+        alias_map: Mapping[str, str],
+    ) -> Dict[str, str]:
+        """Remap canonical node scope assignments using runtime aliases."""
+        remapped: Dict[str, str] = {}
+        for canonical_id, scope in scope_assignments.items():
+            node_id = alias_map.get(canonical_id, canonical_id)
+            remapped[node_id] = scope
+        return remapped
+
+    @staticmethod
+    def _map_clients_to_node_ids(
+        partition: Dict[str, List[int]],
+        alias_map: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, List[int]]:
+        """Rename generic client IDs to match runtime node identifiers."""
         remapped: Dict[str, List[int]] = {}
         for client_id, indices in partition.items():
             parts = client_id.split("_")
             suffix = parts[-1] if parts else client_id
-            node_id = f"node_{suffix}"
+            canonical_id = f"node_{suffix}"
+            node_id = alias_map.get(canonical_id, canonical_id) if alias_map else canonical_id
             remapped[node_id] = indices
         return remapped
 
-    def _publish_central_metadata(self, cliques: List[Set[str]], config: TopologyConfig) -> None:
+    def _publish_central_metadata(
+        self,
+        cliques: List[Set[str]],
+        config: TopologyConfig,
+        node_scope_assignments: Optional[Mapping[str, str]] = None,
+    ) -> None:
         """Anchor central node metadata once topology is ready."""
         if not self.metadata_blockchain:
             return
@@ -173,17 +275,50 @@ class TTPServicer(secureagg_pb2_grpc.TTPServiceServicer):
             mode=config.inter_clique_edges,
             small_world_c=config.small_world_c,
         )
-        central_idx, central_nodes = identify_central_clique(cliques, clique_edges)
-        if central_idx is None or not central_nodes:
-            return
+        central_idx: Optional[int] = None
+        central_nodes: List[str] = []
+        scope_central: Dict[str, Tuple[int | None, List[str]]] = {}
+        if config.inter_clique_edges == "ring_star":
+            scope_central = identify_central_cliques_by_scope(
+                cliques,
+                clique_edges,
+                node_scope_assignments or {},
+            )
+        scope_central_nodes: Dict[str, List[str]] = {}
+        scope_cluster_ids: Dict[str, List[str]] = defaultdict(list)
+        scope_assignments_lookup = node_scope_assignments or {}
+        default_scope_key = self.topology.scope_label or "state"
+        for idx, clique in enumerate(cliques):
+            scope_key = default_scope_key
+            for node in clique:
+                candidate_scope = scope_assignments_lookup.get(node)
+                if candidate_scope:
+                    scope_key = str(candidate_scope)
+                    break
+            scope_cluster_ids[scope_key].append(f"cluster_{idx}")
+        for scope_key in sorted(scope_central):
+            scope_idx, scope_nodes = scope_central[scope_key]
+            if not scope_nodes:
+                continue
+            if central_idx is None and scope_idx is not None:
+                central_idx = scope_idx
+            normalized_nodes = list(dict.fromkeys(scope_nodes))
+            scope_central_nodes[scope_key] = normalized_nodes
+            for node in normalized_nodes:
+                if node not in central_nodes:
+                    central_nodes.append(node)
+        # Ensure deterministic ordering for metadata payload.
+        central_nodes = list(dict.fromkeys(central_nodes))
         cluster_ids = [f"cluster_{i}" for i in range(len(cliques))]
         metadata = CentralMetadata(
-            central_clique_idx=central_idx,
+            central_clique_idx=central_idx if central_idx is not None else -1,
             central_nodes=central_nodes,
             checker_candidates=central_nodes[:2] if len(central_nodes) > 1 else central_nodes,
             total_cliques=len(cliques),
             cluster_ids=cluster_ids,
             version=0,
+            scope_central_nodes=scope_central_nodes,
+            scope_cluster_ids={scope: clusters for scope, clusters in scope_cluster_ids.items()},
         )
         data_id = publish_central_metadata(self.metadata_blockchain, metadata)
         if data_id:

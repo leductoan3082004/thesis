@@ -13,7 +13,7 @@ from secure_aggregation.topology import (
     compute_skew,
     metropolis_hastings_weights,
 )
-from secure_aggregation.topology.graph import identify_central_clique
+from secure_aggregation.topology.graph import identify_central_clique, identify_central_cliques_by_scope
 
 
 def _global_distribution(node_distributions: Dict[str, Dict[str, float]]) -> Dict[str, float]:
@@ -231,3 +231,58 @@ def test_degree_calculation_with_real_topology() -> None:
     assert max_degree >= 2
     assert 2.0 <= avg_degree <= 11.0
     assert max_degree == max(degrees.values())
+
+
+def test_build_full_topology_partitions_by_scope() -> None:
+    node_labels = {f"a{i}": {"A": 1.0} for i in range(4)}
+    node_labels.update({f"b{i}": {"B": 1.0} for i in range(4)})
+    scope_assignments = {f"a{i}": "alpha" for i in range(4)}
+    scope_assignments.update({f"b{i}": "beta" for i in range(4)})
+
+    cliques, _, inter_edges, _ = build_full_topology(
+        node_labels,
+        clique_size=2,
+        iterations=20,
+        edge_mode="ring_star",
+        seed=7,
+        node_scope_assignments=scope_assignments,
+    )
+
+    assert len(cliques) == 4
+    for clique in cliques:
+        scopes = {scope_assignments[node] for node in clique}
+        assert len(scopes) == 1, f"Clique mixes scopes: {clique}"
+
+    for node_a, node_b in inter_edges:
+        assert scope_assignments[node_a] == scope_assignments[node_b]
+
+
+def test_identify_central_cliques_by_scope() -> None:
+    cliques = [
+        {"a1", "a2"},
+        {"a3", "a4"},
+        {"b1", "b2"},
+        {"b3", "b4"},
+    ]
+    interclique_edges = [(0, 1), (2, 3)]
+    scope_assignments = {
+        "a1": "alpha",
+        "a2": "alpha",
+        "a3": "alpha",
+        "a4": "alpha",
+        "b1": "beta",
+        "b2": "beta",
+        "b3": "beta",
+        "b4": "beta",
+    }
+
+    results = identify_central_cliques_by_scope(cliques, interclique_edges, scope_assignments)
+
+    assert "alpha" in results and "beta" in results
+    alpha_idx, alpha_nodes = results["alpha"]
+    beta_idx, beta_nodes = results["beta"]
+
+    assert alpha_idx in (0, 1)
+    assert beta_idx in (2, 3)
+    assert set(alpha_nodes) <= {"a1", "a2", "a3", "a4"}
+    assert set(beta_nodes) <= {"b1", "b2", "b3", "b4"}

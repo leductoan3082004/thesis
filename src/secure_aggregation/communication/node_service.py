@@ -3,10 +3,13 @@
 import argparse
 import copy
 import json
+import math
 import os
+import re
 import time
+from collections import deque, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import grpc
 import numpy as np
@@ -15,29 +18,43 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
-from secure_aggregation.communication.aggregator_service import AggregatorServicer, serve as serve_aggregator
-from secure_aggregation.communication.bridge_service import BridgeClient, serve_bridge
+from secure_aggregation.communication.aggregator_service import (
+    AggregatorServicer,
+    grpc_message_options,
+    serve as serve_aggregator,
+)
+from secure_aggregation.communication.bridge_service import (
+    BridgeClient,
+    serve_bridge,
+)
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
+from secure_aggregation.communication.hierarchy_mixin import (
+    HierarchyMixin,
+    ScopeRoundHandler,
+    ScopeRuntime,
+)
 from secure_aggregation.convergence import ConvergenceConfig, ConvergenceState, ConvergenceTracker
 from secure_aggregation.convergence.central_broadcast import (
     CENTRAL_METADATA_CLUSTER_ID,
     fetch_central_metadata,
 )
-from secure_aggregation.convergence.central_checker import CentralChecker
 from secure_aggregation.config.models import NodeRole
 from secure_aggregation.config.system import load_system_config
 from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition, get_labels, load_dataset
-from secure_aggregation.node import ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
+from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
+from secure_aggregation.state import HierarchyLevelConfig, StateAggregator
 from secure_aggregation.storage.model_store import (
+    AnchorScope,
     BlockchainInterface,
     GatewayBlockchain,
     IPFSInterface,
     KuboIPFS,
     MockBlockchain,
     MockIPFS,
+    compute_model_hash,
     verify_model_hash,
 )
 from secure_aggregation.topology import (
@@ -59,15 +76,49 @@ logger = get_logger("node_service")
 
 
 class MnistLinear(nn.Module):
-    """Simple linear classifier for MNIST."""
+    """Simple linear classifier for vectorized image inputs (e.g., MNIST)."""
 
-    def __init__(self) -> None:
+    def __init__(self, input_shape: Tuple[int, ...] = (1, 28, 28), num_classes: int = 10) -> None:
         super().__init__()
-        self.fc = nn.Linear(28 * 28, 10)
+        features = 1
+        for dim in input_shape:
+            features *= dim
+        self.fc = nn.Linear(features, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(x.size(0), -1)
         return self.fc(x)
+
+
+class CifarConvNet(nn.Module):
+    """Compact convolutional network for CIFAR-sized RGB images."""
+
+    def __init__(self, num_classes: int = 10) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(128 * 8 * 8, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
 
 
 def flatten_params(model: nn.Module) -> List[float]:
@@ -105,23 +156,33 @@ class AggregatorUnavailable(Exception):
     """Raised when the elected aggregator cannot be reached after repeated attempts."""
 
 
-class NodeService:
+class NodeService(HierarchyMixin):
     """Node service that coordinates training and secure aggregation."""
 
     def __init__(self, config_path: str) -> None:
         self.config = self._load_config(config_path)
         self.system_config, self.system_config_path = load_system_config(Path(config_path))
         self.node_id = self.config["node_id"]
+        self.state_id = self.config.get("state_id")
         self.role = NodeRole(self.config["role"])
         self.ttp_address = self.config["ttp_address"]
         self.port = self.config["port"]
+        self.network_host = (
+            self.config.get("network_host")
+            or os.environ.get("NODE_HOSTNAME")
+            or os.environ.get("HOSTNAME")
+            or self.node_id
+        )
         self.dataset_config = self.config["dataset"]
+        self.dataset_name: str = self.dataset_config.get("name", "mnist")
+        self.dataset_input_shape: Optional[Tuple[int, ...]] = None
+        self.dataset_num_classes: Optional[int] = None
         self.training_config = self.config["training"]
         self.secagg_config = self.config["secure_agg"]
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
-        default_round_cap = 50
+        default_round_cap = 200
         if env_rounds:
             try:
                 self.max_training_rounds = max(1, int(env_rounds))
@@ -162,6 +223,10 @@ class NodeService:
         self.neighbor_bridge_addresses: List[str] = []
         self.neighbor_address_map: Dict[str, str] = {}
         self.central_neighbor_addresses: Dict[str, str] = {}
+        self.scope_configs = self._load_scope_config()
+        self._init_scope_role_pools()
+        self._init_scope_timers()
+        self._state_rosters, self._state_cluster_map = self._load_state_metadata()
         self.ecm_buffer: Optional[ECMBuffer] = None
         self.bridge_server: Optional[grpc.Server] = None
         self.bridge_client: Optional[BridgeClient] = None
@@ -170,26 +235,66 @@ class NodeService:
         self.blockchain: Optional[BlockchainInterface] = None
         self.ecm_forward_wait = float(self.inter_cluster_config.get("ecm_forward_wait_seconds", 5.0))
 
+        # State-level aggregation (hierarchy) state
+        (
+            self.scope_name,
+            self.scope_config,
+            self.higher_scope_name,
+            higher_scope_config,
+        ) = self._select_scope_roles(self.scope_configs)
+        self.higher_scope_config = higher_scope_config or HierarchyLevelConfig(scope_index=self.scope_config.scope_index + 1)
+        scope_interval = self._scope_interval_seconds(self.scope_config)
+        higher_interval = self._scope_interval_seconds(self.higher_scope_config)
+        logger.info(
+            "%s aggregation config: enabled=%s, rounds_per_scope=%s, interval_seconds=%.1f, scope_id=%s",
+            self._scope_label_upper(),
+            self.scope_config.enabled,
+            self.scope_config.rounds_per_scope,
+            scope_interval,
+            self.scope_config.scope_id,
+        )
+        logger.info(
+            "%s scheduling config: enabled=%s, rounds_per_scope=%s, interval_seconds=%.1f, apply_policy=%s, apply_alpha=%.3f",
+            self._higher_scope_label_upper(),
+            self.higher_scope_config.enabled,
+            self.higher_scope_config.rounds_per_scope,
+            higher_interval,
+            getattr(self.higher_scope_config, "apply_policy", "replace"),
+            float(getattr(self.higher_scope_config, "apply_alpha", 0.0) or 0.0),
+        )
+        self._scope_runtimes: Dict[str, ScopeRuntime] = {}
+        for runtime_name, runtime_config in self.scope_configs.items():
+            self._ensure_scope_runtime(runtime_name, runtime_config)
+        self._bridge_ecm_hooks: List[Callable[[ECM], None]] = []
+        self._scope_last_applied_rounds: Dict[str, int] = defaultdict(int)
+        self._scope_last_applied_cids: Dict[str, str] = {}
+        self._pending_scope_waits: Deque[Tuple[str, float, float]] = deque()
+        self._ready_scope_fetches: Set[str] = set()
+        self._scope_execution_order = [
+            name for name, _ in sorted(self.scope_configs.items(), key=lambda item: item[1].scope_index)
+        ]
+        self._build_scope_handlers()
+        self._prime_scope_fetches()
+        self._configure_scope_layer()
+
         # Convergence state
         self.convergence_config = self._load_convergence_config()
+        self._convergence_runtime_enabled = self._should_enable_convergence_runtime()
+        if not self._convergence_runtime_enabled:
+            self.convergence_config.enabled = False
         self.convergence_tracker: Optional[ConvergenceTracker] = None
         self._latest_cluster_converged: bool = False
         self._latest_delta_norm: float = 0.0
         self._latest_convergence_streak: int = 0
         self._last_model_cid: Optional[str] = None
+        self._last_model_hash: Optional[str] = None
         self._last_model_data_id: Optional[str] = None
         self.central_metadata = None
-        self.central_checker: Optional[CentralChecker] = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
-        self._bootstrap_anchors: List[Tuple[str, int, str, Optional[str], Optional[str]]] = []
+        self._bootstrap_anchors: List[
+            Tuple[str, int, str, Optional[str], Optional[str], AnchorScope]
+        ] = []
         self._logged_central_addresses = False
-        self._clique_signal_addresses: Dict[str, str] = {}
-        self._known_convergence_data_ids: Set[str] = set()
-        self._pending_convergence_data_ids: Set[str] = set()
-        self._acknowledged_convergence_data_ids: Set[str] = set()
-        self._convergence_payload_cache: Dict[str, Dict[str, Any]] = {}
-        self._confirmed_global_convergence_round: Optional[int] = None
-        self._confirmed_global_convergence_reason: str = ""
         max_failures = self.secagg_config.get("max_aggregator_failure_rounds", 2)
         try:
             self._max_aggregator_failure_rounds = max(1, int(max_failures))
@@ -228,6 +333,31 @@ class NodeService:
             )
             return ConvergenceConfig.from_dict(node_convergence)
         return ConvergenceConfig()
+
+    def _should_enable_convergence_runtime(self) -> bool:
+        """Determine if convergence detection runtime should be active."""
+        env_toggle = os.getenv("ENABLE_CLUSTER_CONVERGENCE")
+        if env_toggle is not None:
+            return env_toggle.lower() in {"1", "true", "yes", "on"}
+
+        def _resolve_runtime_flag(source: Optional[Dict[str, Any]]) -> Optional[bool]:
+            if not source or not isinstance(source, dict):
+                return None
+            if "runtime_enabled" in source:
+                return bool(source["runtime_enabled"])
+            return None
+
+        system_flag = _resolve_runtime_flag((self.system_config or {}).get("convergence"))
+        if system_flag is not None:
+            return system_flag
+        node_flag = _resolve_runtime_flag(self.config.get("convergence"))
+        if node_flag is not None:
+            return node_flag
+        return False
+
+    def _is_convergence_runtime_enabled(self) -> bool:
+        """Helper to check if convergence runtime is active."""
+        return bool(self._convergence_runtime_enabled)
 
     def _prime_convergence_tracker_state(self) -> None:
         """Advance convergence tracker state without computing deltas."""
@@ -276,6 +406,19 @@ class NodeService:
             )
         return conv_state
 
+    def _apply_model_tensor(self, tensor: np.ndarray) -> None:
+        """Load flattened tensor data into the local model."""
+        if not self.model:
+            return
+        load_params(self.model, tensor.flatten().tolist())
+        self._prime_convergence_tracker_state()
+
+    def _export_local_model_vector(self) -> Optional[np.ndarray]:
+        """Return flattened local model parameters as numpy array."""
+        if not self.model:
+            return None
+        return np.array(flatten_params(self.model), dtype=np.float32)
+
     def _log_final_model_status(self) -> None:
         """Log the final model accuracy and identifiers before stopping."""
         accuracy = self.evaluate()
@@ -306,6 +449,8 @@ class NodeService:
             first_check: Attempt number to trigger the first convergence check.
             interval: Attempt interval for subsequent checks.
         """
+        if not self._is_convergence_runtime_enabled():
+            return
         if attempt_idx < first_check:
             return
         if attempt_idx == first_check or ((attempt_idx - first_check) % interval == 0):
@@ -351,8 +496,15 @@ class NodeService:
         """Persist bootstrap anchor references once blockchain client is ready."""
         if not self.blockchain or not self._bootstrap_anchors:
             return
-        for cluster_id, round_num, data_id, cid, hash_val in self._bootstrap_anchors:
-            self.blockchain.remember_anchor(cluster_id, round_num, data_id, cid, hash_val)
+        for cluster_id, round_num, data_id, cid, hash_val, scope in self._bootstrap_anchors:
+            self.blockchain.remember_anchor(
+                cluster_id,
+                round_num,
+                data_id,
+                cid,
+                hash_val,
+                scope=scope or AnchorScope.CLUSTER,
+            )
         self._bootstrap_anchors.clear()
 
     def register_with_ttp(self) -> None:
@@ -367,7 +519,7 @@ class NodeService:
 
                 request = secureagg_pb2.RegisterRequest(
                     node_id=self.node_id,
-                    address=f"{self.node_id}:{self.port}"
+                    address=f"{self.network_host}:{self.port}"
                 )
                 response = stub.RegisterNode(request, timeout=5)
 
@@ -402,6 +554,7 @@ class NodeService:
                             metadata_data_id,
                             None,
                             None,
+                            AnchorScope.CONTROL,
                         )
                     )
                 else:
@@ -425,19 +578,29 @@ class NodeService:
     def setup_data(self) -> None:
         """Setup dataset using config-driven loader with indices assigned by TTP or local partition."""
         dataset_name = self.dataset_config.get("name", "mnist")
+        self.dataset_name = dataset_name
         datasets_config_path = self.dataset_config.get("config_path", "/app/config/datasets.json")
         logger.info(f"Setting up dataset: {dataset_name}")
 
         train_ds = load_dataset(dataset_name, datasets_config_path, train=True)
         test_ds = load_dataset(dataset_name, datasets_config_path, train=False)
+        self._capture_dataset_metadata(train_ds)
+
+        node_index = self._extract_node_index()
+        num_clients = self.dataset_config["num_clients"]
+        num_clients = max(num_clients, node_index + 1)
+        if self.participants:
+            num_clients = max(num_clients, len(self.participants))
 
         # Use TTP-assigned indices if available, otherwise compute locally.
+        dataset_size = len(train_ds)
+        indices_source = "TTP-assigned"
+
         if self.assigned_data_indices:
-            indices = self.assigned_data_indices
-            logger.info(f"Using {len(indices)} TTP-assigned data samples")
+            indices = self._sanitize_indices(self.assigned_data_indices, dataset_size)
+            logger.info(f"Using {len(indices)} {indices_source} data samples")
         else:
             labels = get_labels(train_ds)
-            num_clients = self.dataset_config["num_clients"]
             alpha = self.dataset_config["alpha"]
             seed = self.dataset_config.get("seed", 42)
 
@@ -445,10 +608,28 @@ class NodeService:
                 list(range(len(train_ds))), labels, num_clients=num_clients, alpha=alpha, seed=seed
             )
 
-            node_index = int(self.node_id.split("_")[-1])
             client_key = f"client_{node_index}"
             indices = parts.get(client_key, [])
-            logger.info(f"Using {len(indices)} locally-computed data samples")
+            if not indices:
+                logger.warning(
+                    "Dirichlet partition returned no samples for %s (client_%s); falling back to deterministic split",
+                    self.node_id,
+                    node_index,
+                )
+                indices = self._deterministic_partition(len(train_ds), num_clients, node_index)
+            indices = self._sanitize_indices(indices, dataset_size)
+            indices_source = "locally-computed"
+            logger.info(f"Using {len(indices)} {indices_source} data samples")
+
+        if not indices:
+            fallback = self._deterministic_partition(dataset_size, num_clients, node_index)
+            logger.warning(
+                "No valid %s data indices for %s; falling back to deterministic partition of %d samples",
+                indices_source,
+                self.node_id,
+                len(fallback),
+            )
+            indices = fallback
 
         # Split indices into train (80%) and validation (20%) for metrics tracking
         import random
@@ -465,10 +646,103 @@ class NodeService:
         self.test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
         logger.info(f"Data split: {len(self.train_indices)} train, {len(self.val_indices)} validation samples")
 
+    def _extract_node_index(self) -> int:
+        """Extract trailing numeric component from node_id, regardless of delimiters."""
+        suffix = self.node_id.split("_")[-1]
+        if suffix.isdigit():
+            return int(suffix)
+        match = re.search(r"(\d+)$", self.node_id)
+        if match:
+            return int(match.group(1))
+        raise ValueError(f"Node ID '{self.node_id}' does not end with a numeric index")
+
+    @staticmethod
+    def _deterministic_partition(dataset_size: int, num_clients: int, node_index: int) -> List[int]:
+        """Split dataset evenly when probabilistic partitioning yields zero samples."""
+        base = dataset_size // num_clients
+        remainder = dataset_size % num_clients
+        extra = 1 if node_index < remainder else 0
+        start = node_index * base + min(node_index, remainder)
+        end = min(dataset_size, start + base + extra)
+        if start >= dataset_size:
+            return [dataset_size - 1]
+        return list(range(start, end))
+
+    @staticmethod
+    def _sanitize_indices(indices: Sequence[int], dataset_size: int) -> List[int]:
+        """Drop invalid/duplicate indices to avoid dataset bounds issues."""
+        valid: List[int] = []
+        seen: Set[int] = set()
+        dropped = 0
+        for idx in indices:
+            if not isinstance(idx, int) or idx < 0 or idx >= dataset_size:
+                dropped += 1
+                continue
+            if idx in seen:
+                continue
+            seen.add(idx)
+            valid.append(idx)
+        if dropped:
+            logger.warning(
+                "Dropped %d invalid data indices outside dataset bounds (size=%d)",
+                dropped,
+                dataset_size,
+            )
+        if not valid and dataset_size:
+            logger.error("No valid data indices remain after sanitization (dataset size=%d)", dataset_size)
+        return valid
+
+    def _capture_dataset_metadata(self, dataset: Any) -> None:
+        """Capture dataset shape/num_classes for downstream model selection."""
+        if self.dataset_input_shape is None:
+            try:
+                first_item = dataset[0]
+                sample = first_item[0] if isinstance(first_item, (tuple, list)) else first_item
+                if hasattr(sample, "shape"):
+                    shape = tuple(int(dim) for dim in sample.shape)  # type: ignore[attr-defined]
+                    self.dataset_input_shape = shape
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Unable to capture dataset input shape: %s", exc)
+
+        if self.dataset_num_classes is None:
+            num_classes: Optional[int] = None
+            if hasattr(dataset, "classes"):
+                classes = getattr(dataset, "classes")
+                if isinstance(classes, Sequence):
+                    num_classes = len(classes)
+            elif hasattr(dataset, "class_to_idx"):
+                mapping = getattr(dataset, "class_to_idx")
+                if isinstance(mapping, Mapping):
+                    num_classes = len(mapping)
+            elif hasattr(dataset, "targets"):
+                targets = getattr(dataset, "targets")
+                if isinstance(targets, Sequence) and targets:
+                    try:
+                        num_classes = len(set(int(t) for t in targets))
+                    except Exception:  # noqa: BLE001
+                        num_classes = None
+            if num_classes:
+                self.dataset_num_classes = num_classes
+
     def setup_model(self) -> None:
-        """Initialize model."""
-        self.model = MnistLinear()
-        logger.info("Model initialized")
+        """Initialize model matching dataset characteristics."""
+        dataset_name = (self.dataset_name or "mnist").lower()
+        num_classes = self.dataset_num_classes or 10
+        input_shape = self.dataset_input_shape or (1, 28, 28)
+
+        if dataset_name.startswith("cifar"):
+            self.model = CifarConvNet(num_classes=num_classes)
+            model_name = "CifarConvNet"
+        else:
+            self.model = MnistLinear(input_shape=input_shape, num_classes=num_classes)
+            model_name = "MnistLinear"
+
+        logger.info(
+            "Model initialized (%s, num_classes=%d, input_shape=%s)",
+            model_name,
+            num_classes,
+            input_shape,
+        )
 
     def train_local(self, epochs: int) -> Tuple[int, int]:
         """Train model locally for specified epochs.
@@ -582,6 +856,99 @@ class NodeService:
             logger.info(f"Elected global aggregator for round {round_idx + 1}: {aggregator_id}")
         return aggregator_id
 
+    def _handle_completed_scope_round(self, scope_name: str, scope_round: int, source_round: int) -> None:
+        logger.debug(
+            "Completed %s round %d (scheduled after %s round %d)",
+            scope_name.upper(),
+            scope_round,
+            self.scope_name,
+            source_round,
+        )
+        if scope_name != self.scope_name:
+            config = self._get_scope_config_entry(scope_name)
+            wait_seconds = float(getattr(config, "wait_seconds", 0.0) or 0.0) if config else 0.0
+            if wait_seconds > 0:
+                scope_key = str(scope_name or "").lower()
+                queue = getattr(self, "_pending_scope_waits", None)
+                ready = getattr(self, "_ready_scope_fetches", None)
+                scope_ready = bool(ready and scope_key in ready)
+                has_pending_wait = bool(queue and any(entry[0] == scope_key for entry in queue))
+                if has_pending_wait and not scope_ready:
+                    logger.debug(
+                        "%s round %d finished; waiting %.0fs before pulling latest %s model",
+                        scope_name.upper(),
+                        scope_round,
+                        wait_seconds,
+                        scope_name.upper(),
+                    )
+                else:
+                    logger.debug(
+                        "%s round %d finished; wait window already satisfied; pulling latest model without delay",
+                        scope_name.upper(),
+                        scope_round,
+                    )
+            else:
+                logger.debug(
+                    "%s round %d finished; no wait window configured before pulling latest model",
+                    scope_name.upper(),
+                    scope_round,
+                )
+
+    def _process_high_level_rounds(self) -> bool:
+        """Drain scheduled rounds, enforce wait windows, and pull latest scope models."""
+        work_done = False
+        if self._drain_scope_rounds():
+            work_done = True
+        if self._pause_for_scope_waits():
+            work_done = True
+        if self._apply_ready_scope_models():
+            work_done = True
+        return work_done
+
+    def _drain_scope_rounds(self) -> bool:
+        """Execute at most one pending scope round (state, nation, etc.) per invocation."""
+        execution_order = getattr(self, "_scope_execution_order", [self.scope_name])
+        for scope in execution_order:
+            handler_name = None if scope == self.scope_name else scope
+            result = self._run_next_scope_round(handler_name)
+            if result is None:
+                continue
+            scope_name, scope_round, source_round = result
+            if scope_name != self.scope_name:
+                self._handle_completed_scope_round(scope_name, scope_round, source_round)
+            return True
+        return False
+
+    def _build_scope_handlers(self) -> None:
+        """Register scope round handlers for every configured hierarchy level."""
+        self._scope_round_handlers = {}
+        scope_order = self._scope_execution_order or []
+        for idx, scope_name in enumerate(scope_order):
+            config = self.scope_configs[scope_name]
+            runtime = self._ensure_scope_runtime(scope_name, config)
+            trigger_label = "cluster" if idx == 0 else scope_order[idx - 1]
+            handler = ScopeRoundHandler(
+                scope_name=scope_name,
+                config=config,
+                trigger_label=trigger_label,
+                round_queue=runtime.round_queue,
+                rounds_logged=runtime.rounds_logged,
+                round_cache=runtime.round_cache,
+                round_hashes=runtime.round_hashes,
+                committed_rounds=runtime.committed_rounds,
+                is_candidate_fn=lambda rt=runtime: rt.is_candidate,
+                dispatch_fn=lambda scope_round, parent_round, rt=runtime: self._dispatch_scope_artifacts(scope_round, parent_round, rt),
+                execute_fn=lambda scope_round, parent_round, rt=runtime: self._execute_scope_round(scope_round, parent_round, rt),
+                budget_fn=lambda rt=runtime: self._scope_round_budget_for(rt),
+            )
+            self._register_scope_round_handler(handler)
+
+    def _scope_round_budget_for(self, runtime: ScopeRuntime) -> Optional[int]:
+        """Return a budget only for the primary scope runtime."""
+        if runtime.scope_name.lower() != self.scope_name.lower():
+            return None
+        return self._scope_round_budget()
+
     def start_aggregator_server(self) -> None:
         """Start aggregator gRPC server if this node is elected."""
         if self.aggregator_server is not None:
@@ -593,6 +960,7 @@ class NodeService:
         signing_public_keys: Dict[str, bytes] = {}
         if self.participants:
             signing_public_keys = {p.node_id: bytes(p.signing_public_key) for p in self.participants}
+        convergence_handler = None
         self.aggregator_server, self.aggregator_servicer = serve_aggregator(
             self.node_id,
             self.port + 1000,
@@ -600,14 +968,16 @@ class NodeService:
             participant_ids,
             signing_public_keys=signing_public_keys or None,
             ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
-            convergence_signal_handler=self._handle_convergence_signal_from_peer,
+            convergence_signal_handler=convergence_handler,
         )
         logger.info(f"Started aggregator server on port {self.port + 1000} for {len(participant_ids)} clique members")
 
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
         if self.aggregator_server:
-            self.aggregator_server.stop(0)
+            stop_future = self.aggregator_server.stop(0)
+            if stop_future:
+                stop_future.wait()
             self.aggregator_server = None
             self.aggregator_servicer = None
             logger.info("Stopped aggregator server")
@@ -637,6 +1007,7 @@ class NodeService:
             ipfs_timeout = ipfs_config.get("timeout", 30.0)
             ipfs_max_retries = ipfs_config.get("max_retries", 5)
             ipfs_retry_delay = ipfs_config.get("retry_delay", 2.0)
+            replica_urls = ipfs_config.get("replica_api_urls", [])
             gateway_url = blockchain_config.get(
                 "gateway_url",
                 os.environ.get("BLOCKCHAIN_GATEWAY_URL", "http://localhost:9000"),
@@ -658,6 +1029,7 @@ class NodeService:
                 timeout=ipfs_timeout,
                 max_retries=ipfs_max_retries,
                 retry_delay=ipfs_retry_delay,
+                replica_api_urls=replica_urls,
             )
             self.blockchain = GatewayBlockchain(
                 base_url=gateway_url,
@@ -693,9 +1065,10 @@ class NodeService:
         self._refresh_central_metadata()
         self._ensure_bridge_stack()
 
-    def _ensure_bridge_stack(self) -> None:
+    def _ensure_bridge_stack(self, allow_state_layer: bool = False) -> None:
         """Ensure the bridge server/client are available for convergence gossip."""
-        if not self.inter_cluster_enabled:
+        state_layer_requested = allow_state_layer and self._scope_layer_enabled()
+        if not self.inter_cluster_enabled and not state_layer_requested:
             return
         if self.ecm_buffer is None:
             freshness = float(self.inter_cluster_config.get("freshness_window", 300.0))
@@ -706,13 +1079,28 @@ class NodeService:
                     self.node_id,
                     self.port + 2000,
                     self.ecm_buffer,
+                    ecm_hooks=self._bridge_ecm_hooks or None,
                 )
-                logger.info("Bridge server started on port %d", self.port + 2000)
+                logger.info(
+                    "Bridge server started on port %d (state_layer=%s)",
+                    self.port + 2000,
+                    state_layer_requested,
+                )
             except Exception as exc:  # noqa: BLE001
                 self.bridge_server = None
                 logger.error("Failed to start bridge server on port %d: %s", self.port + 2000, exc, exc_info=True)
-        if self.bridge_client is None:
+        if self.bridge_client is None and (self.inter_cluster_enabled or state_layer_requested):
             self.bridge_client = BridgeClient(self.node_id)
+
+    def _update_bridge_hooks(self) -> None:
+        """Rebuild the list of ECM hooks and restart the bridge server if needed."""
+        hooks: List[Callable[[ECM], None]] = [self._route_scope_ecm]
+        if hooks == self._bridge_ecm_hooks:
+            return
+        self._bridge_ecm_hooks = hooks
+        if self.bridge_server:
+            self.stop_bridge_server()
+            self.bridge_server = None
 
     def setup_bridge_node(self, inter_edges: List[Tuple[str, str]]) -> bool:
         """Setup bridge node if this node has inter-clique connections."""
@@ -761,6 +1149,21 @@ class NodeService:
         self._ensure_bridge_stack()
         self._update_central_neighbor_addresses()
         return self.bridge_client is not None
+
+    def _route_scope_ecm(self, ecm: ECM) -> None:
+        """Route incoming ECMs to the correct per-scope buffer."""
+        source = ecm.source_cluster or ""
+        runtime: Optional[ScopeRuntime] = None
+        if "::" in source:
+            scope_label, _ = source.split("::", 1)
+            try:
+                runtime = self._runtime_for_scope(scope_label)
+            except KeyError:
+                runtime = None
+        else:
+            runtime = self.scope_runtime
+        if runtime and runtime.ecm_buffer is not None:
+            runtime.ecm_buffer.add(ecm)
 
     def stop_bridge_server(self) -> None:
         """Stop bridge server."""
@@ -823,43 +1226,64 @@ class NodeService:
         )
         return False
 
-    def _refresh_central_metadata(self) -> None:
+    def _refresh_central_metadata(self, *, skip_if_cached: bool = False) -> None:
         """Fetch central metadata from blockchain and update coordinator."""
+        if skip_if_cached and self.central_metadata is not None:
+            return
         if not self.blockchain:
             return
         metadata = fetch_central_metadata(self.blockchain)
         if metadata:
             self.central_metadata = metadata
-            logger.info(
-                f"Fetched central metadata: central clique={metadata.central_clique_idx}, "
-                f"central nodes={metadata.central_nodes}, checker candidates={metadata.checker_candidates}"
-            )
+            if metadata.central_nodes:
+                logger.info(
+                    "Fetched central metadata: central clique=%s, central nodes=%s",
+                    metadata.central_clique_idx,
+                    metadata.central_nodes,
+                )
+            else:
+                logger.info("Fetched central metadata: no dedicated central clique")
+            if metadata.scope_central_nodes:
+                for scope, nodes in sorted(metadata.scope_central_nodes.items()):
+                    if nodes:
+                        logger.info("Central clique for %s: %s", scope, nodes)
             self._update_central_neighbor_addresses()
-            if (
-                self.convergence_tracker
-                and metadata.checker_candidates
-                and not self.convergence_config.central_checker_id
-            ):
-                self.convergence_config.central_checker_id = metadata.checker_candidates[0]
-                self.convergence_tracker.config.central_checker_id = metadata.checker_candidates[0]
-            self._maybe_init_central_checker()
 
     def _update_central_neighbor_addresses(self) -> None:
         """Build mapping to central neighbor bridge addresses when metadata is available."""
         self.central_neighbor_addresses = {}
         if not self.central_metadata or not self.participant_map:
             return
-        for node_id in self.central_metadata.central_nodes:
+        scope_label = self._scope_label_upper()
+        candidate_nodes = self._preferred_scope_candidates()
+        for node_id in candidate_nodes:
             base_address = self.participant_map.get(node_id)
+            attempts = 0
+            while not base_address and attempts < 5:
+                logger.info(
+                    "%s aggregator candidate %s not registered in map yet; refreshing participant map",
+                    scope_label,
+                    node_id or "unknown",
+                )
+                time.sleep(1)
+                self.register_with_ttp()
+                base_address = self.participant_map.get(node_id)
+                attempts += 1
             if not base_address:
+                logger.warning(
+                    "Could not resolve address for %s aggregator candidate %s; excluding from state routing",
+                    scope_label,
+                    node_id or "unknown",
+                )
                 continue
             try:
                 host, port_str = base_address.split(":")
                 bridge_port = int(port_str) + 2000
             except ValueError:
                 logger.warning(
-                    "Invalid address format for central node %s: %s",
-                    node_id,
+                    "Invalid address format for %s aggregator candidate %s: %s",
+                    scope_label,
+                    node_id or "unknown",
                     base_address,
                 )
                 continue
@@ -867,40 +1291,32 @@ class NodeService:
 
         if self.central_neighbor_addresses and not self._logged_central_addresses:
             details = ", ".join(f"{node}@{addr}" for node, addr in self.central_neighbor_addresses.items())
-            logger.info(f"Central neighbor addresses: {details}")
+            logger.info(f"{scope_label} aggregator candidate addresses: {details}")
             self._logged_central_addresses = True
 
-    def _update_clique_signal_addresses(self) -> None:
-        """Precompute bridge endpoints for clique peers to receive convergence broadcasts."""
-        self._clique_signal_addresses = {}
-        candidates = self.clique_members if self.clique_members else list(self.participant_map.keys())
-        for member in candidates:
-            base_address = self.participant_map.get(member)
-            if not base_address:
-                continue
-            try:
-                host, port_str = base_address.split(":")
-                bridge_port = int(port_str) + 2000
-            except ValueError:
-                logger.warning("Invalid address format for clique member %s: %s", member, base_address)
-                continue
-            self._clique_signal_addresses[member] = f"{host}:{bridge_port}"
+        if self.scope_config.enabled:
+            self._configure_scope_layer()
 
-    def _maybe_init_central_checker(self) -> None:
-        """Instantiate central checker if this node is a candidate."""
-        if not self.central_metadata:
-            self.central_checker = None
+    def _log_scope_aggregator_candidates(self) -> None:
+        """Log all configured hierarchy-level aggregator candidate rosters."""
+        scope_configs = getattr(self, "scope_configs", None) or {}
+        if not scope_configs:
             return
-        if self.node_id in self.central_metadata.checker_candidates:
-            if self.central_checker is None:
-                self.central_checker = CentralChecker(
-                    self.blockchain,
-                    total_cliques=self.central_metadata.total_cliques,
-                    cluster_ids=self.central_metadata.cluster_ids,
-                    on_announcement=self._handle_global_convergence_announcement,
-                )
-        else:
-            self.central_checker = None
+        ordered = sorted(scope_configs.items(), key=lambda item: (item[1].scope_index, item[0]))
+        for scope_key, config in ordered:
+            if not getattr(config, "enabled", True):
+                continue
+            scope_name = getattr(config, "scope_name", scope_key) or scope_key
+            scope_label = scope_name.upper()
+            scope_id = self._node_scope_identifier_for(scope_name, config) or getattr(config, "scope_id", None)
+            roster = self._scope_member_roster(scope_name, scope_id) if scope_id else []
+            candidate_text = ", ".join(roster) if roster else "(dynamic)"
+            logger.info(
+                "%s aggregator candidates for %s: %s",
+                scope_label,
+                scope_id or "(dynamic)",
+                candidate_text,
+            )
 
     def gossip_ecm(self, cid: str, model_hash: str, round_num: int) -> None:
         """Gossip ECM to neighbor cluster bridge nodes."""
@@ -966,7 +1382,7 @@ class NodeService:
         agg_addr = f"{agg_host}:{agg_port}"
 
         try:
-            channel = grpc.insecure_channel(agg_addr)
+            channel = self._create_aggregator_channel(agg_addr)
             stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
             ecm_messages = [
@@ -1032,31 +1448,49 @@ class NodeService:
             int(self.ecm_forward_wait),
         )
 
-    def _ensure_bridge_client(self) -> bool:
-        """Ensure bridge infrastructure is running; restart if necessary."""
-        if not self.is_bridge_node or not self.inter_cluster_enabled:
-            return False
+    def _ensure_bridge_client(self, allow_state_layer: bool = False) -> bool:
+        """
+        Ensure bridge infrastructure is running; restart if necessary.
+
+        Args:
+            allow_state_layer: When True, permit a lightweight client to be created
+                for state-level dispatch even if this node is not configured as a bridge.
+        """
         if self.bridge_client:
             return True
-        if not self.inter_edges:
+        state_layer_requested = allow_state_layer and self._scope_layer_enabled()
+        if self.is_bridge_node and self.inter_cluster_enabled:
+            if not self.inter_edges:
+                logger.warning(
+                    "Bridge client unavailable for %s and no inter_edges configured",
+                    self.node_id,
+                )
+                return False
             logger.warning(
-                "Bridge client unavailable for %s and no inter_edges configured",
+                "Bridge client missing for %s; restarting bridge server on port %d",
+                self.node_id,
+                self.port + 2000,
+            )
+            # Tear down any existing server before reconfiguring.
+            self.stop_bridge_server()
+            return self._init_bridge_with_retries(
+                self.inter_edges,
+                max_attempts=3,
+                delay=1.0,
+                fatal=False,
+            )
+        if state_layer_requested:
+            logger.debug(
+                "State layer requested bridge client for %s; creating lightweight client",
                 self.node_id,
             )
-            return False
-        logger.warning(
-            "Bridge client missing for %s; restarting bridge server on port %d",
-            self.node_id,
-            self.port + 2000,
-        )
-        # Tear down any existing server before reconfiguring.
-        self.stop_bridge_server()
-        return self._init_bridge_with_retries(
-            self.inter_edges,
-            max_attempts=3,
-            delay=1.0,
-            fatal=False,
-        )
+            self.bridge_client = BridgeClient(self.node_id)
+            return True
+        return False
+
+    def _create_aggregator_channel(self, address: str) -> grpc.Channel:
+        """Create an aggregator gRPC channel with increased message limits."""
+        return grpc.insecure_channel(address, options=grpc_message_options())
 
     def run_secure_aggregation_round(self) -> List[float]:
         """Run one round of secure aggregation protocol."""
@@ -1074,7 +1508,7 @@ class NodeService:
         agg_host = self.aggregator_address.split(":")[0]
         agg_addr = f"{agg_host}:{agg_port}"
 
-        channel = grpc.insecure_channel(agg_addr)
+        channel = self._create_aggregator_channel(agg_addr)
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
         # SAP Round 0: Advertise keys
@@ -1332,10 +1766,17 @@ class NodeService:
         convergence_warmup = max(0, self.convergence_config.warmup_rounds)
 
         # Initialize convergence tracker
-        self.convergence_tracker = ConvergenceTracker(
-            self.convergence_config, f"cluster_{self.clique_id}"
-        )
-        self._refresh_central_metadata()
+        if self._is_convergence_runtime_enabled():
+            self.convergence_tracker = ConvergenceTracker(
+                self.convergence_config, f"cluster_{self.clique_id}"
+            )
+        else:
+            self.convergence_tracker = None
+            logger.info(
+                "Cluster convergence runtime disabled; training will run fixed %d rounds",
+                max_rounds,
+            )
+        self._refresh_central_metadata(skip_if_cached=True)
 
         # Initialize Prometheus metrics and start HTTP server for scraping
         self.prom_metrics = PrometheusMetrics.get_instance(self.node_id, self.clique_id)
@@ -1349,18 +1790,21 @@ class NodeService:
             f"warmup_rounds={convergence_warmup}, "
             f"tol_abs={self.convergence_config.tol_abs}, patience={self.convergence_config.patience})"
         )
+        self._apply_ready_scope_models()
 
         should_stop = False
         stop_reason = ""
 
         while self.current_round < max_rounds and not should_stop:
+            if self._process_high_level_rounds():
+                continue
             round_idx = self.current_round
             round_start_time = time.monotonic()
             self.comm_tracker.set_round(round_idx)
             self.prom_metrics.set_round(round_idx)
 
             logger.info(f"\n{'='*60}")
-            logger.info(f"Round {round_idx + 1}/{max_rounds}")
+            logger.info(f"Cluster Round {round_idx + 1}/{max_rounds}")
             logger.info(f"{'='*60}")
             should_stop, stop_reason = self._refresh_convergence_state(should_stop, stop_reason)
             if should_stop:
@@ -1486,7 +1930,11 @@ class NodeService:
                             for ecm in consumed_ecms:
                                 self.inter_cluster_aggregator.receive_ecms(self.node_id, [ecm])
                                 # Update neighbor convergence status from ECM
-                                if hasattr(ecm, "cluster_converged"):
+                                if (
+                                    hasattr(ecm, "cluster_converged")
+                                    and self.convergence_tracker is not None
+                                    and self._is_convergence_runtime_enabled()
+                                ):
                                     self.convergence_tracker.receive_neighbor_convergence(
                                         ecm.source_cluster, ecm.cluster_converged
                                     )
@@ -1524,6 +1972,7 @@ class NodeService:
                             stop_reason = conv_state.stop_reason
 
                     self._last_model_cid = final_cid
+                    self._last_model_hash = final_hash
                     self._last_model_data_id = final_data_id
 
                 if not self.is_aggregator:
@@ -1549,6 +1998,7 @@ class NodeService:
                     response_hash = model_response.model_hash or ""
                     response_data_id = getattr(model_response, "model_data_id", "") or ""
                     self._last_model_cid = response_cid or None
+                    self._last_model_hash = response_hash or None
                     self._last_model_data_id = response_data_id or None
 
                     quantized_final = [int(w) for w in model_response.model_weights]
@@ -1629,15 +2079,11 @@ class NodeService:
             # Phase 6: ECM gossip with convergence status (bridge nodes only)
             if cid and model_hash and self.is_bridge_node:
                 logger.info("Phase 6: ECM gossip to neighbor clusters")
-                cluster_converged = self._latest_cluster_converged
-                delta_norm = self._latest_delta_norm
-                self.gossip_ecm_with_convergence(cid, model_hash, round_idx, cluster_converged, delta_norm)
-                self._broadcast_central_signal(round_idx, cluster_converged, delta_norm)
+                self.gossip_ecm(cid, model_hash, round_idx)
 
             should_stop, stop_reason = self._sync_stop_state_from_tracker(should_stop, stop_reason)
             if should_stop:
                 logger.info(f"Stopping training: {stop_reason}")
-                self._check_cached_convergence_data()
                 break
 
             # Record round total time
@@ -1654,11 +2100,17 @@ class NodeService:
             total_bytes = comm_stats["bytes_sent"] + comm_stats["bytes_received"]
             self.prom_metrics.set_total_bytes_per_round(total_bytes)
 
-            logger.info(f"Training Round {round_idx + 1} complete. Waiting before next round...")
+            logger.info(f"Training Cluster Round {round_idx + 1} complete.")
+            logger.info("Waiting before next cluster round...")
+
+            self._maybe_schedule_scope_round(round_idx)
+            self._process_high_level_rounds()
+
             time.sleep(5)
             self.current_round += 1
 
         self._log_final_model_status()
+        self._process_high_level_rounds()
         logger.info("\n" + "="*60)
         logger.info(f"Training completed after {self.current_round + 1} rounds (reason: {stop_reason or 'max_rounds'})")
         logger.info("="*60)
@@ -1681,7 +2133,7 @@ class NodeService:
             agg_host = self.aggregator_address.split(":")[0]
             agg_addr = f"{agg_host}:{agg_port}"
 
-            channel = grpc.insecure_channel(agg_addr)
+            channel = self._create_aggregator_channel(agg_addr)
             stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
             delay = 2
@@ -1727,313 +2179,9 @@ class NodeService:
             if channel:
                 channel.close()
 
-    def gossip_ecm_with_convergence(
-        self, cid: str, model_hash: str, round_num: int,
-        cluster_converged: bool, delta_norm: float
-    ) -> None:
-        """Gossip ECM with convergence status to neighbor cluster bridge nodes."""
-        if not self.is_bridge_node:
-            return
-        if not self._ensure_bridge_client():
-            logger.warning("Cannot gossip ECM (node %s): bridge client unavailable", self.node_id)
-            return
-
-        cluster_id = f"cluster_{self.clique_id}"
-        accepted = self.bridge_client.broadcast_ecm_with_convergence(
-            self.neighbor_bridge_addresses,
-            cluster_id,
-            round_num,
-            cid,
-            model_hash,
-            cluster_converged,
-            delta_norm,
-        )
-        logger.info(
-            f"Gossiped ECM with convergence (converged={cluster_converged}) to "
-            f"{accepted}/{len(self.neighbor_bridge_addresses)} neighbors"
-        )
-
-    def _broadcast_central_signal(
-        self,
-        round_idx: int,
-        cluster_converged: bool,
-        delta_norm: float,
-    ) -> None:
-        """Send convergence-only signal to central checkers."""
-        if not self.central_neighbor_addresses:
-            return
-
-        delivered = 0
-        total_targets = len(self.central_neighbor_addresses)
-
-        if self.node_id in self.central_neighbor_addresses and self.central_checker:
-            self.central_checker.record_signal(
-                f"cluster_{self.clique_id}",
-                round_idx,
-                cluster_converged,
-                delta_norm,
-            )
-            delivered += 1
-
-        remote_addresses = [
-            addr
-            for checker_id, addr in self.central_neighbor_addresses.items()
-            if checker_id != self.node_id
-        ]
-        if remote_addresses:
-            if not self.is_bridge_node or not self.bridge_client:
-                logger.warning(
-                    "Cannot dispatch convergence signal to remote central nodes: bridge client unavailable"
-                )
-            else:
-                cid = f"signal::cluster_{self.clique_id}::{round_idx}"
-                accepted = self.bridge_client.broadcast_ecm_with_convergence(
-                    remote_addresses,
-                    f"cluster_{self.clique_id}",
-                    round_idx,
-                    cid,
-                    "signal",
-                    cluster_converged,
-                    delta_norm,
-                    convergence_data_id=None,
-                )
-                delivered += accepted
-
-        if delivered > 0:
-            logger.info(
-                "Dispatched convergence signal (converged=%s) to %d/%d central targets",
-                cluster_converged,
-                delivered,
-                total_targets,
-            )
-
-    def _broadcast_convergence_data_id_to_neighbors(
-        self,
-        data_id: str,
-        round_idx: int,
-        targets: Optional[List[str]] = None,
-    ) -> None:
-        """Broadcast convergence confirmation to bridge neighbors."""
-        if not data_id or not self.bridge_client or not self.inter_cluster_enabled:
-            return
-        addresses = targets or self.neighbor_bridge_addresses
-        if not addresses:
-            logger.debug("No neighbor bridges available for convergence data broadcast")
-            return
-        cluster_id = f"cluster_{self.clique_id}"
-        cid = f"signal::convergence::{data_id}"
-        accepted = self.bridge_client.broadcast_ecm_with_convergence(
-            addresses,
-            cluster_id,
-            round_idx,
-            cid,
-            "signal",
-            True,
-            0.0,
-            convergence_data_id=data_id,
-        )
-        logger.info(
-            "Broadcast convergence data_id=%s to %d/%d bridge targets",
-            data_id,
-            accepted,
-            len(addresses),
-        )
-
-    def _broadcast_convergence_data_id_to_clique(self, data_id: str, round_idx: int) -> None:
-        """Broadcast convergence confirmation to non-bridge clique members."""
-        if not data_id or not self.bridge_client or not self.inter_cluster_enabled:
-            return
-        if not self._clique_signal_addresses:
-            return
-        targets: List[str] = []
-        for member, address in self._clique_signal_addresses.items():
-            if member == self.node_id:
-                continue
-            targets.append(address)
-        if not targets:
-            return
-        cluster_id = f"cluster_{self.clique_id}"
-        cid = f"signal::convergence::{data_id}"
-        accepted = self.bridge_client.broadcast_ecm_with_convergence(
-            targets,
-            cluster_id,
-            round_idx,
-            cid,
-            "signal",
-            True,
-            0.0,
-            convergence_data_id=data_id,
-        )
-        logger.info(
-            "Propagated convergence data_id=%s to %d/%d clique peers",
-            data_id,
-            accepted,
-            len(targets),
-        )
-
-    def _register_convergence_data_id(self, data_id: Optional[str], round_idx: Optional[int] = None) -> bool:
-        """Cache convergence data_id for later verification."""
-        if not data_id:
-            return False
-        if data_id in self._known_convergence_data_ids:
-            return False
-        self._known_convergence_data_ids.add(data_id)
-        if data_id not in self._acknowledged_convergence_data_ids:
-            self._pending_convergence_data_ids.add(data_id)
-        logger.info(
-            "Cached convergence confirmation data_id=%s%s",
-            data_id,
-            f" (round={round_idx})" if round_idx is not None else "",
-        )
-        self._send_convergence_signal_to_aggregator(data_id, round_idx)
-        return True
-
-    def _handle_convergence_signal_from_peer(self, data_id: str, round_idx: int) -> None:
-        """Receive convergence notification from clique peers via aggregator RPC."""
-        logger.info(
-            "Aggregator %s received convergence signal via RPC data_id=%s round=%s",
-            self.node_id,
-            data_id,
-            round_idx,
-        )
-        if self._register_convergence_data_id(data_id, round_idx):
-            self._broadcast_convergence_data_id_to_neighbors(data_id, round_idx)
-            self._broadcast_convergence_data_id_to_clique(data_id, round_idx)
-
-    def _send_convergence_signal_to_aggregator(self, data_id: str, round_idx: Optional[int]) -> None:
-        """Notify the current aggregator about convergence confirmation."""
-        if (
-            not data_id
-            or self.aggregator_id is None
-            or self.aggregator_id == self.node_id
-            or not self.aggregator_address
-        ):
-            return
-        try:
-            host, port_str = self.aggregator_address.split(":")
-            agg_port = int(port_str) + 1000
-        except ValueError:
-            logger.debug(
-                "Cannot notify aggregator %s about convergence: invalid address %s",
-                self.aggregator_id,
-                self.aggregator_address,
-            )
-            return
-        agg_addr = f"{host}:{agg_port}"
-        channel = grpc.insecure_channel(agg_addr)
-        stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
-        try:
-            stub.NotifyConvergenceSignal(
-                secureagg_pb2.ConvergenceSignal(
-                    data_id=data_id,
-                    round=round_idx if round_idx is not None else self.current_round,
-                ),
-                timeout=5,
-            )
-        except grpc.RpcError as exc:
-            logger.debug(
-                "Failed to notify aggregator %s about convergence data_id=%s: %s",
-                self.aggregator_id,
-                data_id,
-                exc,
-            )
-        finally:
-            channel.close()
-
-    def _handle_global_convergence_announcement(
-        self,
-        round_idx: int,
-        data_id: Optional[str],
-        payload: Optional[Dict],
-    ) -> None:
-        """Callback executed when central checker finalizes convergence."""
-        if not data_id:
-            logger.warning("Central checker declared convergence but no data_id was returned")
-            return
-        if payload:
-            self._convergence_payload_cache[data_id] = payload
-        if self._register_convergence_data_id(data_id, round_idx):
-            self._broadcast_convergence_data_id_to_neighbors(data_id, round_idx)
-            self._broadcast_convergence_data_id_to_clique(data_id, round_idx)
-
-    def _process_incoming_signals(self) -> None:
-        if not self.ecm_buffer:
-            return
-        signals = self.ecm_buffer.pop_signal_ecms()
-        for ecm in signals:
-            if ecm.convergence_data_id:
-                is_new = self._register_convergence_data_id(ecm.convergence_data_id, ecm.round_idx)
-                if is_new and self.is_bridge_node:
-                    self._broadcast_convergence_data_id_to_clique(ecm.convergence_data_id, ecm.round_idx)
-            if (
-                self.central_checker
-                and ecm.source_cluster
-                and ecm.round_idx >= 0
-                and ecm.cluster_delta_norm is not None
-            ):
-                self.central_checker.record_signal(
-                    ecm.source_cluster,
-                    ecm.round_idx,
-                    ecm.cluster_converged,
-                    ecm.cluster_delta_norm,
-                )
-
-    def _check_cached_convergence_data(self) -> None:
-        if not self.blockchain or not self._pending_convergence_data_ids:
-            return
-        for data_id in list(self._pending_convergence_data_ids):
-            record: Optional[Dict[str, Any]]
-            try:
-                record = self.blockchain.fetch_data(data_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to fetch convergence payload data_id=%s: %s", data_id, exc)
-                continue
-            metadata = self._extract_convergence_metadata(record)
-            if not metadata:
-                continue
-            round_idx = metadata.get("round")
-            if round_idx is None:
-                logger.warning("Convergence payload %s missing round field", data_id)
-                continue
-            self._pending_convergence_data_ids.discard(data_id)
-            self._acknowledged_convergence_data_ids.add(data_id)
-            self._convergence_payload_cache[data_id] = metadata
-            if self.convergence_tracker:
-                self.convergence_tracker.receive_global_convergence(int(round_idx))
-            self._confirmed_global_convergence_round = int(round_idx)
-            self._confirmed_global_convergence_reason = "global_convergence"
-            logger.info(
-                "Verified convergence payload data_id=%s (round=%s); stopping after confirmation",
-                data_id,
-                round_idx,
-            )
-
     def _refresh_convergence_state(self, should_stop: bool, stop_reason: str) -> Tuple[bool, str]:
-        """Process buffered signals, fetch payloads, and align stop flags."""
-        self._process_incoming_signals()
-        self._check_cached_convergence_data()
+        """Process buffered signals and align stop flags."""
         return self._sync_stop_state_from_tracker(should_stop, stop_reason)
-
-    def _extract_convergence_metadata(self, record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not record:
-            return None
-        payload = record.get("payload")
-        if payload is None:
-            return None
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                logger.warning("Failed to parse convergence payload string")
-                return None
-        metadata = payload.get("metadata")
-        if metadata is None:
-            metadata = payload
-        if not isinstance(metadata, dict):
-            return None
-        if metadata.get("type") != "global_convergence":
-            return None
-        return metadata
 
     def _sync_stop_state_from_tracker(self, should_stop: bool, stop_reason: str) -> Tuple[bool, str]:
         """
@@ -2043,13 +2191,8 @@ class NodeService:
             Tuple updated with the tracker decision if a central/global stop
             signal was received outside of the aggregator update flow.
         """
-        if not should_stop and self._confirmed_global_convergence_round is not None:
-            reason = self._confirmed_global_convergence_reason or stop_reason or "global_convergence"
-            logger.info(
-                "Global convergence confirmed on-chain at round %s; halting",
-                self._confirmed_global_convergence_round,
-            )
-            return True, reason
+        if not self._is_convergence_runtime_enabled():
+            return should_stop, stop_reason
         if self.convergence_tracker and not should_stop:
             tracker_state = self.convergence_tracker.state
             if tracker_state.should_stop:
@@ -2064,6 +2207,8 @@ class NodeService:
 
     def _abort_if_global_stop(self) -> None:
         """Raise if global convergence has already been confirmed."""
+        if not self._is_convergence_runtime_enabled():
+            return
         should_stop, _ = self._refresh_convergence_state(False, "")
         if should_stop:
             raise GlobalStopRequested()
@@ -2122,7 +2267,7 @@ class NodeService:
                 self.register_with_ttp()
             logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
 
-        self._update_clique_signal_addresses()
+        self._log_scope_aggregator_candidates()
 
         if inter_edges:
             bridge_ready = self._init_bridge_with_retries(inter_edges, fatal=False)
