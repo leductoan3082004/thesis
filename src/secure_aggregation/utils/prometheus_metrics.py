@@ -177,6 +177,27 @@ class PrometheusMetrics:
             labels,
         )
 
+        self.topology_max_degree = Gauge(
+            "fl_topology_max_degree",
+            "Maximum node degree in topology (d_max equivalent)",
+            labels,
+        )
+        self.topology_average_degree = Gauge(
+            "fl_topology_average_degree",
+            "Average node degree across network",
+            labels,
+        )
+        self.topology_type = Gauge(
+            "fl_topology_type",
+            "Topology type identifier",
+            ["node_id", "clique_id", "topology_name"],
+        )
+        self.total_bytes_per_round = Gauge(
+            "fl_total_bytes_per_round",
+            "Total bytes communicated per round",
+            round_labels,
+        )
+
     @classmethod
     def get_instance(cls, node_id: str, clique_id: int) -> "PrometheusMetrics":
         """Get or create the singleton instance."""
@@ -283,3 +304,23 @@ class PrometheusMetrics:
     def add_messages_received(self, count: int) -> None:
         if PROMETHEUS_AVAILABLE:
             self.messages_received.labels(**self._labels()).inc(count)
+
+    def set_topology_max_degree(self, max_degree: int) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.topology_max_degree.labels(**self._labels()).set(max_degree)
+
+    def set_topology_average_degree(self, avg_degree: float) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.topology_average_degree.labels(**self._labels()).set(avg_degree)
+
+    def set_topology_type(self, topology_name: str) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.topology_type.labels(
+                node_id=self.node_id,
+                clique_id=str(self.clique_id),
+                topology_name=topology_name,
+            ).set(1)
+
+    def set_total_bytes_per_round(self, total_bytes: int) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.total_bytes_per_round.labels(**self._round_labels()).set(total_bytes)

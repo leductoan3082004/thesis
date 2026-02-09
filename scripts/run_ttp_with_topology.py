@@ -167,6 +167,7 @@ def write_topology_file(
         "cliques": remapped_cliques,
         "inter_edges": [[a, b] for a, b in remapped_edges],
         "edge_counts": remapped_edge_counts,
+        "topology_type": "d_cliques",
     }
 
     output_file = Path(output_path)
