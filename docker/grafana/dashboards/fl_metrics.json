@@ -481,6 +481,97 @@
           ]
         }
       ]
+    },
+    {
+      "id": 60,
+      "type": "row",
+      "title": "Hierarchy",
+      "gridPos": { "x": 0, "y": 61, "w": 24, "h": 1 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 61,
+          "type": "stat",
+          "title": "Total Hierarchy Rounds",
+          "gridPos": { "x": 0, "y": 62, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
+          "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "palette-classic" } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+          "targets": [
+            { "expr": "sum(fl_scope_rounds_committed_total{clique_id=~\"$clique\"})", "refId": "A" }
+          ]
+        },
+        {
+          "id": 62,
+          "type": "stat",
+          "title": "State Rounds",
+          "gridPos": { "x": 8, "y": 62, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
+          "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "palette-classic" } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+          "targets": [
+            { "expr": "sum(fl_scope_rounds_committed_total{clique_id=~\"$clique\", scope_name=\"state\"})", "refId": "A" }
+          ]
+        },
+        {
+          "id": 63,
+          "type": "stat",
+          "title": "Nation Rounds",
+          "gridPos": { "x": 16, "y": 62, "w": 8, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
+          "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "palette-classic" } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+          "targets": [
+            { "expr": "sum(fl_scope_rounds_committed_total{clique_id=~\"$clique\", scope_name=\"nation\"})", "refId": "A" }
+          ]
+        },
+        {
+          "id": 64,
+          "type": "timeseries",
+          "title": "Committed Hierarchy Rounds by Scope/Committer",
+          "gridPos": { "x": 0, "y": 66, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 },
+              "color": { "mode": "palette-classic" }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (scope_name, committer_node_id) (fl_scope_rounds_committed_total{clique_id=~\"$clique\"})",
+              "refId": "A",
+              "legendFormat": "{{scope_name}} - {{committer_node_id}}"
+            }
+          ]
+        },
+        {
+          "id": 65,
+          "type": "table",
+          "title": "Selected Leaders and Committed Rounds",
+          "gridPos": { "x": 12, "y": 66, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "${prom_ds}" },
+          "targets": [
+            {
+              "expr": "max by (scope_name, scope_round, leader_node_id) (fl_scope_round_leader{clique_id=~\"$clique\"})",
+              "refId": "A",
+              "instant": true,
+              "format": "table"
+            },
+            {
+              "expr": "max by (scope_name, scope_round, committer_node_id) (fl_scope_round_commit_marker{clique_id=~\"$clique\"})",
+              "refId": "B",
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "options": {
+            "showHeader": true,
+            "sortBy": [{ "displayName": "scope_round", "desc": true }]
+          }
+        }
+      ]
     }
   ],
   "refresh": "10s",

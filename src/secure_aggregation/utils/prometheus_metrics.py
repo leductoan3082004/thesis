@@ -202,6 +202,26 @@ class PrometheusMetrics:
             "Number of topology connections for this node",
             labels,
         )
+        self.scope_round_leader = Gauge(
+            "fl_scope_round_leader",
+            "Selected leader for a hierarchy scope round (value=1)",
+            ["node_id", "clique_id", "scope_name", "scope_id", "scope_round", "leader_node_id"],
+        )
+        self.scope_rounds_committed = Counter(
+            "fl_scope_rounds_committed_total",
+            "Total committed hierarchy rounds by scope",
+            ["node_id", "clique_id", "scope_name", "scope_id", "committer_node_id"],
+        )
+        self.scope_last_committed_round = Gauge(
+            "fl_scope_last_committed_round",
+            "Latest committed hierarchy round by scope",
+            ["node_id", "clique_id", "scope_name", "scope_id", "committer_node_id"],
+        )
+        self.scope_round_commit_marker = Gauge(
+            "fl_scope_round_commit_marker",
+            "Marker for committed hierarchy scope rounds (value=1)",
+            ["node_id", "clique_id", "scope_name", "scope_id", "scope_round", "committer_node_id"],
+        )
 
     @classmethod
     def get_instance(cls, node_id: str, clique_id: int) -> "PrometheusMetrics":
@@ -333,3 +353,46 @@ class PrometheusMetrics:
     def set_node_connections(self, count: int) -> None:
         if PROMETHEUS_AVAILABLE:
             self.node_connections.labels(**self._labels()).set(count)
+
+    def set_scope_round_leader(
+        self,
+        scope_name: str,
+        scope_id: str,
+        scope_round: int,
+        leader_node_id: str,
+    ) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.scope_round_leader.labels(
+                node_id=self.node_id,
+                clique_id=str(self.clique_id),
+                scope_name=str(scope_name),
+                scope_id=str(scope_id),
+                scope_round=str(scope_round),
+                leader_node_id=str(leader_node_id),
+            ).set(1)
+
+    def record_scope_round_commit(
+        self,
+        scope_name: str,
+        scope_id: str,
+        scope_round: int,
+        committer_node_id: str,
+    ) -> None:
+        if PROMETHEUS_AVAILABLE:
+            labels = {
+                "node_id": self.node_id,
+                "clique_id": str(self.clique_id),
+                "scope_name": str(scope_name),
+                "scope_id": str(scope_id),
+                "committer_node_id": str(committer_node_id),
+            }
+            self.scope_rounds_committed.labels(**labels).inc()
+            self.scope_last_committed_round.labels(**labels).set(scope_round)
+            self.scope_round_commit_marker.labels(
+                node_id=self.node_id,
+                clique_id=str(self.clique_id),
+                scope_name=str(scope_name),
+                scope_id=str(scope_id),
+                scope_round=str(scope_round),
+                committer_node_id=str(committer_node_id),
+            ).set(1)
