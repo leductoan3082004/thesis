@@ -498,7 +498,10 @@
           "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "palette-classic" } } },
           "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
           "targets": [
-            { "expr": "sum(fl_scope_rounds_committed_total{clique_id=~\"$clique\"})", "refId": "A" }
+            {
+              "expr": "count(count by (scope_name, scope_round) (fl_scope_round_commit_marker{clique_id=~\"$clique\"}))",
+              "refId": "A"
+            }
           ]
         },
         {
@@ -510,7 +513,10 @@
           "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "palette-classic" } } },
           "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
           "targets": [
-            { "expr": "sum(fl_scope_rounds_committed_total{clique_id=~\"$clique\", scope_name=\"state\"})", "refId": "A" }
+            {
+              "expr": "count(count by (scope_round) (fl_scope_round_commit_marker{clique_id=~\"$clique\", scope_name=\"state\"}))",
+              "refId": "A"
+            }
           ]
         },
         {
@@ -522,7 +528,10 @@
           "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "palette-classic" } } },
           "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
           "targets": [
-            { "expr": "sum(fl_scope_rounds_committed_total{clique_id=~\"$clique\", scope_name=\"nation\"})", "refId": "A" }
+            {
+              "expr": "count(count by (scope_round) (fl_scope_round_commit_marker{clique_id=~\"$clique\", scope_name=\"nation\"}))",
+              "refId": "A"
+            }
           ]
         },
         {
