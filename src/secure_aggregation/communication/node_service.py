@@ -1068,6 +1068,8 @@ class NodeService(HierarchyMixin):
         )
         self._refresh_central_metadata()
         self._ensure_bridge_stack()
+        # Reconfigure hierarchy runtimes now that storage backends exist.
+        self._configure_scope_layer()
 
     def _ensure_bridge_stack(self, allow_state_layer: bool = False) -> None:
         """Ensure the bridge server/client are available for convergence gossip."""

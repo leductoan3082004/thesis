@@ -1,18 +1,24 @@
 {
-  "num_cliques": 2,
+  "num_cliques": 4,
   "cliques": [
     [
       "node_0",
       "node_1",
-      "node_2",
-      "node_3",
-      "node_4"
+      "node_2"
     ],
     [
-      "node_5",
+      "node_3",
+      "node_4",
+      "node_5"
+    ],
+    [
       "node_6",
       "node_7",
-      "node_8",
+      "node_8"
+    ],
+    [
+      "node_10",
+      "node_11",
       "node_9"
     ]
   ],

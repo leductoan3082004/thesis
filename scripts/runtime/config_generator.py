@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -313,6 +314,22 @@ def generate_process_layout(
 
     # Ensure runtime directories exist.
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    runtime_config_dir = runtime_dir / "config"
+    runtime_config_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ensure nodes find the shared system configuration next to their configs.
+    destination = runtime_config_dir / SYSTEM_CONFIG_FILENAME
+    if sys_cfg_path.exists():
+        shutil.copy2(sys_cfg_path, destination)
+    elif destination.exists():
+        destination.unlink()
+
+    nodes_map_dest = runtime_config_dir / "nodes-map.json"
+    nodes_map_source = resolved_map
+    if nodes_map_source and nodes_map_source.exists():
+        shutil.copy2(nodes_map_source, nodes_map_dest)
+    elif nodes_map_dest.exists():
+        nodes_map_dest.unlink()
 
     # Write process-mode datasets.json with absolute host paths.
     datasets_path = runtime_dir / "datasets.json"
@@ -352,7 +369,6 @@ def generate_process_layout(
         elif data_link.exists():
             data_link.unlink()
         if copy_data and data_source.exists():
-            import shutil
             shutil.copytree(data_source, data_link)
         elif data_source.exists():
             data_link.symlink_to(data_source)

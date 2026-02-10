@@ -811,7 +811,11 @@ class HierarchyMixin:
                     if not isinstance(members, list):
                         continue
                     for member in members:
-                        container_to_clique[str(member)] = idx
+                        member_id = str(member)
+                        container_to_clique[member_id] = idx
+                        canonical = self._trainer_to_canonical_id(member_id)
+                        if canonical:
+                            container_to_clique.setdefault(canonical, idx)
             except (OSError, json.JSONDecodeError) as exc:
                 hierarchy_logger.warning("Failed to parse topology file %s: %s", topo_path, exc)
         for state_id, nodes in rosters.items():
