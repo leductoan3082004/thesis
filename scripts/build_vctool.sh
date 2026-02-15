@@ -14,7 +14,7 @@ require_cmd() {
 	if ! command -v "$1" >/dev/null 2>&1; then
 		err "Missing dependency: $1"
 		exit 1
-	}
+	fi
 }
 
 detect_goos() {
@@ -44,7 +44,7 @@ main() {
 	if [ ! -d "$API_DIR" ]; then
 		err "Blockchain api-gateway repo not found at $BLOCKCHAIN_DIR"
 		exit 1
-	}
+	fi
 	local goos goarch
 	goos="${GOOS:-$(detect_goos)}"
 	goarch="${GOARCH:-$(detect_goarch)}"
