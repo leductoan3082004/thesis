@@ -60,6 +60,7 @@ from secure_aggregation.storage.model_store import (
 from secure_aggregation.topology import (
     compute_average_degree,
     compute_max_degree,
+    compute_node_degrees,
     elect_clique_aggregator,
     get_inter_clique_neighbors,
     is_bridge_node,
@@ -160,6 +161,7 @@ class NodeService(HierarchyMixin):
     """Node service that coordinates training and secure aggregation."""
 
     def __init__(self, config_path: str) -> None:
+        self._config_path = config_path
         self.config = self._load_config(config_path)
         self.system_config, self.system_config_path = load_system_config(Path(config_path))
         self.node_id = self.config["node_id"]
@@ -579,7 +581,9 @@ class NodeService(HierarchyMixin):
         """Setup dataset using config-driven loader with indices assigned by TTP or local partition."""
         dataset_name = self.dataset_config.get("name", "mnist")
         self.dataset_name = dataset_name
-        datasets_config_path = self.dataset_config.get("config_path", "/app/config/datasets.json")
+        # Resolve datasets config: explicit config value, then relative to node config file, then Docker fallback.
+        _default_datasets = str(Path(self._config_path).resolve().parent.parent / "datasets.json") if hasattr(self, "_config_path") else "/app/config/datasets.json"
+        datasets_config_path = self.dataset_config.get("config_path", _default_datasets)
         logger.info(f"Setting up dataset: {dataset_name}")
 
         train_ds = load_dataset(dataset_name, datasets_config_path, train=True)
@@ -1064,6 +1068,8 @@ class NodeService(HierarchyMixin):
         )
         self._refresh_central_metadata()
         self._ensure_bridge_stack()
+        # Reconfigure hierarchy runtimes now that storage backends exist.
+        self._configure_scope_layer()
 
     def _ensure_bridge_stack(self, allow_state_layer: bool = False) -> None:
         """Ensure the bridge server/client are available for convergence gossip."""
@@ -1492,6 +1498,26 @@ class NodeService(HierarchyMixin):
         """Create an aggregator gRPC channel with increased message limits."""
         return grpc.insecure_channel(address, options=grpc_message_options())
 
+    def _invoke_tracked_rpc(
+        self,
+        rpc_name: str,
+        rpc_fn: Callable[..., Any],
+        request: Any,
+        timeout: int = 30,
+    ) -> Any:
+        """Invoke an RPC and record request/response sizes for comm metrics."""
+        start = time.monotonic()
+        response = rpc_fn(request, timeout=timeout)
+        if self.comm_tracker is not None:
+            track_rpc_call(
+                request=request,
+                response=response,
+                method_name=rpc_name,
+                latency_ms=(time.monotonic() - start) * 1000.0,
+                tracker=self.comm_tracker,
+            )
+        return response
+
     def run_secure_aggregation_round(self) -> List[float]:
         """Run one round of secure aggregation protocol."""
         self._abort_if_global_stop()
@@ -1528,14 +1554,17 @@ class NodeService(HierarchyMixin):
         for attempt in range(max_retries):
             self._abort_if_global_stop()
             try:
-                response = stub.Round0AdvertiseKeys(
-                    secureagg_pb2.KeyAdvertisement(
-                        node_id=self.node_id,
-                        c_public_key=advert_msg.c_public,
-                        s_public_key=advert_msg.s_public,
-                        signature=advert_msg.signature,
-                    ),
-                    timeout=30
+                round0_request = secureagg_pb2.KeyAdvertisement(
+                    node_id=self.node_id,
+                    c_public_key=advert_msg.c_public,
+                    s_public_key=advert_msg.s_public,
+                    signature=advert_msg.signature,
+                )
+                response = self._invoke_tracked_rpc(
+                    "Round0AdvertiseKeys",
+                    stub.Round0AdvertiseKeys,
+                    round0_request,
+                    timeout=30,
                 )
                 break
             except grpc.RpcError as e:
@@ -1574,14 +1603,17 @@ class NodeService(HierarchyMixin):
             self._abort_if_global_stop()
             time.sleep(1)
             self._abort_if_global_stop()
-            response = stub.Round0AdvertiseKeys(
-                secureagg_pb2.KeyAdvertisement(
-                    node_id=self.node_id,
-                    c_public_key=advert_msg.c_public,
-                    s_public_key=advert_msg.s_public,
-                    signature=advert_msg.signature,
-                ),
-                timeout=30
+            round0_request = secureagg_pb2.KeyAdvertisement(
+                node_id=self.node_id,
+                c_public_key=advert_msg.c_public,
+                s_public_key=advert_msg.s_public,
+                signature=advert_msg.signature,
+            )
+            response = self._invoke_tracked_rpc(
+                "Round0AdvertiseKeys",
+                stub.Round0AdvertiseKeys,
+                round0_request,
+                timeout=30,
             )
 
             logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
@@ -1609,20 +1641,23 @@ class NodeService(HierarchyMixin):
         sap_r1_start = time.monotonic()
         self.comm_tracker.set_phase("sap_round1")
         ct_list = client.create_round1_ciphertexts(ordered_participants, self.threshold)
-        response1 = stub.Round1ShareKeys(
-            secureagg_pb2.ShareKeysMessage(
-                node_id=self.node_id,
-                ciphertexts=[
-                    secureagg_pb2.Round1Ciphertext(
-                        sender_id=ct.sender_id,
-                        recipient_id=ct.recipient_id,
-                        iv=ct.iv,
-                        ciphertext=ct.ciphertext,
-                        tag=ct.tag,
-                    )
-                    for ct in ct_list
-                ],
-            ),
+        round1_request = secureagg_pb2.ShareKeysMessage(
+            node_id=self.node_id,
+            ciphertexts=[
+                secureagg_pb2.Round1Ciphertext(
+                    sender_id=ct.sender_id,
+                    recipient_id=ct.recipient_id,
+                    iv=ct.iv,
+                    ciphertext=ct.ciphertext,
+                    tag=ct.tag,
+                )
+                for ct in ct_list
+            ],
+        )
+        response1 = self._invoke_tracked_rpc(
+            "Round1ShareKeys",
+            stub.Round1ShareKeys,
+            round1_request,
             timeout=30,
         )
         mailbox = [
@@ -1641,8 +1676,11 @@ class NodeService(HierarchyMixin):
             self._abort_if_global_stop()
             time.sleep(1)
             self._abort_if_global_stop()
-            response1 = stub.Round1ShareKeys(
-                secureagg_pb2.ShareKeysMessage(node_id=self.node_id, ciphertexts=[]),
+            round1_poll_request = secureagg_pb2.ShareKeysMessage(node_id=self.node_id, ciphertexts=[])
+            response1 = self._invoke_tracked_rpc(
+                "Round1ShareKeys",
+                stub.Round1ShareKeys,
+                round1_poll_request,
                 timeout=30,
             )
             mailbox = [
@@ -1670,8 +1708,11 @@ class NodeService(HierarchyMixin):
 
         masked = client.create_masked_input(quantized)
         masked_bytes = [_int_to_bytes(val, SHARE_BYTES) for val in masked.masked_vector]
-        response2 = stub.Round2MaskedInput(
-            secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes),
+        round2_request = secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes)
+        response2 = self._invoke_tracked_rpc(
+            "Round2MaskedInput",
+            stub.Round2MaskedInput,
+            round2_request,
             timeout=30,
         )
 
@@ -1680,8 +1721,14 @@ class NodeService(HierarchyMixin):
             self._abort_if_global_stop()
             time.sleep(1)
             self._abort_if_global_stop()
-            response2 = stub.Round2MaskedInput(
-                secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes),
+            round2_poll_request = secureagg_pb2.MaskedInputMessage(
+                node_id=self.node_id,
+                masked_vector=masked_bytes,
+            )
+            response2 = self._invoke_tracked_rpc(
+                "Round2MaskedInput",
+                stub.Round2MaskedInput,
+                round2_poll_request,
                 timeout=30,
             )
 
@@ -1696,8 +1743,14 @@ class NodeService(HierarchyMixin):
         sap_r3_start = time.monotonic()
         self.comm_tracker.set_phase("sap_round3")
         survivor_sig = client.sign_survivor_list(response2.survivors)
-        response3 = stub.Round3ConsistencyCheck(
-            secureagg_pb2.ConsistencySignature(node_id=self.node_id, signature=survivor_sig.signature),
+        round3_request = secureagg_pb2.ConsistencySignature(
+            node_id=self.node_id,
+            signature=survivor_sig.signature,
+        )
+        response3 = self._invoke_tracked_rpc(
+            "Round3ConsistencyCheck",
+            stub.Round3ConsistencyCheck,
+            round3_request,
             timeout=30,
         )
 
@@ -1711,12 +1764,15 @@ class NodeService(HierarchyMixin):
         self.comm_tracker.set_phase("sap_round4")
         dropouts = set(ordered_participants) - set(response2.survivors)
         unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
-        response4 = stub.Round4Unmask(
-            secureagg_pb2.UnmaskShares(
-                node_id=self.node_id,
-                dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
-                survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
-            ),
+        round4_request = secureagg_pb2.UnmaskShares(
+            node_id=self.node_id,
+            dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
+            survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
+        )
+        response4 = self._invoke_tracked_rpc(
+            "Round4Unmask",
+            stub.Round4Unmask,
+            round4_request,
             timeout=30,
         )
 
@@ -1725,12 +1781,15 @@ class NodeService(HierarchyMixin):
             self._abort_if_global_stop()
             time.sleep(1)
             self._abort_if_global_stop()
-            response4 = stub.Round4Unmask(
-                secureagg_pb2.UnmaskShares(
-                    node_id=self.node_id,
-                    dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
-                    survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
-                ),
+            round4_poll_request = secureagg_pb2.UnmaskShares(
+                node_id=self.node_id,
+                dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
+                survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
+            )
+            response4 = self._invoke_tracked_rpc(
+                "Round4Unmask",
+                stub.Round4Unmask,
+                round4_poll_request,
                 timeout=30,
             )
 
@@ -1745,7 +1804,13 @@ class NodeService(HierarchyMixin):
         if self.is_aggregator:
             logger.info("Fetching global model")
             self.comm_tracker.set_phase("model_fetch")
-            model_response = stub.GetGlobalModel(secureagg_pb2.ModelRequest(round=self.current_round), timeout=30)
+            model_request = secureagg_pb2.ModelRequest(round=self.current_round)
+            model_response = self._invoke_tracked_rpc(
+                "GetGlobalModel",
+                stub.GetGlobalModel,
+                model_request,
+                timeout=30,
+            )
             aggregated = list(model_response.model_weights)
             logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
 
@@ -1780,9 +1845,18 @@ class NodeService(HierarchyMixin):
 
         # Initialize Prometheus metrics and start HTTP server for scraping
         self.prom_metrics = PrometheusMetrics.get_instance(self.node_id, self.clique_id)
-        self.prom_metrics.start_server(port=8000)
+        metrics_port = self.config.get("metrics_port", 8000)
+        self.prom_metrics.start_server(port=metrics_port)
         self.prom_metrics.set_training_samples(len(self.train_indices))
         self.prom_metrics.set_model_parameters(sum(p.numel() for p in self.model.parameters()))
+        pending = getattr(self, "_pending_topology_metrics", None)
+        if pending:
+            self.prom_metrics.set_topology_max_degree(pending["max_degree"])
+            self.prom_metrics.set_topology_average_degree(pending["avg_degree"])
+            self.prom_metrics.set_node_connections(pending["node_connections"])
+        pending_type = getattr(self, "_pending_topology_type", None)
+        if pending_type:
+            self.prom_metrics.set_topology_type(pending_type)
         self.comm_tracker = CommunicationTracker(self.node_id)
 
         logger.info(
@@ -2142,7 +2216,9 @@ class NodeService(HierarchyMixin):
             while True:
                 attempts += 1
                 try:
-                    response = stub.GetGlobalModel(
+                    response = self._invoke_tracked_rpc(
+                        "GetGlobalModel",
+                        stub.GetGlobalModel,
                         secureagg_pb2.ModelRequest(round=self.current_round),
                         timeout=10,
                     )
@@ -2240,15 +2316,28 @@ class NodeService(HierarchyMixin):
             if cliques and inter_edges is not None:
                 max_degree = compute_max_degree(cliques, inter_edges)
                 avg_degree = compute_average_degree(cliques, inter_edges)
-                self.metrics.set_topology_max_degree(max_degree)
-                self.metrics.set_topology_average_degree(avg_degree)
+                node_degrees = compute_node_degrees(cliques, inter_edges)
+                node_connections = int(node_degrees.get(self.node_id, 0))
                 logger.info(f"Topology metrics: max_degree={max_degree}, avg_degree={avg_degree:.2f}")
+                # Store for deferred export once prom_metrics is initialized.
+                self._pending_topology_metrics = {
+                    "max_degree": max_degree,
+                    "avg_degree": avg_degree,
+                    "node_connections": node_connections,
+                }
 
             topology_type = topology_data.get("topology_type", "d_cliques")
-            self.metrics.set_topology_type(topology_type)
+            self._pending_topology_type = topology_type
         else:
             inter_edges_config = self.inter_cluster_config.get("inter_edges", [])
             inter_edges = [(e[0], e[1]) for e in inter_edges_config]
+            intra_connections = max(0, len(self.clique_members) - 1)
+            inter_connections = sum(1 for a, b in inter_edges if self.node_id in (a, b))
+            self._pending_topology_metrics = {
+                "max_degree": 0,
+                "avg_degree": 0.0,
+                "node_connections": intra_connections + inter_connections,
+            }
 
         # Wait for clique members or all nodes to be ready
         if self.clique_members:

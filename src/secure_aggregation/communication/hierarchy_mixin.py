@@ -319,6 +319,48 @@ class HierarchyMixin:
             return self.scope_runtime
         return self._ensure_scope_runtime(config.scope_name, config)
 
+    def _emit_scope_round_leader_metric(
+        self,
+        runtime: ScopeRuntime,
+        scope_round: int,
+        leader_id: Optional[str],
+    ) -> None:
+        if not leader_id:
+            return
+        prom = getattr(self, "prom_metrics", None)
+        if prom is None:
+            return
+        scope_id = runtime.scope_id or getattr(runtime.config, "scope_id", None)
+        if not scope_id:
+            return
+        prom.set_scope_round_leader(
+            runtime.scope_name,
+            scope_id,
+            scope_round,
+            leader_id,
+        )
+
+    def _record_scope_commit_metric(
+        self,
+        runtime: ScopeRuntime,
+        scope_round: int,
+        committer_node_id: Optional[str],
+    ) -> None:
+        if not committer_node_id:
+            return
+        prom = getattr(self, "prom_metrics", None)
+        if prom is None:
+            return
+        scope_id = runtime.scope_id or getattr(runtime.config, "scope_id", None)
+        if not scope_id:
+            return
+        prom.record_scope_round_commit(
+            runtime.scope_name,
+            scope_id,
+            scope_round,
+            committer_node_id,
+        )
+
     @staticmethod
     def _runtime_label_lower(runtime: ScopeRuntime) -> str:
         name = runtime.config.scope_name or runtime.scope_name or "scope"
@@ -784,7 +826,7 @@ class HierarchyMixin:
                 ready.add(scope_key)
 
     @staticmethod
-    def _trainer_to_container(trainer_id: str) -> Optional[str]:
+    def _trainer_to_canonical_id(trainer_id: str) -> Optional[str]:
         suffix = "".join(ch for ch in str(trainer_id) if ch.isdigit())
         if not suffix:
             return None
@@ -811,14 +853,18 @@ class HierarchyMixin:
                     if not isinstance(members, list):
                         continue
                     for member in members:
-                        container_to_clique[str(member)] = idx
+                        member_id = str(member)
+                        container_to_clique[member_id] = idx
+                        canonical = self._trainer_to_canonical_id(member_id)
+                        if canonical:
+                            container_to_clique.setdefault(canonical, idx)
             except (OSError, json.JSONDecodeError) as exc:
                 hierarchy_logger.warning("Failed to parse topology file %s: %s", topo_path, exc)
         for state_id, nodes in rosters.items():
             seen: Set[str] = set()
             clusters: List[str] = []
             for trainer_id in nodes:
-                container = self._trainer_to_container(trainer_id)
+                container = self._trainer_to_canonical_id(trainer_id)
                 if not container:
                     continue
                 clique_idx = container_to_clique.get(container)
@@ -1287,6 +1333,18 @@ class HierarchyMixin:
             interval_note,
         )
         hierarchy_logger.info("=" * 60)
+        try:
+            runtime = self._ensure_scope_runtime(scope_label, config)
+        except KeyError:
+            runtime = None
+        if runtime is not None:
+            leader_id = self._scope_round_leader(
+                runtime.scope_name,
+                runtime.scope_id,
+                scope_round,
+                fallback=runtime.candidates,
+            )
+            self._emit_scope_round_leader_metric(runtime, scope_round, leader_id)
         handler.dispatch_fn(scope_round, source_round)
         handler.execute_fn(scope_round, source_round)
         return handler.scope_name, scope_round, source_round
@@ -1636,6 +1694,7 @@ class HierarchyMixin:
                             data_id=data_id,
                         )
                     self._mark_scope_round_committed(scope_round, runtime=runtime)
+                    self._record_scope_commit_metric(runtime, scope_round, self.node_id)
                     self._mark_scope_fetch_ready(runtime, cid, pending_anchor)
                     return
             else:

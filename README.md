@@ -1,499 +1,527 @@
 # Secure Aggregation for Federated Learning
 
-A complete implementation of privacy-preserving federated learning using the secure aggregation protocol from Bonawitz et al. (CCS 2017). This system enables multiple parties to collaboratively train a machine learning model while keeping their data private. The server learns only the aggregate model, never individual updates.
+Privacy-preserving federated learning using the secure aggregation protocol from Bonawitz et al. (CCS 2017). Multiple parties collaboratively train a machine learning model while keeping their data private — the server learns only the aggregate model, never individual updates.
 
 ## Features
 
-- **4-Round Secure Aggregation Protocol**: Fully implemented with key exchange, masking, and reconstruction
-- **Automatic Coordination**: Nodes self-organize without manual intervention
-- **Dropout Tolerance**: Threshold-based aggregation (survives up to n-t failures)
-- **Aggregator Rotation**: Round-robin election distributes load across nodes
-- **Non-IID Data**: Dirichlet partitioning simulates realistic heterogeneous federated settings
-- **Blockchain Integration**: Hyperledger Fabric for trainer identity and model registry
-- **Docker Deployment**: One-command launch of entire federated network
-- **Monitoring**: Prometheus metrics and Grafana dashboards
-- **gRPC Communication**: Efficient, type-safe distributed protocol with 200MB message budgets (override via `GRPC_MAX_MESSAGE_MB`) so large model updates flow without truncation
-- **MNIST Demonstration**: Complete end-to-end training example
+- **4-Round Secure Aggregation Protocol** with key exchange, masking, and reconstruction
+- **D-Cliques Topology** for scalable hierarchical aggregation
+- **Dropout Tolerance** via threshold-based aggregation (survives up to n-t failures)
+- **Non-IID Data** using Dirichlet partitioning for realistic heterogeneous settings
+- **Blockchain Integration** with Hyperledger Fabric for trainer identity and model registry
+- **IPFS Storage** for decentralized model distribution
+- **Full Monitoring** with Prometheus metrics and Grafana dashboards
+- **Centralized Logging** via Loki + Promtail with CLI querying
+- **Process-Only Runtime** — all components run as managed host processes, no Docker required
 
 ## Prerequisites
 
-- Python 3.10+
-- Docker and Docker Compose
-- Hyperledger Fabric binaries (cryptogen, configtxgen, fabric-ca-client)
-- Node.js 18+ (for blockchain scripts)
-- 4GB+ free disk space
+| Dependency | Version | Purpose |
+|---|---|---|
+| Python | 3.10+ | Core runtime |
+| Hyperledger Fabric binaries | 2.x | `cryptogen`, `configtxgen`, `fabric-ca-server`, `fabric-ca-client` |
+| Node.js | 18+ | Blockchain gateway scripts |
+| IPFS Kubo | Latest | `ipfs` binary for decentralized storage |
+| 4GB+ free disk | | Datasets, models, blockchain state |
 
-The blockchain repository (`thesis-blockchain`) must be cloned as a sibling directory.
+The monitoring tools (Loki, Promtail, Prometheus, Grafana) are installed automatically by `make setup`.
 
-## Quick Start
+### Repository Layout
 
-### Using Makefile (Recommended)
+The blockchain repository is expected as a sibling directory:
 
-```bash
-# First time setup: install dependencies, generate gRPC code, download MNIST
-make setup
-
-# Start the full system (blockchain + monitoring + training nodes)
-make start
-
-# Start with custom number of nodes
-make start NODES=10
-
-# Start in background (detached mode)
-make start DETACH=1
-
-# View logs
-make logs
-
-# Stop all services
-make stop
-
-# Run IPFS + blockchain as host processes, FL stack in Docker
-make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
+```
+parent/
+├── secure_aggregation/       # this repo
+└── thesis-blockchain/        # blockchain helper repo
 ```
 
-### Available Make Targets
-
-| Target | Description |
-|--------|-------------|
-| `make setup` | Install dependencies, generate gRPC code, download MNIST |
-| `make start` | Start full system (blockchain + monitoring + training) |
-| `make start NODES=N` | Start with N training nodes (default: 6) |
-| `make start DETACH=1` | Start in background mode |
-| `make start-training` | Restart only training nodes (keeps infrastructure running) |
-| `make start-blockchain` | Start only blockchain infrastructure |
-| `make start-monitoring` | Start only Prometheus and Grafana |
-| `make stop` | Stop all services |
-| `make stop-training` | Stop only training nodes |
-| `make logs` | View logs from all containers |
-| `make logs-node NODE=0` | View logs from specific node |
-| `make clean` | Remove generated files and stop containers |
-| `make clean-all` | Full cleanup including virtual environment |
-| `make test` | Run unit tests |
-
-### Manual Setup
-
-If you prefer not to use the Makefile:
+`make setup` now auto-clones `thesis-blockchain` if missing.
+If you need a different repo URL, set `BLOCKCHAIN_REPO_URL`:
 
 ```bash
-# 1. Create virtual environment and install dependencies
+BLOCKCHAIN_REPO_URL=https://github.com/your-org/thesis-blockchain.git make setup
+```
+
+## End-to-End Setup Guide
+
+### Step 1: Clone and Enter the Repository
+
+```bash
+git clone <this-repo-url> secure_aggregation
+cd secure_aggregation
+```
+
+### Step 2: One-Command Setup
+
+```bash
+make setup
+```
+
+This runs six steps automatically:
+1. Creates Python virtual environment (`.venv/`)
+2. Installs Python dependencies (`pip install -e ".[mnist]"`, gRPC tools, PyYAML)
+3. Generates gRPC protobuf code from `protos/secureagg.proto`
+4. Downloads MNIST dataset to `data/MNIST/`
+5. Prepares blockchain `.env` config
+6. Installs monitoring tools (Loki, Promtail, Prometheus, Grafana) to `~/.local/bin/`
+
+<details>
+<summary>Manual setup (if you prefer not to use Make)</summary>
+
+```bash
+# Virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[mnist]"
-pip install grpcio grpcio-tools PyYAML
 
-# 2. Generate gRPC protobuf code
+# Python dependencies
+pip install -e ".[mnist]"
+pip install grpcio grpcio-tools PyYAML prometheus_client
+
+# gRPC code generation
 python -m grpc_tools.protoc -I=protos \
     --python_out=src/secure_aggregation/communication \
     --grpc_python_out=src/secure_aggregation/communication \
     protos/secureagg.proto
 
-# 3. Download MNIST dataset
+# MNIST dataset
 python scripts/prepare_data.py
 
-# 4. Run with Docker Compose
-python scripts/run_docker_with_nodes.py --nodes 6
+# Monitoring tools
+bash scripts/install_monitoring.sh
+
+# Blockchain .env
+cp ../thesis-blockchain/api-gateway/.env.example ../thesis-blockchain/api-gateway/.env
 ```
+</details>
 
-### IPFS Deployment Options
-
-By default the Compose file starts IPFS inside Docker (`ipfs-node-1..3`). To run the same cluster as host processes instead:
-
-- Edit `config/ipfs-process.json` if you need different ports or want the daemons to bind only to `localhost`.
-- Launch the processes with `python scripts/run_ipfs_processes.py --config config/ipfs-process.json`. Logs stream to `logs/ipfs/` and Ctrl+C stops every daemon.
-- Run the rest of the stack with `make start IPFS_MODE=process` (or pass `--ipfs-mode process` to `scripts/run_docker_with_nodes.py`). The generator will point node configs at the client URLs derived from the process config instead of the Docker service names.
-
-When running training nodes directly on the host, override the client host with `IPFS_PROCESS_CLIENT_HOST=localhost` (or change the `client_host` fields in the JSON) so configs use `http://127.0.0.1:<api_port>`. Switching back to Docker is as simple as stopping the processes and omitting the override.
-
-## Hybrid Process Mode (IPFS + Blockchain on Host, Nodes in Docker)
-
-If Docker is restricted on your machine but you still want to run the FL nodes inside containers, the stack now supports a “process mode” for the infrastructure components:
+### Step 3: Start the Full System
 
 ```bash
-make start NODES_MAP=config/nodes-map.json PROCESS_MODE=1 NO_BUILD=1
+# Default: 6 nodes, clique size 3
+make start
+
+# Custom: 10 nodes, clique size 5
+make start NODES=10 CLIQUE_SIZE=5
+
+# With hierarchical node roster
+make start NODES_MAP=config/nodes-map.json CLIQUE_SIZE=4
 ```
 
-- `NODES_MAP=config/nodes-map.json` tells the generator to derive the fleet from the hierarchy-aware roster (trainer IDs, scope assignments, etc.). Omit it to fall back to `config/system-config.json:number_of_nodes`.
-- `PROCESS_MODE=1` switches IPFS + Hyperledger Fabric (orderer, peers, API gateway, IPFS daemons) to host processes. The Makefile automatically points trainer configs at `host.docker.internal` so Dockerized nodes can reach them.
-- `NO_BUILD=1` skips rebuilding the shared trainer image; drop the flag the first time or after Dockerfile changes.
-
-During this flow `scripts/run_process_mode.py`:
-1. Stops any leftover dockerized FL nodes, IPFS daemons, and Fabric processes.
-2. Regenerates node configs/topology/Prometheus files just like the Docker path.
-3. Launches the IPFS daemons and Fabric process runner, signs VCs, builds a bulk registration payload, and whitelists every trainer via `/auth/register-trainers`.
-4. Starts the FL docker compose stack with the freshly generated configuration.
-
-Fabric logs live under `../thesis-blockchain/api-gateway/process-runner/runtime/logs`, IPFS logs under `logs/ipfs`, and the trainer whitelist at `../thesis-blockchain/api-gateway/data/trainers.json`. Run `make stop` to tear everything down.
-
-#### Quick Test of the Process-Based IPFS Cluster
+Or use the CLI directly:
 
 ```bash
-# Terminal A: add a file via ipfs-process-1 (API port 15101)
-echo "hello from process mode" > /tmp/hello.txt
-curl -s -X POST "http://127.0.0.1:15101/api/v0/add" \
-     -F file=@/tmp/hello.txt | tee /tmp/ipfs-add.json
-CID=$(jq -r '.Hash' /tmp/ipfs-add.json)
-echo "Stored CID: $CID"
-
-# (optional) announce it on the routing API so replicas learn about it quickly
-curl -s -X POST "http://127.0.0.1:15101/api/v0/routing/provide?arg=$CID&recursive=true"
-
-# Terminal B: fetch the payload through ipfs-process-2 (port 15102)
-curl -s -X POST "http://127.0.0.1:15102/api/v0/cat?arg=$CID"
-
-# Optional health checks
-curl -s -X POST "http://127.0.0.1:15101/api/v0/swarm/peers?verbose=true" | jq '.Peers | length'
-curl -s -X POST "http://127.0.0.1:15101/api/v0/refs/local" | head
+.venv/bin/python scripts/secureagg_ctl.py start --nodes 10 --clique-size 5
 ```
 
-All Kubo HTTP API calls require `-X POST`, even for reads like `cat` or `refs`. You can also point the CLI at one of the host repos (`export IPFS_PATH=data/ipfs/node-1`) and run `ipfs add`, `ipfs cat`, or `ipfs dht provide` directly if you prefer.
+The startup sequence:
+1. IPFS daemons for decentralized model storage
+2. Blockchain stack (Hyperledger Fabric orderer, peers, gateway)
+3. Trainer identity registration
+4. TTP service (Ed25519 key distribution)
+5. N FL training nodes with Dirichlet-partitioned MNIST data
+6. Monitoring stack (Loki, Promtail, Prometheus, Grafana)
 
-## System Behavior
-
-The system automatically:
-1. Starts blockchain infrastructure (Hyperledger Fabric network)
-2. Registers trainer identities with verifiable credentials
-3. Starts IPFS for decentralized model storage
-4. Launches a TTP (Trusted Third Party) for key distribution
-5. Spawns N federated nodes with partitioned MNIST data
-6. Runs federated training with secure aggregation
-7. Logs accuracy improvements after each round
-
-## Hierarchy Warm-Start & Scope Fetch Flow
-
-- **Startup warm-start:** when each node boots it immediately queries the blockchain gateway for every scope it belongs to (cluster/state/nation). If the gateway returns 404 you will now see `~ BLOCKCHAIN ~ No STATE model available yet for state=...`, which simply means there is nothing to merge yet.
-- **Aggregator candidates:** the node logs `STATE/NATION aggregator candidates for <scope_id>` plus their bridge addresses so you can confirm the roster that high-level rounds will rotate through.
-- **Wait windows:** after a state/nation round commits, all participants wait for the configured `wait_seconds` (see `config/system-config.json`) unless a fresh anchor is observed sooner. The committing aggregator now bypasses the rest of the wait window by reusing the CID/hash it just published, but it still refetches the model via the gateway/IPFS path so integrity checks and merge policies remain uniform.
-- **Follower polling:** during the wait window followers poll the latest-model endpoint every 5 seconds. If the CID matches what’s already been applied you will see `No new STATE model available...`; polling continues until a new CID shows up or the window expires.
-
-## Tutorial: Inspecting Hierarchy Activity
-
-1. **Start the stack:** `make start` (or your preferred combination of `make start-*` targets).
-2. **Watch a node:** `make logs-node NODE=0` to tail trainer-node-001.
-3. **Confirm roster discovery:** look for `STATE aggregator candidates for state_alpha: ...` and the companion address log. These come from `NodeService` once the participant map and topology metadata are loaded.
-4. **Observe a high-level round:** when the timer fires you will see `STATE Round N` banners. The assigned aggregator logs `STATE round N committed by trainer-node-XXX ...` followed by `STATE aggregator candidate addresses: ...`.
-5. **Verify warm-start fetches:** after the commit, the node should either log `Applied STATE model round N ...` (new CID) or `No new STATE model available...` (already merged). To shorten or lengthen the delay before these fetches, edit the `wait_seconds` field for the relevant `hierarchy_levels` entry in `config/system-config.json` and restart the nodes.
-
-Following the above steps lets you validate that hierarchy warm-starting, aggregator rotation, and propagation delays behave as expected without diving into the code.
-
-## Expected Output
-
+You will see:
 ```
-[node_0] Round 1/10
-[node_0] Phase 1: Local training
-[node_0] Accuracy before aggregation: 0.7465
-[node_0] *** This node is the AGGREGATOR for round 0 ***
-[node_0] Phase 2: Secure aggregation
-[node_0] Round 0: Advertising keys
-[node_0] Accepted by aggregator, received all 4 keys
-[node_0] Round 2: Sending masked model
-[node_0] Masked input accepted, 4 survivors
-[node_0] Round 4: Sending unmask shares
-[node_0] Round 4 complete: aggregation done
-[node_0] Phase 3: Updating model with aggregated weights
-[node_0] Accuracy after aggregation: 0.8234
-[node_0] Improvement: +0.0769
+Starting IPFS processes...
+Starting blockchain stack (orderer + peers + gateway)...
+Waiting for gateway health at http://localhost:9000...
+Registering trainers...
+Starting TTP service...
+Starting 10 FL nodes...
+  [trainer-node-001] pid=12345 service=51000 metrics=61000
+  [trainer-node-002] pid=12346 service=51001 metrics=61001
+  ...
+Starting monitoring stack...
+  Loki      -> http://localhost:3100
+  Promtail  -> http://localhost:9080
+  Prometheus-> http://localhost:9090
+  Grafana   -> http://localhost:3000 (admin/admin)
 ```
 
-**Accuracy progression (verified):**
+#### Skip Optional Components
+
+```bash
+# Skip monitoring (faster startup for development)
+.venv/bin/python scripts/secureagg_ctl.py start --nodes 4 --skip-monitoring
+
+# Skip blockchain (no model anchoring)
+.venv/bin/python scripts/secureagg_ctl.py start --nodes 4 --skip-blockchain
+
+# Skip IPFS (no decentralized storage)
+.venv/bin/python scripts/secureagg_ctl.py start --nodes 4 --skip-ipfs
+```
+
+### Step 4: Monitor Training
+
+#### Check Process Status
+
+```bash
+make status
+# or
+.venv/bin/python scripts/secureagg_ctl.py status
+```
+
+Output:
+```
+NAME                        PID STATUS     TYPE            PORTS
+-------------------------------------------------------------------------
+ipfs_0                    12340 running    infrastructure  15101,18180
+blockchain                   -1 running    infrastructure  7050,7051,8051,9051,9000
+ttp                       12350 running    ttp             50051
+node_0                    12360 running    training        51000,52000,53000,61000
+node_1                    12361 running    training        51001,52001,53001,61001
+...
+loki                      12380 running    monitoring      3100
+promtail                  12381 running    monitoring      9080
+prometheus                12382 running    monitoring      9090
+grafana                   12383 running    monitoring      3000
+```
+
+#### View Logs via CLI
+
+```bash
+# All logs (uses Loki when available, falls back to files)
+make logs
+
+# Follow logs in real-time
+.venv/bin/python scripts/secureagg_ctl.py logs --follow
+
+# Filter by node
+make logs-node NODE=trainer-node-001
+
+# Filter by service (fl_node, ttp, ipfs)
+.venv/bin/python scripts/secureagg_ctl.py logs --service ttp
+
+# Error-level only
+make logs-errors
+
+# Advanced querying
+.venv/bin/python scripts/secureagg_ctl.py logs --level ERROR --since 30m --json
+.venv/bin/python scripts/secureagg_ctl.py logs --contains "accuracy" --limit 50
+```
+
+#### Grafana Dashboards
+
+Open http://localhost:3000 (login: admin / admin).
+
+Two dashboards are auto-provisioned on startup:
+
+**Federated Learning - Cluster Metrics** (Prometheus)
+- Overview: total clusters, nodes, global round, test accuracy, convergence status
+- Accuracy over time per node and per clique
+- Accuracy by round (train / validation / test)
+- Delta norm and convergence streak
+- Timing: local training, aggregation, round total
+- Network: messages and bytes sent/received, SAP phase durations
+- Topology: nodes per clique, model parameters, training samples
+- Template variables: filter by clique and node
+
+**Federated Learning - Logs** (Loki)
+- All node logs with free-text filter
+- Accuracy and convergence signals
+- SAP protocol phase progression
+- IPFS and blockchain activity
+- Errors and warnings
+- Per-node individual log panels (auto-generated based on node count)
+- Infrastructure: TTP and IPFS logs
+- Log volume and error rate over time
+
+### Step 5: Stop the System
+
+```bash
+make stop
+# or
+.venv/bin/python scripts/secureagg_ctl.py stop
+```
+
+### Cleanup
+
+```bash
+# Kill stale processes and verify ports are free
+.venv/bin/python scripts/secureagg_ctl.py cleanup
+
+# Also purge logs and observability data
+.venv/bin/python scripts/secureagg_ctl.py cleanup --purge-logs
+
+# Full cleanup: stop processes, remove all generated files
+make clean
+
+# Full cleanup including virtual environment
+make clean-all
+```
+
+## Expected Training Output
+
+```
+[trainer-node-001] Round 1/10
+[trainer-node-001] Phase 1: Local training
+[trainer-node-001] Accuracy before aggregation: 0.7465
+[trainer-node-001] *** This node is the AGGREGATOR for round 0 ***
+[trainer-node-001] Phase 2: Secure aggregation
+[trainer-node-001] Round 0: Advertising keys
+[trainer-node-001] Accepted by aggregator, received all 4 keys
+[trainer-node-001] Round 2: Sending masked model
+[trainer-node-001] Masked input accepted, 4 survivors
+[trainer-node-001] Round 4: Sending unmask shares
+[trainer-node-001] Round 4 complete: aggregation done
+[trainer-node-001] Phase 3: Updating model with aggregated weights
+[trainer-node-001] Accuracy after aggregation: 0.8234
+[trainer-node-001] Improvement: +0.0769
+```
+
+**Accuracy progression (MNIST, 10 nodes):**
 - Round 1: 74-78% (local models with non-IID data)
 - Round 5: 85-88% (after collaboration)
-- Round 10: 91.81% (all nodes converge to same accuracy)
+- Round 10: ~91% (all nodes converge)
 
 ## Architecture
 
 ```
 +-----------------------------------------------------+
-|                   TTP Service                       |
-|         (Ed25519 Key Distribution)                  |
+|                   TTP Service                        |
+|         (Ed25519 Key Distribution)                   |
 +-----------------------+-----------------------------+
                         | Register & Get Keys
     +-------------------+-------------------+-------------------+
     |                   |                   |                   |
 +---v----+        +-----v-----+       +-----v-----+       +-----v-----+
-| Node 0 |        |  Node 1   |       |  Node 2   |       |  Node 3   |
-| 11.6K  |        |  11.7K    |       |  19.2K    |       |  17.4K    |
-|samples |        |  samples  |       |  samples  |       |  samples  |
-|(19.4%) |        |  (19.5%)  |       |  (32.0%)  |       |  (29.1%)  |
+| Node 0 |        |  Node 1   |       |  Node 2   |       |  Node N   |
 +--------+        +-----------+       +-----------+       +-----------+
      |                  |                   |                   |
      +------------------+-------------------+-------------------+
-                    Secure Aggregation
-               (Rounds 0 -> 2 -> 4, simplified)
+                    Secure Aggregation (D-Cliques)
                             |
-                      +-----v------+
-                      |   Global   |
-                      |   Model    |
-                      +------------+
+          +-----------------+-----------------+
+          |                                   |
+     +----v-----+                       +-----v----+
+     |  Clique 0 |                       | Clique 1 |
+     | (intra-   |<--- inter-cluster --->| (intra-  |
+     | aggregate)|     via IPFS +        | aggregate|
+     +-----------+     Blockchain        +----------+
 ```
 
-**Data Distribution:**
-- Non-IID partitioning using Dirichlet(alpha=0.5)
-- Each sample assigned to exactly ONE node (no overlap)
-- Nodes have different amounts and label distributions
+## Port Allocation
 
-**Per Training Round:**
-1. **Local Training**: Each node trains on its partition (2 epochs)
-2. **Aggregator Election**: Round-robin selection (node_0 -> node_1 -> ...)
-3. **Secure Aggregation**: 3-round protocol (Rounds 0, 2, 4)
-   - Round 0: Advertise ECDH + Ed25519 keys
-   - Round 2: Send masked model (quantized weights + PRG masks)
-   - Round 4: Unmask shares for dropped nodes
-4. **Model Update**: All nodes receive aggregated weights from aggregator
-5. **Evaluation**: Accuracy measured on global test set
+| Component | Port |
+|---|---|
+| TTP | 50051 |
+| Node i service | 51000 + i |
+| Node i aggregator | 52000 + i |
+| Node i bridge | 53000 + i |
+| Node i metrics | 61000 + i |
+| Loki | 3100 |
+| Promtail | 9080 |
+| Prometheus | 9090 |
+| Grafana | 3000 |
+| Blockchain Gateway | 9000 |
+| Blockchain Orderer | 7050 |
+| Blockchain Peers | 7051, 8051, 9051 |
 
-## Documentation
-
-- [RUN_INSTRUCTIONS.md](RUN_INSTRUCTIONS.md): Detailed usage guide with troubleshooting
-- [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md): Complete technical overview
-- [TOPOLOGY_IMPLEMENTATION.md](TOPOLOGY_IMPLEMENTATION.md): D-Cliques topology design and implementation
-- [INTER_CLUSTER_AGGREGATION.md](INTER_CLUSTER_AGGREGATION.md): Inter-cluster flow with IPFS/Blockchain
-
-## Security Properties
-
-1. **Privacy**: Server learns only aggregate model (individual updates remain private)
-2. **Authentication**: Ed25519 signatures prevent impersonation
-3. **Consistency**: Round 3 signatures ensure all parties agree on participants
-4. **Dropout Tolerance**: System continues if threshold nodes survive
-5. **No Central Trust**: After TTP setup, no single party controls the system
+Override base ports: `--ttp-port`, `--base-node-port`, `--base-metrics-port`.
 
 ## Configuration
 
-Node configs are generated into `config/nodes/node_X.json` by `scripts/run_docker_with_nodes.py` using the defaults in `config/node.config.template.json`. Update the template to change the baseline settings before launching.
+### Node Config Template
 
-Set the target fleet size via `number_of_nodes` in `config/system-config.json`. The script reads that value automatically when `--nodes` is omitted.
+Node configs are generated from `config/node.config.template.json`. The orchestrator substitutes process-friendly values (localhost addresses, sequential ports). Key training parameters:
 
-```json
-{
-  "dataset": {
-    "alpha": 0.5,
-    "num_clients": 4
-  },
-  "training": {
-    "num_rounds": 10,
-    "local_epochs": 2,
-    "batch_size": 64
-  },
-  "secure_agg": {
-    "threshold": 3,
-    "scale": 1000000.0
-  }
-}
-```
+| Parameter | Default | Description |
+|---|---|---|
+| `training.rounds` | 3 | Federated training rounds |
+| `training.local_epochs` | 1 | Local training epochs per round |
+| `training.batch_size` | 64 | Mini-batch size |
+| `dataset.alpha` | 0.5 | Dirichlet non-IID parameter (lower = more non-IID) |
+| `secure_agg.threshold` | 3 | Minimum nodes for secure aggregation |
 
 ### System Config
 
 Copy `config/system-config.sample.json` to `config/system-config.json` to configure:
-- Convergence detection: `enabled`, `warmup_rounds`, `tol_abs`, `tol_rel`, `patience`
-- Fleet size: `number_of_nodes` for Docker launches
-- Hierarchy behavior: tweak the `hierarchy_levels` array to change scope identifiers, timer intervals, wait windows, and merge policies (`apply_policy`, `apply_alpha`, `fanout_count`, `max_aggregators`). Edit these values to speed up/slow down state or nation rounds or to adjust the interpolation rules applied when nodes pull a high-level model.
+- **Convergence detection**: warmup rounds, tolerance, patience
+- **Fleet size**: `number_of_nodes` (used when `--nodes` is omitted)
+- **Hierarchy levels**: state/nation scope identifiers, timer intervals, merge policies
 
-### Hierarchy Rosters (`config/nodes-map.json`)
+### Hierarchy Rosters
 
-The nodes map mirrors your hierarchy levels and defines which trainers participate in each scope:
+`config/nodes-map.json` defines which trainers belong to each scope:
 
 ```json
 {
-  "nation": [
-    {
-      "nation_id": "nation_0",
-      "states": [
-        {
-          "state_id": "state_alpha",
-          "clusters": [
-            {
-              "cluster_id": "cluster_0",
-              "nodes": ["trainer-node-001", "trainer-node-002"]
-            }
-          ]
-        }
-      ]
-    }
-  ]
+  "nation": [{
+    "nation_id": "nation_0",
+    "states": [{
+      "state_id": "state_alpha",
+      "clusters": [{
+        "cluster_id": "cluster_0",
+        "nodes": ["trainer-node-001", "trainer-node-002", "trainer-node-003"]
+      }]
+    }]
+  }]
 }
 ```
-
-- Update this file when adding/removing nodes or introducing new scopes (e.g., `region`).  
-- The runtime ingests it at startup to build aggregator candidate pools, determine fan-out responsibilities, and map each node to its state/nation IDs.  
-- Keep the keys (`nation_id`, `state_id`, `cluster_id`) in sync with the `scope_id` values declared in `config/system-config.json`.
 
 ### Dataset Configuration
 
-Datasets are configured in `config/datasets.json`. To switch datasets:
-
-1. Download the dataset:
 ```bash
-# List available datasets
-python scripts/prepare_data.py --list
-
-# Download a specific dataset
-python scripts/prepare_data.py --dataset mnist
-python scripts/prepare_data.py --dataset fashion_mnist
-python scripts/prepare_data.py --dataset cifar10
+.venv/bin/python scripts/prepare_data.py --list           # List available datasets
+.venv/bin/python scripts/prepare_data.py --dataset mnist
+.venv/bin/python scripts/prepare_data.py --dataset fashion_mnist
 ```
 
-2. Update `config/node.config.template.json`:
-```json
-{
-  "dataset": {
-    "name": "fashion_mnist",
-    "num_clients": 12,
-    "alpha": 0.5,
-    "seed": 42
-  }
-}
-```
+## Process Runtime Layout
 
-To add a custom dataset (e.g., from Kaggle), add an entry to `config/datasets.json`:
-
-```json
-{
-  "my_kaggle_dataset": {
-    "type": "csv",
-    "train_path": "/app/data/kaggle/train.csv",
-    "test_path": "/app/data/kaggle/test.csv",
-    "num_classes": 10,
-    "input_shape": [1, 784],
-    "label_column": "label"
-  }
-}
-```
-
-Supported dataset types:
-- `torchvision`: Built-in datasets (MNIST, FashionMNIST, CIFAR10, etc.)
-- `csv`: CSV files with features and a label column
-
-## Project Structure
+All runtime state lives under `process-runtime/` (gitignored):
 
 ```
-secure_aggregation/
-├── Makefile                 # Build and run commands
-├── src/secure_aggregation/
-│   ├── communication/       # gRPC services (node_service, aggregator_service, ttp_service)
-│   ├── protocol/            # Secure aggregation protocol (core.py)
-│   ├── crypto/              # Primitives (dh.py, sign.py, aead.py, prg.py, shamir.py)
-│   ├── data/                # Dirichlet partitioning (partition.py)
-│   ├── node/                # Node engine (engine.py)
-│   ├── training/            # MNIST training flow (mnist_flow.py)
-│   ├── topology/            # Topology utilities (graph.py)
-│   └── config/              # Configuration models (models.py)
-├── config/
-│   ├── nodes/               # Generated node configurations
-│   ├── keys/                # Trainer keys (generated)
-│   ├── datasets.json        # Dataset configurations
-│   └── node.config.template.json
-├── docker/
-│   ├── docker-compose.yml   # Base compose template
-│   ├── docker-compose.auto.yml  # Generated compose file
-│   └── node.Dockerfile
-├── protos/                  # gRPC protocol definitions
-├── scripts/
-│   ├── run_docker_with_nodes.py  # Main orchestrator
-│   ├── prepare_data.py           # Download datasets
-│   ├── run_ttp_with_topology.py  # TTP service runner
-│   ├── generate_grafana_dashboard.py  # Dashboard generator
-│   └── generate_keys.py          # Key generation utility
-└── tests/                   # Unit and integration tests
+process-runtime/
+├── registry.json               # Managed process tracking
+├── datasets.json               # Process-mode dataset paths
+├── topology.json               # D-Cliques topology
+├── config/nodes/               # Per-node JSON configs
+├── nodes/
+│   └── node_<i>/
+│       ├── data/               # Symlink to shared dataset
+│       ├── logs/node.log       # Node stdout/stderr
+│       ├── checkpoints/        # Model checkpoints
+│       └── pids/               # PID files
+├── logs/                       # TTP, IPFS, monitoring logs
+├── pids/                       # Infrastructure PID files
+└── observability/
+    ├── loki.yml                # Loki config (auto-generated)
+    ├── promtail.yml            # Promtail config (auto-generated)
+    ├── prometheus.yml          # Prometheus config (auto-generated)
+    └── grafana/
+        ├── provisioning/       # Datasources + dashboard providers
+        └── dashboards/         # Auto-provisioned dashboard JSON
 ```
 
-## Performance
+## Make Targets
 
-- **Training Time**: 3-5 minutes for 10 rounds on CPU
-- **Communication**: ~5MB per node per round (quantized weights)
-- **Final Accuracy**: 91.81% on MNIST test set (verified)
-- **Scalability**: Tested with 4-10 nodes
-
-## Monitoring
-
-```bash
-# View all logs in real-time
-make logs
-
-# View specific node logs
-make logs-node NODE=0
-
-# Save all logs to file
-docker compose -f docker/docker-compose.auto.yml logs > training.log
-
-# Check container status
-docker compose -f docker/docker-compose.auto.yml ps
-```
-
-Access the monitoring dashboards:
-- Grafana: http://localhost:3000 (admin/admin)
-- Prometheus: http://localhost:9090
-
-## Testing
-
-```bash
-# Run all tests
-make test
-
-# Run with coverage
-make test-coverage
-
-# Run specific test suite
-PYTHONPATH=src .venv/bin/python -m pytest tests/test_protocol.py -v
-```
+| Target | Description |
+|---|---|
+| `make setup` | Full setup: venv, deps, gRPC, data, blockchain, monitoring |
+| `make start` | Start full system (runs setup first) |
+| `make start NODES=10 CLIQUE_SIZE=5` | Start with custom topology |
+| `make stop` | Stop all managed processes |
+| `make status` | Show status of all processes |
+| `make logs` | View aggregated logs |
+| `make logs-node NODE=trainer-node-001` | View logs for a specific node |
+| `make logs-errors` | View error-level logs only |
+| `make clean` | Stop processes, remove generated files |
+| `make clean-all` | Full cleanup including virtual environment |
+| `make test` | Run unit tests |
+| `make test-coverage` | Run tests with coverage |
 
 ## Troubleshooting
 
-### SSL Certificate Errors (MNIST Download)
+### Port Conflicts
+```bash
+.venv/bin/python scripts/secureagg_ctl.py cleanup
+make status
+```
 
-The `prepare_data.py` script handles SSL issues automatically. If errors persist:
+### SSL Certificate Errors (MNIST Download)
 ```bash
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-python scripts/prepare_data.py
+.venv/bin/python scripts/prepare_data.py
 ```
 
 ### gRPC Import Error
-
-If you see `ModuleNotFoundError: No module named 'secureagg_pb2'`:
+If `ModuleNotFoundError: No module named 'secureagg_pb2'`:
 ```bash
 sed -i '' 's/^import secureagg_pb2/from . import secureagg_pb2/' \
     src/secure_aggregation/communication/secureagg_pb2_grpc.py
 ```
 
-### gRPC Message Size Configuration
-
-Aggregator RPC servers and clients now set `grpc.max_send_message_length` and `grpc.max_receive_message_length` to 200 MB so CIFAR-scale models fit inside SAP Round 2 payloads. Export `GRPC_MAX_MESSAGE_MB=<megabytes>` before starting services to customize this ceiling.
-
-### Port Conflicts
-
-If port 50051 is in use, edit `docker/docker-compose.yml` to change the TTP port mapping.
-
-### Docker Build Issues
-
-```bash
-make clean-all
-make start
-```
-
-### Nodes Stuck or Not Progressing
-
-```bash
-make logs
-make stop
-make start
-```
-
 ### Blockchain Setup Failures
-
-Ensure the `thesis-blockchain` repository is cloned as a sibling directory and Hyperledger Fabric binaries are installed:
 ```bash
 ls ../thesis-blockchain/api-gateway/
-which cryptogen configtxgen fabric-ca-client
+which cryptogen configtxgen fabric-ca-server fabric-ca-client
+```
+
+### Nodes Not Progressing
+```bash
+make logs-errors
+make stop && make start
+```
+
+### Grafana Shows "No Data"
+Verify Prometheus targets are up:
+```bash
+curl -s 'http://localhost:9090/api/v1/targets' | python3 -c "
+import sys, json
+targets = json.load(sys.stdin)['data']['activeTargets']
+for t in targets:
+    print(f\"{t['scrapeUrl']:40s} {t['health']}  {t.get('lastError', '')}\")
+"
+```
+
+If all targets show `down`, ensure `prometheus_client` is installed:
+```bash
+.venv/bin/pip install prometheus_client
+```
+Then restart the stack.
+
+## Security Properties
+
+1. **Privacy**: Server learns only aggregate model, never individual updates
+2. **Authentication**: Ed25519 signatures prevent impersonation
+3. **Consistency**: Round 3 signatures ensure all parties agree on participants
+4. **Dropout Tolerance**: System continues if threshold nodes survive
+5. **No Central Trust**: After TTP setup, no single party controls the system
+
+## Performance
+
+| Metric | Value |
+|---|---|
+| Per round | ~30-60 seconds (CPU) |
+| Full training (10 rounds) | ~5-10 minutes |
+| Final accuracy (MNIST) | ~91% |
+| Communication | ~5MB per node per round |
+| Tested scale | 4-10 nodes |
+
+## Project Structure
+
+```
+secure_aggregation/
+├── Makefile                          # Build and run commands
+├── scripts/
+│   ├── secureagg_ctl.py              # Unified CLI orchestrator
+│   ├── install_monitoring.sh         # Monitoring tools installer
+│   ├── runtime/
+│   │   ├── port_allocator.py         # Deterministic port allocation
+│   │   ├── process_registry.py       # PID tracking and lifecycle
+│   │   ├── config_generator.py       # Per-node config generation
+│   │   ├── ipfs_manager.py           # IPFS daemon management
+│   │   ├── blockchain_helpers.py     # Blockchain artifact prep
+│   │   ├── observability.py          # Loki/Promtail/Prometheus/Grafana
+│   │   └── loki_client.py            # Loki HTTP API client
+│   ├── run_ttp_with_topology.py      # TTP service runner
+│   └── prepare_data.py               # Download datasets
+├── src/secure_aggregation/
+│   ├── communication/     # gRPC services (node, aggregator, TTP)
+│   ├── protocol/          # Secure aggregation protocol (core.py)
+│   ├── crypto/            # Primitives (DH, signatures, AEAD, PRG, Shamir)
+│   ├── data/              # Dirichlet partitioning
+│   ├── node/              # Node engine
+│   ├── training/          # MNIST training flow
+│   ├── topology/          # D-Cliques topology
+│   └── config/            # Configuration models
+├── config/
+│   ├── datasets.json               # Dataset configurations
+│   ├── node.config.template.json   # Node config template
+│   ├── ipfs-process.json           # IPFS daemon config
+│   └── system-config.sample.json   # System config sample
+├── docker/grafana/dashboards/      # Grafana dashboard templates
+├── protos/                         # gRPC protocol definitions
+└── tests/                          # Unit and integration tests
 ```
 
 ## References
 
-This implementation follows the paper:
 > Bonawitz, Keith, et al. "Practical secure aggregation for privacy-preserving machine learning." ACM CCS 2017.
 
 ## License
 
 See [LICENSE](LICENSE) file for details.
-
----
-
-**Status**: Fully Functional | **Last Updated**: 2025-12-20 | **Version**: 1.1.0

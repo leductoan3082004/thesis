@@ -40,6 +40,9 @@ logs/
 checkpoints/
 *.log
 
+# Process runtime
+process-runtime/
+
 # Jupyter
 .ipynb_checkpoints/
 
