@@ -95,6 +95,131 @@ cp ../thesis-blockchain/api-gateway/.env.example ../thesis-blockchain/api-gatewa
 ```
 </details>
 
+### Step 2b: Install the IPFS Binary (Kubo)
+
+Process-mode runtime launches multiple IPFS daemons on the host, so the `ipfs` binary must be installed and on your `PATH`.
+
+#### Option 1 — Use the helper script
+
+```bash
+make install-ipfs                  # downloads kubo_v0.30.0_<platform>-<arch>.tar.gz
+# or override defaults:
+# IPFS_VERSION=v0.29.0 IPFS_INSTALL_PREFIX=/opt make install-ipfs
+```
+
+The script downloads the requested release from `https://dist.ipfs.tech/kubo`, copies `ipfs` into `${IPFS_INSTALL_PREFIX:-$HOME/.local}/bin`, and prints the installed version. Make sure that directory is exported in your shell:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+#### Option 2 — Manual install
+
+```bash
+VERSION=v0.30.0
+PLATFORM=linux-amd64   # use darwin-amd64 or darwin-arm64 for macOS
+curl -L "https://dist.ipfs.tech/kubo/${VERSION}/kubo_${VERSION}_${PLATFORM}.tar.gz" -o /tmp/kubo.tgz
+tar -xzf /tmp/kubo.tgz -C /tmp
+cp /tmp/kubo/ipfs ~/.local/bin/ipfs
+chmod +x ~/.local/bin/ipfs
+```
+
+Verify the installation:
+
+```bash
+ipfs --version     # should output go-ipfs/kubo version
+```
+
+### Step 2c: Install Hyperledger Fabric CLI Binaries
+
+The blockchain stack runs native Fabric components, so the host must provide `cryptogen`, `configtxgen`, `fabric-ca-client`, `fabric-ca-server`, plus the standard `peer`/`orderer` CLIs.
+
+#### Option 1 — Use the helper script
+
+```bash
+make install-fabric
+# ENV overrides:
+# FABRIC_VERSION=2.5.6 FABRIC_CA_VERSION=1.5.9 FABRIC_INSTALL_PREFIX=/opt make install-fabric
+```
+
+This downloads the official release tarballs from `github.com/hyperledger/fabric` and `fabric-ca`, extracts every binary from `bin/`, and copies them into `${FABRIC_INSTALL_PREFIX:-$HOME/.local}/bin`. Ensure that directory is exported in `PATH` (see Step 2b).
+
+#### Option 2 — Manual install
+
+```bash
+FABRIC_VERSION=2.5.6
+FABRIC_CA_VERSION=1.5.9
+PLATFORM=linux-amd64   # use darwin-amd64 / darwin-arm64 on macOS
+curl -L "https://github.com/hyperledger/fabric/releases/download/v${FABRIC_VERSION}/hyperledger-fabric-${PLATFORM}-${FABRIC_VERSION}.tar.gz" | tar -xz -C /tmp
+curl -L "https://github.com/hyperledger/fabric-ca/releases/download/v${FABRIC_CA_VERSION}/hyperledger-fabric-ca-${PLATFORM}-${FABRIC_CA_VERSION}.tar.gz" | tar -xz -C /tmp
+cp /tmp/bin/* ~/.local/bin/
+chmod +x ~/.local/bin/*
+```
+
+Verify:
+
+```bash
+cryptogen version
+configtxgen version
+fabric-ca-client version
+fabric-ca-server version
+```
+
+### Step 2d: Install Node.js Runtime (for blockchain helpers)
+
+The blockchain helper scripts inside `thesis-blockchain/api-gateway` use Node 18+ and npm. Install Node.js system-wide or in your home directory.
+
+#### Option 1 — Package manager (Ubuntu/Debian)
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+sudo apt-get install -y nodejs
+```
+
+Replace `setup_20.x` with `setup_18.x` if you prefer LTS 18.
+
+#### Option 2 — Manual tarball (no sudo required)
+
+```bash
+VERSION=v20.19.1         # match your dev machine
+PLATFORM=linux-x64       # or linux-arm64 for Arm servers
+curl -LO "https://nodejs.org/dist/${VERSION}/node-${VERSION}-${PLATFORM}.tar.xz"
+tar -xJf "node-${VERSION}-${PLATFORM}.tar.xz"
+mkdir -p ~/.local
+cp -r "node-${VERSION}-${PLATFORM}"/{bin,lib,include,share} ~/.local/
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Verify:
+
+```bash
+node -v
+npm -v
+```
+
+### Step 2e: Rebuild `vctool` for Your Platform
+
+The verifiable-credential helper (`thesis-blockchain/api-gateway/api/vctool`) is a Go binary. The repo ships a macOS build; for Linux servers you must rebuild it locally.
+
+#### Option 1 — Helper target (Go toolchain required)
+
+```bash
+make build-vctool
+# or override repo path:
+# BLOCKCHAIN_DIR=/opt/thesis-blockchain/api-gateway make build-vctool
+```
+
+This runs `go build ./cmd/vctool` inside `../thesis-blockchain/api-gateway/api`, using your host `GOOS/GOARCH`, and replaces `api/vctool` with the new binary.
+
+#### Option 2 — Manual build
+
+```bash
+cd ../thesis-blockchain/api-gateway/api
+GOOS=linux GOARCH=amd64 go build -o vctool ./cmd/vctool      # adjust GOARCH for arm64
+```
+
+Ensure the resulting `api/vctool` is executable (`chmod +x api/vctool`) and rerun `make start`.
+
 ### Step 3: Start the Full System
 
 ```bash
@@ -436,8 +561,11 @@ sed -i '' 's/^import secureagg_pb2/from . import secureagg_pb2/' \
 
 ### Blockchain Setup Failures
 ```bash
+make install-fabric           # installs cryptogen/configtxgen/fabric-ca-*
 ls ../thesis-blockchain/api-gateway/
 which cryptogen configtxgen fabric-ca-server fabric-ca-client
+node -v && npm -v             # require Node.js 18+ with npm
+make build-vctool             # rebuild VC signing helper for host platform
 ```
 
 ### Nodes Not Progressing

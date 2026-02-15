@@ -13,7 +13,7 @@
 #   NODES=6             - Number of training nodes (default: 6)
 #   CLIQUE_SIZE=3       - Size of each clique in D-Cliques topology (default: 3)
 
-.PHONY: setup start stop status logs clean test help
+.PHONY: setup start stop status logs clean test help install-ipfs install-fabric build-vctool
 .PHONY: setup-venv setup-deps setup-grpc setup-data setup-blockchain setup-monitoring
 .PHONY: logs-node logs-errors clean-all
 
@@ -67,6 +67,18 @@ help:
 	@echo "  make start NODES_MAP=config/nodes-map.json CLIQUE_SIZE=4"
 	@echo "  make logs-node NODE=trainer-node-001"
 	@echo "  make logs-errors"
+
+install-ipfs:
+	@echo "Installing IPFS (Kubo)..."
+	@bash $(PROJECT_ROOT)/scripts/install_ipfs.sh
+
+install-fabric:
+	@echo "Installing Hyperledger Fabric CLI binaries..."
+	@bash $(PROJECT_ROOT)/scripts/install_fabric_binaries.sh
+
+build-vctool:
+	@echo "Building vctool from blockchain repo..."
+	@bash $(PROJECT_ROOT)/scripts/build_vctool.sh
 
 
 # ------------------------------------------------------------------------------
