@@ -39,6 +39,8 @@ data/
 logs/
 checkpoints/
 *.log
+!src/secure_aggregation/data/
+!src/secure_aggregation/data/*.py
 
 # Process runtime
 process-runtime/

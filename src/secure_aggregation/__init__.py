@@ -8,4 +8,4 @@ Phases implemented:
 - Inter-cluster aggregation
 """
 
-__all__ = ["config", "crypto", "topology", "utils", "storage", "node", "protocol"]
+__all__ = ["config", "crypto", "topology", "utils", "storage", "node", "protocol", "data"]
