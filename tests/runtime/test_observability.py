@@ -15,6 +15,7 @@ from scripts.runtime.observability import (
     generate_loki_config,
     generate_prometheus_config,
     generate_promtail_config,
+    start_promtail,
 )
 
 
@@ -76,7 +77,7 @@ class TestGeneratePromtailConfig:
         assert str(tmp_path) in positions
 
     def test_node_ids_label_attached(self, tmp_path):
-        """When node_ids are provided, each FL node stream gets a node_id label."""
+        """When node_ids are provided, node_id labels are derived from node_index."""
         node_ids = ["trainer-node-001", "trainer-node-002"]
         config_path = generate_promtail_config(tmp_path, node_count=2, node_ids=node_ids)
         content = config_path.read_text()
@@ -85,13 +86,16 @@ class TestGeneratePromtailConfig:
         else:
             data = json.loads(content)
         fl_job = [sc for sc in data["scrape_configs"] if sc["job_name"] == "fl_nodes"][0]
-        static_cfgs = fl_job["static_configs"]
-        assert len(static_cfgs) == 2
-        assert static_cfgs[0]["labels"]["node_id"] == "trainer-node-001"
-        assert static_cfgs[1]["labels"]["node_id"] == "trainer-node-002"
+        matches = [s["match"] for s in fl_job["pipeline_stages"] if "match" in s]
+        selectors = [m["selector"] for m in matches]
+        assert '{service="fl_node", node_index="0"}' in selectors
+        assert '{service="fl_node", node_index="1"}' in selectors
+        static_labels = [m["stages"][0]["static_labels"]["node_id"] for m in matches]
+        assert "trainer-node-001" in static_labels
+        assert "trainer-node-002" in static_labels
 
-    def test_per_node_static_configs(self, tmp_path):
-        """Each node gets its own static_config entry with node_index label."""
+    def test_single_static_config_for_fl_nodes(self, tmp_path):
+        """FL node scraping uses one wildcard target to reduce target-manager load."""
         config_path = generate_promtail_config(tmp_path, node_count=3)
         content = config_path.read_text()
         if HAS_YAML:
@@ -99,9 +103,27 @@ class TestGeneratePromtailConfig:
         else:
             data = json.loads(content)
         fl_job = [sc for sc in data["scrape_configs"] if sc["job_name"] == "fl_nodes"][0]
-        assert len(fl_job["static_configs"]) == 3
-        indices = [sc["labels"]["node_index"] for sc in fl_job["static_configs"]]
-        assert indices == ["0", "1", "2"]
+        assert len(fl_job["static_configs"]) == 1
+        assert "node_*/logs/*.log" in fl_job["static_configs"][0]["labels"]["__path__"]
+
+    def test_start_promtail_fails_fast_when_process_exits(self, tmp_path, monkeypatch):
+        (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "pids").mkdir(parents=True, exist_ok=True)
+
+        class _DeadProc:
+            pid = 12345
+            returncode = 1
+
+            @staticmethod
+            def poll():
+                return 1
+
+        monkeypatch.setattr("scripts.runtime.observability.shutil.which", lambda _name: "/usr/bin/promtail")
+        monkeypatch.setattr("scripts.runtime.observability.subprocess.Popen", lambda *args, **kwargs: _DeadProc())
+        monkeypatch.setattr("scripts.runtime.observability.time.sleep", lambda _secs: None)
+
+        with pytest.raises(SystemExit, match="Promtail exited immediately"):
+            start_promtail(tmp_path, node_count=2, node_ids=["trainer-node-001", "trainer-node-002"])
 
 
 class TestGeneratePrometheusConfig:

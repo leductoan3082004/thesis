@@ -112,19 +112,41 @@ def generate_promtail_config(
 
     scrape_configs: List[Dict[str, Any]] = []
 
-    # Scrape FL node logs — one static_config per node so we can attach
-    # both node_index and node_id (trainer ID) as labels.
-    fl_static_configs: List[Dict[str, Any]] = []
-    for idx in range(node_count):
-        labels: Dict[str, str] = {
-            "service": "fl_node",
-            "node_index": str(idx),
-            "__path__": str(runtime_dir / "nodes" / f"node_{idx}" / "logs" / "*.log"),
-        }
-        if node_ids and idx < len(node_ids):
-            labels["node_id"] = node_ids[idx]
-        fl_static_configs.append({"targets": ["localhost"], "labels": labels})
-    scrape_configs.append({"job_name": "fl_nodes", "static_configs": fl_static_configs})
+    # Scrape FL node logs through a single file target and derive node labels
+    # from the concrete filename to keep target count small.
+    pipeline_stages: List[Dict[str, Any]] = [
+        {
+            "regex": {
+                "source": "filename",
+                "expression": r".*/node_(?P<node_index>[0-9]+)/logs/.*",
+            }
+        },
+        {"labels": {"node_index": "node_index"}},
+    ]
+    if node_ids:
+        for idx, node_id in enumerate(node_ids):
+            pipeline_stages.append(
+                {
+                    "match": {
+                        "selector": '{service="fl_node", node_index="' + str(idx) + '"}',
+                        "stages": [{"static_labels": {"node_id": node_id}}],
+                    }
+                }
+            )
+    fl_job = {
+        "job_name": "fl_nodes",
+        "pipeline_stages": pipeline_stages,
+        "static_configs": [
+            {
+                "targets": ["localhost"],
+                "labels": {
+                    "service": "fl_node",
+                    "__path__": str(runtime_dir / "nodes" / "node_*" / "logs" / "*.log"),
+                },
+            }
+        ],
+    }
+    scrape_configs.append(fl_job)
 
     # Scrape TTP logs.
     ttp_log = runtime_dir / "logs" / "ttp.log"
@@ -194,6 +216,12 @@ def start_promtail(
         env=os.environ.copy(),
     )
     log_handle.close()
+    # Fail fast so callers can rollback when promtail cannot initialize.
+    time.sleep(1)
+    if proc.poll() is not None:
+        tail = _tail_file(log_path)
+        details = f"\nRecent promtail log output:\n{tail}" if tail else ""
+        raise SystemExit(f"Promtail exited immediately (code {proc.returncode}).{details}")
     return ManagedProcess(
         name="promtail",
         pid=proc.pid,
@@ -470,3 +498,10 @@ def _grafana_homepath(binary_path: str) -> str:
         if (candidate / "public").exists():
             return str(candidate)
     return str(bin_dir.parent)
+
+
+def _tail_file(path: Path, line_count: int = 20) -> str:
+    if not path.exists():
+        return ""
+    lines = path.read_text(errors="replace").splitlines()
+    return "\n".join(lines[-line_count:])

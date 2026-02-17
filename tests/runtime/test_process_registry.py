@@ -191,6 +191,14 @@ class TestPidAlive:
     def test_negative_pid_is_dead(self):
         assert _pid_alive(-42) is False
 
+    def test_zombie_pid_is_dead(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import os; os._exit(0)"])
+        time.sleep(0.1)
+        try:
+            assert _pid_alive(proc.pid) is False
+        finally:
+            proc.wait(timeout=5)
+
 
 class TestKillPid:
     def test_kill_nonexistent_pid_is_safe(self):

@@ -184,6 +184,16 @@ def _pid_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
+    # A zombie process still responds to kill(pid, 0) but is not a healthy
+    # running service.
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        stat = stat_path.read_text()
+        fields = stat.split()
+        if len(fields) > 2 and fields[2] == "Z":
+            return False
+    except OSError:
+        return False
     return True
 
 
