@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import socket
 import time
 from collections import deque, defaultdict
 from pathlib import Path
@@ -172,6 +173,9 @@ class NodeService(HierarchyMixin):
         self.port = self.config["port"]
         self.aggregator_port_offset = self._resolve_port_offset("aggregator_port_offset", 1000)
         self.bridge_port_offset = self._resolve_port_offset("bridge_port_offset", 2000)
+        self._aggregator_port_guard: Optional[socket.socket] = None
+        self._bridge_port_guard: Optional[socket.socket] = None
+        self._port_guard_notices: Set[str] = set()
         self.network_host = (
             self.config.get("network_host")
             or os.environ.get("NODE_HOSTNAME")
@@ -317,6 +321,7 @@ class NodeService(HierarchyMixin):
         self.train_indices: List[int] = []
         self.val_indices: List[int] = []
 
+        self._initialize_port_guards()
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
 
     def _load_config(self, path: str) -> dict:
@@ -336,6 +341,54 @@ class NodeService(HierarchyMixin):
             logger.warning("%s=%s cannot be negative; defaulting to %d", key, value, default)
             return default
         return offset
+
+    def _initialize_port_guards(self) -> None:
+        """Reserve aggregator/bridge ports so the OS never assigns them to ephemeral sockets."""
+        self._ensure_port_guard("_aggregator_port_guard", self._aggregator_listen_port(), "aggregator")
+        self._ensure_port_guard("_bridge_port_guard", self._bridge_listen_port(), "bridge")
+
+    def _acquire_port_guard(self, port: int, label: str) -> socket.socket:
+        """Bind a dummy socket to keep a port reserved until the real server starts."""
+        last_error: Optional[Exception] = None
+        for family, bind_addr in (
+            (socket.AF_INET6, ("::", port)),
+            (socket.AF_INET, ("0.0.0.0", port)),
+        ):
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+                    # Mirror gRPC's default dual-stack behavior.
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                sock.bind(bind_addr)
+                sock.listen(1)
+                return sock
+            except OSError as exc:
+                last_error = exc
+                sock.close()
+        raise RuntimeError(
+            f"Port guard for {label} failed on port {port}: {last_error}"
+        )
+
+    def _ensure_port_guard(self, attr: str, port: int, label: str) -> None:
+        """Ensure we hold a guard socket for the given label."""
+        guard = getattr(self, attr, None)
+        if guard:
+            return
+        guard = self._acquire_port_guard(port, label)
+        setattr(self, attr, guard)
+        if label not in self._port_guard_notices:
+            logger.info("Reserved %s port %d for node %s", label, port, self.node_id)
+            self._port_guard_notices.add(label)
+
+    def _release_port_guard(self, attr: str) -> None:
+        """Close and clear the guard socket for the supplied attribute."""
+        guard = getattr(self, attr, None)
+        if guard:
+            try:
+                guard.close()
+            finally:
+                setattr(self, attr, None)
 
     def _load_convergence_config(self) -> ConvergenceConfig:
         """Load convergence configuration preferring the shared system config."""
@@ -1014,6 +1067,7 @@ class NodeService(HierarchyMixin):
             signing_public_keys = {p.node_id: bytes(p.signing_public_key) for p in self.participants}
         convergence_handler = None
         agg_port = self._aggregator_listen_port()
+        self._release_port_guard("_aggregator_port_guard")
         try:
             self.aggregator_server, self.aggregator_servicer = serve_aggregator(
                 self.node_id,
@@ -1030,18 +1084,25 @@ class NodeService(HierarchyMixin):
                 self.node_id,
                 agg_port,
             )
+            self._ensure_port_guard("_aggregator_port_guard", agg_port, "aggregator")
+            raise
+        except Exception:
+            self._ensure_port_guard("_aggregator_port_guard", agg_port, "aggregator")
             raise
         logger.info(f"Started aggregator server on port {agg_port} for {len(participant_ids)} clique members")
 
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
-        if self.aggregator_server:
-            stop_future = self.aggregator_server.stop(0)
-            if stop_future:
-                stop_future.wait()
-            self.aggregator_server = None
-            self.aggregator_servicer = None
-            logger.info("Stopped aggregator server")
+        try:
+            if self.aggregator_server:
+                stop_future = self.aggregator_server.stop(0)
+                if stop_future:
+                    stop_future.wait()
+                self.aggregator_server = None
+                self.aggregator_servicer = None
+                logger.info("Stopped aggregator server")
+        finally:
+            self._ensure_port_guard("_aggregator_port_guard", self._aggregator_listen_port(), "aggregator")
 
     def setup_inter_cluster(self) -> None:
         """Setup inter-cluster aggregation components."""
@@ -1139,6 +1200,7 @@ class NodeService(HierarchyMixin):
         if self.bridge_server is None:
             bridge_port = self._bridge_listen_port()
             try:
+                self._release_port_guard("_bridge_port_guard")
                 self.bridge_server = serve_bridge(
                     self.node_id,
                     bridge_port,
@@ -1153,6 +1215,7 @@ class NodeService(HierarchyMixin):
             except Exception as exc:  # noqa: BLE001
                 self.bridge_server = None
                 logger.error("Failed to start bridge server on port %d: %s", bridge_port, exc, exc_info=True)
+                self._ensure_port_guard("_bridge_port_guard", bridge_port, "bridge")
         if self.bridge_client is None and (self.inter_cluster_enabled or state_layer_requested):
             self.bridge_client = BridgeClient(self.node_id)
 
@@ -1236,16 +1299,19 @@ class NodeService(HierarchyMixin):
     def stop_bridge_server(self) -> None:
         """Stop bridge server."""
         stopped = False
-        if self.bridge_server:
-            stop_future = self.bridge_server.stop(0)
-            if stop_future:
-                stop_future.wait()
-            self.bridge_server = None
-            stopped = True
-        if self.bridge_client:
-            self.bridge_client.close()
-            self.bridge_client = None
-            stopped = True
+        try:
+            if self.bridge_server:
+                stop_future = self.bridge_server.stop(0)
+                if stop_future:
+                    stop_future.wait()
+                self.bridge_server = None
+                stopped = True
+            if self.bridge_client:
+                self.bridge_client.close()
+                self.bridge_client = None
+                stopped = True
+        finally:
+            self._ensure_port_guard("_bridge_port_guard", self._bridge_listen_port(), "bridge")
         if stopped:
             logger.info("Bridge server stopped")
 

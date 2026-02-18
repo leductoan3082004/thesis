@@ -445,7 +445,7 @@ make clean-all
 | Blockchain Peers | 7051, 8051, 9051 |
 
 Override base ports: `--ttp-port`, `--base-node-port`, `--base-metrics-port`.
-Before launching on a shared or long-lived host (especially in process mode), confirm that the derived aggregator and bridge ports are available via `lsof -i :<port>` or similar. If another service is bound to the same offset, set `aggregator_port_offset` / `bridge_port_offset` in the node config to avoid collisions.
+Before launching on a shared or long-lived host (especially in process mode), confirm that the derived aggregator and bridge ports are available via `lsof -i :<port>` or similar. If another service is bound to the same offset, set `aggregator_port_offset` / `bridge_port_offset` in the node config to avoid collisions. Each node keeps guard sockets open on those ports whenever the gRPC servers are idle, so the OS will never hand them out to HTTP/IPFS traffic; startup will fail fast if the reservation cannot be made.
 
 ## Configuration
 
@@ -459,8 +459,8 @@ Node configs are generated from `config/node.config.template.json`. The orchestr
 | `training.local_epochs` | 1 | Local training epochs per round |
 | `training.batch_size` | 64 | Mini-batch size |
 | `dataset.alpha` | 0.5 | Dirichlet non-IID parameter (lower = more non-IID) |
-| `aggregator_port_offset` | 1000 | gRPC port offset used when the node acts as aggregator; adjust if another process binds the derived port. |
-| `bridge_port_offset` | 2000 | gRPC port offset dedicated to the bridge service for ECM gossip. |
+| `aggregator_port_offset` | 1000 | Offset added to the node port for the aggregator gRPC server; the node keeps this port reserved whenever the server isn’t running. |
+| `bridge_port_offset` | 2000 | Offset reserved for the ECM bridge service; adjust if another component legitimately needs that port. |
 | `secure_agg.threshold` | 3 | Minimum nodes for secure aggregation |
 
 ### System Config
