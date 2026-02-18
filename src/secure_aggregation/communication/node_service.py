@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, Subset
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
 from secure_aggregation.communication.aggregator_service import (
     AggregatorServicer,
+    PortBindingError,
     grpc_message_options,
     serve as serve_aggregator,
 )
@@ -169,6 +170,8 @@ class NodeService(HierarchyMixin):
         self.role = NodeRole(self.config["role"])
         self.ttp_address = self.config["ttp_address"]
         self.port = self.config["port"]
+        self.aggregator_port_offset = self._resolve_port_offset("aggregator_port_offset", 1000)
+        self.bridge_port_offset = self._resolve_port_offset("bridge_port_offset", 2000)
         self.network_host = (
             self.config.get("network_host")
             or os.environ.get("NODE_HOSTNAME")
@@ -320,6 +323,19 @@ class NodeService(HierarchyMixin):
         """Load node configuration from JSON file."""
         with open(path) as f:
             return json.load(f)
+
+    def _resolve_port_offset(self, key: str, default: int) -> int:
+        """Parse a configurable port offset, falling back to a sane default."""
+        value = self.config.get(key, default)
+        try:
+            offset = int(value)
+        except (TypeError, ValueError):
+            logger.warning("%s=%s is invalid; defaulting to %d", key, value, default)
+            return default
+        if offset < 0:
+            logger.warning("%s=%s cannot be negative; defaulting to %d", key, value, default)
+            return default
+        return offset
 
     def _load_convergence_config(self) -> ConvergenceConfig:
         """Load convergence configuration preferring the shared system config."""
@@ -953,6 +969,38 @@ class NodeService(HierarchyMixin):
             return None
         return self._scope_round_budget()
 
+    def _aggregator_listen_port(self) -> int:
+        """Local gRPC port used when this node is the clique aggregator."""
+        return int(self.port) + self.aggregator_port_offset
+
+    def _bridge_listen_port(self) -> int:
+        """Local gRPC port used for bridge gossip."""
+        return int(self.port) + self.bridge_port_offset
+
+    def _address_with_offset(self, address: Optional[str], offset: int, label: str) -> Optional[str]:
+        """Apply a port offset to an address of the form host:port."""
+        if not address:
+            return None
+        try:
+            host, port_str = address.rsplit(":", 1)
+        except ValueError:
+            logger.error("Invalid %s address '%s'", label, address)
+            return None
+        try:
+            base_port = int(port_str)
+        except ValueError:
+            logger.error("Invalid %s port in address '%s'", label, address)
+            return None
+        return f"{host}:{base_port + offset}"
+
+    def _aggregator_rpc_address(self) -> Optional[str]:
+        """Remote address that points to the elected aggregator's gRPC endpoint."""
+        return self._address_with_offset(
+            self.aggregator_address,
+            self.aggregator_port_offset,
+            "aggregator",
+        )
+
     def start_aggregator_server(self) -> None:
         """Start aggregator gRPC server if this node is elected."""
         if self.aggregator_server is not None:
@@ -965,16 +1013,25 @@ class NodeService(HierarchyMixin):
         if self.participants:
             signing_public_keys = {p.node_id: bytes(p.signing_public_key) for p in self.participants}
         convergence_handler = None
-        self.aggregator_server, self.aggregator_servicer = serve_aggregator(
-            self.node_id,
-            self.port + 1000,
-            self.threshold,
-            participant_ids,
-            signing_public_keys=signing_public_keys or None,
-            ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
-            convergence_signal_handler=convergence_handler,
-        )
-        logger.info(f"Started aggregator server on port {self.port + 1000} for {len(participant_ids)} clique members")
+        agg_port = self._aggregator_listen_port()
+        try:
+            self.aggregator_server, self.aggregator_servicer = serve_aggregator(
+                self.node_id,
+                agg_port,
+                self.threshold,
+                participant_ids,
+                signing_public_keys=signing_public_keys or None,
+                ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
+                convergence_signal_handler=convergence_handler,
+            )
+        except PortBindingError:
+            logger.error(
+                "Failed to bind aggregator server for %s on port %d; another process may be using it",
+                self.node_id,
+                agg_port,
+            )
+            raise
+        logger.info(f"Started aggregator server on port {agg_port} for {len(participant_ids)} clique members")
 
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
@@ -1080,21 +1137,22 @@ class NodeService(HierarchyMixin):
             freshness = float(self.inter_cluster_config.get("freshness_window", 300.0))
             self.ecm_buffer = ECMBuffer(freshness_window=freshness)
         if self.bridge_server is None:
+            bridge_port = self._bridge_listen_port()
             try:
                 self.bridge_server = serve_bridge(
                     self.node_id,
-                    self.port + 2000,
+                    bridge_port,
                     self.ecm_buffer,
                     ecm_hooks=self._bridge_ecm_hooks or None,
                 )
                 logger.info(
                     "Bridge server started on port %d (state_layer=%s)",
-                    self.port + 2000,
+                    bridge_port,
                     state_layer_requested,
                 )
             except Exception as exc:  # noqa: BLE001
                 self.bridge_server = None
-                logger.error("Failed to start bridge server on port %d: %s", self.port + 2000, exc, exc_info=True)
+                logger.error("Failed to start bridge server on port %d: %s", bridge_port, exc, exc_info=True)
         if self.bridge_client is None and (self.inter_cluster_enabled or state_layer_requested):
             self.bridge_client = BridgeClient(self.node_id)
 
@@ -1135,10 +1193,14 @@ class NodeService(HierarchyMixin):
                     f"Could not resolve bridge address for neighbor {neighbor}; ECM gossip disabled for this edge"
                 )
                 continue
-            host, port_str = base_address.split(":")
-            neighbor_bridge_port = int(port_str) + 2000
-            address = f"{host}:{neighbor_bridge_port}"
-            self.neighbor_address_map[neighbor] = address
+            neighbor_bridge_addr = self._address_with_offset(
+                base_address,
+                self.bridge_port_offset,
+                f"neighbor {neighbor}",
+            )
+            if not neighbor_bridge_addr:
+                continue
+            self.neighbor_address_map[neighbor] = neighbor_bridge_addr
         self.neighbor_bridge_addresses = list(self.neighbor_address_map.values())
 
         logger.info(
@@ -1282,18 +1344,14 @@ class NodeService(HierarchyMixin):
                     node_id or "unknown",
                 )
                 continue
-            try:
-                host, port_str = base_address.split(":")
-                bridge_port = int(port_str) + 2000
-            except ValueError:
-                logger.warning(
-                    "Invalid address format for %s aggregator candidate %s: %s",
-                    scope_label,
-                    node_id or "unknown",
-                    base_address,
-                )
+            candidate_addr = self._address_with_offset(
+                base_address,
+                self.bridge_port_offset,
+                f"{scope_label} aggregator candidate {node_id or 'unknown'}",
+            )
+            if not candidate_addr:
                 continue
-            self.central_neighbor_addresses[node_id] = f"{host}:{bridge_port}"
+            self.central_neighbor_addresses[node_id] = candidate_addr
 
         if self.central_neighbor_addresses and not self._logged_central_addresses:
             details = ", ".join(f"{node}@{addr}" for node, addr in self.central_neighbor_addresses.items())
@@ -1379,13 +1437,10 @@ class NodeService(HierarchyMixin):
             )
             return len(fresh_ecms)
 
-        if not self.aggregator_address:
-            logger.warning("Cannot forward ECMs: aggregator address not set")
+        agg_addr = self._aggregator_rpc_address()
+        if not agg_addr:
+            logger.warning("Cannot forward ECMs: aggregator RPC address unresolved")
             return 0
-
-        agg_port = int(self.aggregator_address.split(":")[-1]) + 1000
-        agg_host = self.aggregator_address.split(":")[0]
-        agg_addr = f"{agg_host}:{agg_port}"
 
         try:
             channel = self._create_aggregator_channel(agg_addr)
@@ -1475,7 +1530,7 @@ class NodeService(HierarchyMixin):
             logger.warning(
                 "Bridge client missing for %s; restarting bridge server on port %d",
                 self.node_id,
-                self.port + 2000,
+                self._bridge_listen_port(),
             )
             # Tear down any existing server before reconfiguring.
             self.stop_bridge_server()
@@ -1530,9 +1585,9 @@ class NodeService(HierarchyMixin):
         )
 
         # Get aggregator address
-        agg_port = int(self.aggregator_address.split(":")[-1]) + 1000
-        agg_host = self.aggregator_address.split(":")[0]
-        agg_addr = f"{agg_host}:{agg_port}"
+        agg_addr = self._aggregator_rpc_address()
+        if not agg_addr:
+            raise AggregatorUnavailable("Aggregator address unavailable")
 
         channel = self._create_aggregator_channel(agg_addr)
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
@@ -1913,36 +1968,34 @@ class NodeService(HierarchyMixin):
             if self.inter_cluster_enabled and aggregator_is_bridge:
                 wait_for_aggregator = max(wait_for_aggregator, 8)
 
-            if self.is_aggregator:
-                logger.info(f"*** This node is the AGGREGATOR for round {round_idx + 1} ***")
-                self.start_aggregator_server()
-
-            logger.info(
-                "Waiting for aggregator %s to be ready (sleeping %ds)...",
-                self.aggregator_id,
-                wait_for_aggregator,
-            )
-            wait_remaining = wait_for_aggregator
-            while wait_remaining > 0 and not should_stop:
-                interval = min(1.0, wait_remaining)
-                time.sleep(interval)
-                wait_remaining -= interval
-                should_stop, stop_reason = self._refresh_convergence_state(should_stop, stop_reason)
-                if should_stop:
-                    logger.info(f"Stopping training while waiting for aggregator: {stop_reason}")
-                    break
-
-            if should_stop:
-                if self.is_aggregator:
-                    self.stop_aggregator_server()
-                break
-
             cid: Optional[str] = None
             model_hash: Optional[str] = None
             model_data_id: Optional[str] = None
             aggregator_unreachable_this_round = False
+            round_failed = False
             try:
-                round_failed = False
+                if self.is_aggregator:
+                    logger.info(f"*** This node is the AGGREGATOR for round {round_idx + 1} ***")
+                    self.start_aggregator_server()
+
+                logger.info(
+                    "Waiting for aggregator %s to be ready (sleeping %ds)...",
+                    self.aggregator_id,
+                    wait_for_aggregator,
+                )
+                wait_remaining = wait_for_aggregator
+                while wait_remaining > 0 and not should_stop:
+                    interval = min(1.0, wait_remaining)
+                    time.sleep(interval)
+                    wait_remaining -= interval
+                    should_stop, stop_reason = self._refresh_convergence_state(should_stop, stop_reason)
+                    if should_stop:
+                        logger.info(f"Stopping training while waiting for aggregator: {stop_reason}")
+                        break
+
+                if should_stop:
+                    break
+
                 # Phase 2: Secure aggregation
                 logger.info("Phase 2: Secure aggregation")
                 sap_start = time.monotonic()
@@ -2108,6 +2161,10 @@ class NodeService(HierarchyMixin):
                 logger.info(f"Accuracy after aggregation: {acc_after:.4f}")
                 logger.info(f"Improvement: {acc_after - acc_before:+.4f}")
 
+            except PortBindingError as exc:
+                round_failed = True
+                aggregator_unreachable_this_round = True
+                logger.error("Aggregator %s could not start gRPC server: %s", self.aggregator_id, exc)
             except AggregatorUnavailable as exc:
                 round_failed = True
                 aggregator_unreachable_this_round = True
@@ -2202,11 +2259,10 @@ class NodeService(HierarchyMixin):
                 Bridge nodes enable this so they always obtain CID/hash for ECM gossip.
         """
         channel = None
+        agg_addr = self._aggregator_rpc_address()
+        if not agg_addr:
+            raise AggregatorUnavailable("Aggregator address unavailable")
         try:
-            agg_port = int(self.aggregator_address.split(":")[-1]) + 1000
-            agg_host = self.aggregator_address.split(":")[0]
-            agg_addr = f"{agg_host}:{agg_port}"
-
             channel = self._create_aggregator_channel(agg_addr)
             stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 

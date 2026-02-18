@@ -24,6 +24,16 @@ from secure_aggregation.utils import get_logger
 
 logger = get_logger("aggregator_service")
 
+
+class PortBindingError(RuntimeError):
+    """Raised when the aggregator server cannot bind to the requested port."""
+
+    def __init__(self, port: int, message: str = "") -> None:
+        prefix = f"Failed to bind aggregator server to port {port}"
+        full_message = f"{prefix}: {message}" if message else prefix
+        super().__init__(full_message)
+        self.port = port
+
 DEFAULT_GRPC_MAX_MESSAGE_MB = 200
 _grpc_max_env = os.environ.get("GRPC_MAX_MESSAGE_MB")
 try:
@@ -460,7 +470,15 @@ def serve(
         options=grpc_message_options(),
     )
     secureagg_pb2_grpc.add_AggregatorServiceServicer_to_server(servicer, server)
-    server.add_insecure_port(f"[::]:{port}")
+    bound_port = 0
+    try:
+        bound_port = server.add_insecure_port(f"[::]:{port}")
+    except Exception as exc:  # noqa: BLE001
+        server.stop(0)
+        raise PortBindingError(port, str(exc)) from exc
+    if not bound_port:
+        server.stop(0)
+        raise PortBindingError(port, "gRPC returned 0 (port already in use?)")
     server.start()
     logger.info(f"Aggregator server started on port {port}")
     return server, servicer

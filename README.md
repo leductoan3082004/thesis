@@ -433,8 +433,8 @@ make clean-all
 |---|---|
 | TTP | 50051 |
 | Node i service | 51000 + i |
-| Node i aggregator | 52000 + i |
-| Node i bridge | 53000 + i |
+| Node i aggregator | (node port) + `aggregator_port_offset` (default 1000) |
+| Node i bridge | (node port) + `bridge_port_offset` (default 2000) |
 | Node i metrics | 61000 + i |
 | Loki | 3100 |
 | Promtail | 9080 |
@@ -445,6 +445,7 @@ make clean-all
 | Blockchain Peers | 7051, 8051, 9051 |
 
 Override base ports: `--ttp-port`, `--base-node-port`, `--base-metrics-port`.
+Before launching on a shared or long-lived host (especially in process mode), confirm that the derived aggregator and bridge ports are available via `lsof -i :<port>` or similar. If another service is bound to the same offset, set `aggregator_port_offset` / `bridge_port_offset` in the node config to avoid collisions.
 
 ## Configuration
 
@@ -458,6 +459,8 @@ Node configs are generated from `config/node.config.template.json`. The orchestr
 | `training.local_epochs` | 1 | Local training epochs per round |
 | `training.batch_size` | 64 | Mini-batch size |
 | `dataset.alpha` | 0.5 | Dirichlet non-IID parameter (lower = more non-IID) |
+| `aggregator_port_offset` | 1000 | gRPC port offset used when the node acts as aggregator; adjust if another process binds the derived port. |
+| `bridge_port_offset` | 2000 | gRPC port offset dedicated to the bridge service for ECM gossip. |
 | `secure_agg.threshold` | 3 | Minimum nodes for secure aggregation |
 
 ### System Config
