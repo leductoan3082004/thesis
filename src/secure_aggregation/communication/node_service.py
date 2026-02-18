@@ -193,13 +193,28 @@ class NodeService(HierarchyMixin):
         self.scale = self.secagg_config["scale"]
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
         default_round_cap = 200
+        system_training_cfg = (self.system_config or {}).get("training") if self.system_config else None
+        system_rounds = None
+        if isinstance(system_training_cfg, dict):
+            system_rounds = system_training_cfg.get("max_rounds")
         if env_rounds:
             try:
                 self.max_training_rounds = max(1, int(env_rounds))
             except ValueError:
                 logger.warning(
-                    "Invalid MAX_TRAINING_ROUNDS=%s; falling back to default %d",
+                    "Invalid MAX_TRAINING_ROUNDS=%s; falling back to configured/default value",
                     env_rounds,
+                )
+                self.max_training_rounds = (
+                    max(1, int(system_rounds)) if system_rounds else default_round_cap
+                )
+        elif system_rounds:
+            try:
+                self.max_training_rounds = max(1, int(system_rounds))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid system training.rounds=%s; falling back to default %d",
+                    system_rounds,
                     default_round_cap,
                 )
                 self.max_training_rounds = default_round_cap

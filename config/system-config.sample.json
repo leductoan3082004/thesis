@@ -35,5 +35,8 @@
       "apply_policy": "interpolate",
       "apply_alpha": 0.2
     }
-  ]
+  ],
+  "training": {
+    "max_rounds": 200
+  }
 }

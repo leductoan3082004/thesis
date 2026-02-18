@@ -455,7 +455,7 @@ Node configs are generated from `config/node.config.template.json`. The orchestr
 
 | Parameter | Default | Description |
 |---|---|---|
-| `training.rounds` | 3 | Federated training rounds |
+| `training.rounds` | 3 | Federated training rounds (per-node config; overridden by system `training.max_rounds` or env) |
 | `training.local_epochs` | 1 | Local training epochs per round |
 | `training.batch_size` | 64 | Mini-batch size |
 | `dataset.alpha` | 0.5 | Dirichlet non-IID parameter (lower = more non-IID) |
@@ -469,6 +469,7 @@ Copy `config/system-config.sample.json` to `config/system-config.json` to config
 - **Convergence detection**: warmup rounds, tolerance, patience
 - **Fleet size**: `number_of_nodes` (used when `--nodes` is omitted)
 - **Hierarchy levels**: state/nation scope identifiers, timer intervals, merge policies
+- **Cluster defaults**: `training.max_rounds` sets the cluster-level round cap (overridden by `MAX_TRAINING_ROUNDS` env or per-node config)
 
 ### Hierarchy Rosters
 

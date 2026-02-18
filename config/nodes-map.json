@@ -11,18 +11,30 @@
             "trainer-node-003",
             "trainer-node-004",
             "trainer-node-005",
-            "trainer-node-006"
-          ]
-        },
-        {
-          "state_id": "state_beta",
-          "nodes": [
+            "trainer-node-006",
             "trainer-node-007",
             "trainer-node-008",
             "trainer-node-009",
             "trainer-node-010",
             "trainer-node-011",
             "trainer-node-012"
+          ]
+        },
+        {
+          "state_id": "state_beta",
+          "nodes": [
+            "trainer-node-013",
+            "trainer-node-014",
+            "trainer-node-015",
+            "trainer-node-016",
+            "trainer-node-017",
+            "trainer-node-018",
+            "trainer-node-019",
+            "trainer-node-020",
+            "trainer-node-021",
+            "trainer-node-022",
+            "trainer-node-023",
+            "trainer-node-024"
           ]
         }
       ]
