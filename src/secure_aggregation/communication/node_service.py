@@ -176,6 +176,7 @@ class NodeService(HierarchyMixin):
         self._aggregator_port_guard: Optional[socket.socket] = None
         self._bridge_port_guard: Optional[socket.socket] = None
         self._port_guard_notices: Set[str] = set()
+        self._initialize_port_guards()
         self.network_host = (
             self.config.get("network_host")
             or os.environ.get("NODE_HOSTNAME")
@@ -321,7 +322,6 @@ class NodeService(HierarchyMixin):
         self.train_indices: List[int] = []
         self.val_indices: List[int] = []
 
-        self._initialize_port_guards()
         logger.info(f"Node {self.node_id} initialized (role={self.role}, port={self.port})")
 
     def _load_config(self, path: str) -> dict:
