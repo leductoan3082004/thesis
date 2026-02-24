@@ -15,6 +15,11 @@ try:
 except ImportError:
     yaml = None  # type: ignore[assignment]
 
+try:
+    import resource
+except ImportError:
+    resource = None  # type: ignore[assignment]
+
 from scripts.runtime.process_registry import ManagedProcess
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -208,6 +213,7 @@ def start_promtail(
         raise SystemExit("Promtail binary not found in PATH. Install Promtail and ensure it is available.")
 
     log_handle = log_path.open("ab")
+    _ensure_nofile_limit(4096)
     proc = subprocess.Popen(
         [promtail_bin, "-config.file", str(config_path)],
         cwd=runtime_dir,
@@ -505,3 +511,24 @@ def _tail_file(path: Path, line_count: int = 20) -> str:
         return ""
     lines = path.read_text(errors="replace").splitlines()
     return "\n".join(lines[-line_count:])
+
+
+def _ensure_nofile_limit(min_soft_limit: int) -> None:
+    """Best-effort bump of RLIMIT_NOFILE so promtail can watch many log files."""
+    if resource is None:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return
+    if soft >= min_soft_limit:
+        return
+    new_soft = min_soft_limit
+    if hard != resource.RLIM_INFINITY and hard < new_soft:
+        new_soft = hard
+    if new_soft <= soft:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+    except (ValueError, OSError):
+        pass
