@@ -606,6 +606,21 @@ If all targets show `down`, ensure `prometheus_client` is installed:
 ```
 Then restart the stack.
 
+### Promtail "too many open files"
+Promtail watches every node log file, so operating systems with very small descriptor limits may abort monitoring with:
+```
+error="failed to make file target manager: too many open files"
+```
+View the full log at `process-runtime/logs/promtail.log`. Raise the limit before starting:
+```bash
+ulimit -n 65536
+make start NODES_MAP=... CLIQUE_SIZE=... PROCESS_MODE=1
+```
+If the host forbids raising the limit, skip monitoring so the rest of the stack can run:
+```bash
+make start ... SKIP_MONITORING=1
+```
+
 ## Security Properties
 
 1. **Privacy**: Server learns only aggregate model, never individual updates

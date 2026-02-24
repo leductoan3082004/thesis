@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -204,7 +205,9 @@ def start_promtail(
 ) -> ManagedProcess:
     # Promtail opens one FD per file target; scale soft limit with cluster size.
     fd_target = max(8192, node_count * 64)
-    _ensure_nofile_limit(fd_target)
+    new_limit = _ensure_nofile_limit(fd_target)
+    if new_limit is not None:
+        print(f"[observability] RLIMIT_NOFILE={new_limit} (target {fd_target})")
     config_path = generate_promtail_config(runtime_dir, node_count, node_ids=node_ids)
     log_path = runtime_dir / "logs" / "promtail.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,8 +219,13 @@ def start_promtail(
         raise SystemExit("Promtail binary not found in PATH. Install Promtail and ensure it is available.")
 
     log_handle = log_path.open("ab")
+    cmd = [promtail_bin, "-config.file", str(config_path)]
+    if os.name != "nt":
+        quoted_bin = shlex.quote(promtail_bin)
+        quoted_cfg = shlex.quote(str(config_path))
+        cmd = ["bash", "-lc", f"ulimit -n {fd_target} || true; exec {quoted_bin} -config.file {quoted_cfg}"]
     proc = subprocess.Popen(
-        [promtail_bin, "-config.file", str(config_path)],
+        cmd,
         cwd=runtime_dir,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
@@ -515,22 +523,23 @@ def _tail_file(path: Path, line_count: int = 20) -> str:
     return "\n".join(lines[-line_count:])
 
 
-def _ensure_nofile_limit(min_soft_limit: int) -> None:
+def _ensure_nofile_limit(min_soft_limit: int) -> Optional[int]:
     """Best-effort bump of RLIMIT_NOFILE so promtail can watch many log files."""
     if resource is None:
-        return
+        return None
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     except (ValueError, OSError):
-        return
+        return None
     if soft >= min_soft_limit:
-        return
+        return soft
     new_soft = min_soft_limit
     if hard != resource.RLIM_INFINITY and hard < new_soft:
         new_soft = hard
-    if new_soft <= soft:
-        return
-    try:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
-    except (ValueError, OSError):
-        pass
+    if new_soft > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+            soft = new_soft
+        except (ValueError, OSError):
+            pass
+    return soft
