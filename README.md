@@ -220,6 +220,16 @@ GOOS=linux GOARCH=amd64 go build -o vctool ./cmd/vctool      # adjust GOARCH for
 
 Ensure the resulting `api/vctool` is executable (`chmod +x api/vctool`) and rerun `make start`.
 
+### Step 2f: Prepare the Blockchain Network
+
+All blockchain artifacts (CAs, orderers, peers, channel configs, chaincode) are sourced from the sibling `thesis-blockchain` repo. Follow `thesis-blockchain/api-gateway/README.md` for the standard containerized deployment, or `thesis-blockchain/api-gateway/RUN_ON_PROCESS.md` if you want the blockchain to run directly as host processes. Complete one of these guides before starting the secure aggregation stack so that enrollment materials and gateway services are already provisioned.
+
+When launching the secure aggregation system in process mode, point to the node topology map and enable process mode explicitly:
+
+```bash
+make start NODES_MAP=config/nodes-map.json CLIQUE_SIZE=4 PROCESS_MODE=1
+```
+
 ### Step 3: Start the Full System
 
 ```bash
@@ -532,6 +542,7 @@ process-runtime/
 | `make setup` | Full setup: venv, deps, gRPC, data, blockchain, monitoring |
 | `make start` | Start full system (runs setup first) |
 | `make start NODES=10 CLIQUE_SIZE=5` | Start with custom topology |
+| `make start NODES_MAP=config/nodes-map.json CLIQUE_SIZE=4 PROCESS_MODE=1` | Start with explicit topology and blockchain process mode |
 | `make stop` | Stop all managed processes |
 | `make status` | Show status of all processes |
 | `make logs` | View aggregated logs |
