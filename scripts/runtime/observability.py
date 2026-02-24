@@ -202,6 +202,9 @@ def start_promtail(
     node_count: int,
     node_ids: Optional[List[str]] = None,
 ) -> ManagedProcess:
+    # Promtail opens one FD per file target; scale soft limit with cluster size.
+    fd_target = max(8192, node_count * 64)
+    _ensure_nofile_limit(fd_target)
     config_path = generate_promtail_config(runtime_dir, node_count, node_ids=node_ids)
     log_path = runtime_dir / "logs" / "promtail.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +216,6 @@ def start_promtail(
         raise SystemExit("Promtail binary not found in PATH. Install Promtail and ensure it is available.")
 
     log_handle = log_path.open("ab")
-    _ensure_nofile_limit(4096)
     proc = subprocess.Popen(
         [promtail_bin, "-config.file", str(config_path)],
         cwd=runtime_dir,
