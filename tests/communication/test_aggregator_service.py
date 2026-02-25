@@ -149,3 +149,65 @@ def test_servicer_happy_path_end_to_end() -> None:
     # model vectors were [1,2], [2,3], [3,4] -> mean = [2, 3]
     assert pytest.approx(mean[0]) == 2.0
     assert pytest.approx(mean[1]) == 3.0
+
+
+def test_readvertisement_after_round1_is_ignored() -> None:
+    participant_ids = ["u1", "u2"]
+    nodes: Dict[str, SecureAggregationNode] = {}
+    for pid in participant_ids:
+        pair = generate_signing_keypair()
+        nodes[pid] = SecureAggregationNode(pid, signing_private=pair.private_key, signing_public=pair.public_key)
+    signing_keys = {pid: node.signing_public for pid, node in nodes.items()}
+    servicer = AggregatorServicer(
+        node_id="agg",
+        threshold=2,
+        participant_ids=participant_ids,
+        signing_public_keys=signing_keys,
+    )
+    adverts = {pid: node.advertise_keys() for pid, node in nodes.items()}
+    for pid, advert in adverts.items():
+        servicer.Round0AdvertiseKeys(_build_advert(pid, advert), None)
+    ordered = list(adverts.keys())
+    ack = servicer.Round0AdvertiseKeys(_build_advert(ordered[0], adverts[ordered[0]]), None)
+    while not ack.all_keys:
+        ack = servicer.Round0AdvertiseKeys(_build_advert(ordered[0], adverts[ordered[0]]), None)
+    broadcast = [
+        AdvertiseMessage(
+            node_id=a.node_id,
+            c_public=bytes(a.c_public_key),
+            s_public=bytes(a.s_public_key),
+            signature=bytes(a.signature),
+            signing_public=None,
+        )
+        for a in ack.all_keys
+    ]
+    for node in nodes.values():
+        node.receive_advertisements(broadcast)
+
+    for pid, node in nodes.items():
+        cts = node.create_round1_ciphertexts(ordered, threshold=2)
+        req = secureagg_pb2.ShareKeysMessage(
+            node_id=pid,
+            ciphertexts=[
+                secureagg_pb2.Round1Ciphertext(
+                    sender_id=ct.sender_id,
+                    recipient_id=ct.recipient_id,
+                    iv=ct.iv,
+                    ciphertext=ct.ciphertext,
+                    tag=ct.tag,
+                )
+                for ct in cts
+            ],
+        )
+        servicer.Round1ShareKeys(req, None)
+
+    before_mailboxes = {pid: len(servicer.aggregator.round1_mailboxes[pid]) for pid in participant_ids}
+    assert all(count > 0 for count in before_mailboxes.values())
+
+    new_advert = nodes[ordered[0]].advertise_keys()
+    resp = servicer.Round0AdvertiseKeys(_build_advert(ordered[0], new_advert), None)
+    assert resp.accepted
+    assert "Ignoring new keys" in resp.message
+
+    after_mailboxes = {pid: len(servicer.aggregator.round1_mailboxes[pid]) for pid in participant_ids}
+    assert after_mailboxes == before_mailboxes

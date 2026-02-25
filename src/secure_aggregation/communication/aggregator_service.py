@@ -114,6 +114,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round3_signatures: Dict[str, bytes] = {}
         self._round4_payloads: List[UnmaskingSharesModel] = []
         self._round_snapshots: Dict[int, secureagg_pb2.ModelResponse] = {}
+        self._round1_payload_seen: bool = False
 
         # ECM buffer for receiving ECMs from bridge nodes
         self.ecm_buffer = ecm_buffer
@@ -173,6 +174,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected key advertisement from {node_id}: not a clique member")
             return secureagg_pb2.KeyAdvertisementAck(accepted=False, message="Node not in clique")
+        ignored_readvert = False
 
         try:
             advert = AdvertiseMessage(
@@ -189,7 +191,20 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 or prev_advert.s_public != advert.s_public
                 or prev_advert.signing_public != advert.signing_public
             )
-            self._adverts[node_id] = advert
+            ignore_new_keys = (
+                existing
+                and advert_changed
+                and self._adverts_committed
+                and self._round1_payload_seen
+            )
+            if ignore_new_keys:
+                ignored_readvert = True
+                advert_changed = False
+                logger.warning(
+                    "Ignoring key advertisement update from %s: Round 1 already started", node_id
+                )
+            else:
+                self._adverts[node_id] = advert
             if self._adverts_committed:
                 if existing and advert_changed:
                     self.aggregator.update_advertisement(advert)
@@ -216,9 +231,17 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             )
             for adv in all_keys
         ]
+        if ignored_readvert:
+            message = "Ignoring new keys; Round 1 already started"
+        else:
+            message = (
+                "SAP-Round 0 OK"
+                if len(all_keys) >= self.threshold
+                else "Waiting for more participants"
+            )
         return secureagg_pb2.KeyAdvertisementAck(
             accepted=True,
-            message="SAP-Round 0 OK" if len(all_keys) >= self.threshold else "Waiting for more participants",
+            message=message,
             all_keys=ack_keys if len(all_keys) >= self.threshold else [],
         )
 
@@ -231,6 +254,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
 
         try:
             ciphertexts = _decode_round1_ciphertexts(request.ciphertexts)
+            if ciphertexts:
+                self._round1_payload_seen = True
             self.aggregator.receive_round1_ciphertexts(ciphertexts)
             mailbox = self.aggregator.deliver_round1_ciphertexts(node_id)
             return secureagg_pb2.ShareKeysAck(
@@ -489,6 +514,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round3_signatures.clear()
         self._round4_payloads.clear()
         self.current_round = round_idx
+        self._round1_payload_seen = False
         logger.info("Aggregator %s prepared for round %d", self.node_id, round_idx)
 
     def reset_for_next_round(self) -> None:
