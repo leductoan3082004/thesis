@@ -2059,12 +2059,14 @@ class NodeService(HierarchyMixin):
             cid: Optional[str] = None
             model_hash: Optional[str] = None
             model_data_id: Optional[str] = None
-            aggregator_unreachable_this_round = False
-            round_failed = False
-            try:
-                if self.is_aggregator:
-                    logger.info(f"*** This node is the AGGREGATOR for round {round_idx + 1} ***")
-                    self._prepare_local_aggregator(round_idx)
+                aggregator_unreachable_this_round = False
+                round_failed = False
+                try:
+                    if self.is_aggregator:
+                        logger.info(f"*** This node is the AGGREGATOR for round {round_idx + 1} ***")
+                        if self.aggregator_server is None:
+                            self.start_aggregator_server()
+                        self._prepare_local_aggregator(round_idx)
 
                 logger.info(
                     "Waiting for aggregator %s to be ready (sleeping %ds)...",
@@ -2434,11 +2436,6 @@ class NodeService(HierarchyMixin):
 
         # Register with TTP
         self.register_with_ttp()
-        try:
-            self.start_aggregator_server()
-        except PortBindingError as exc:
-            logger.error("Unable to start persistent aggregator server on %s: %s", self.node_id, exc)
-            raise
 
         # Setup data and model
         self.setup_data()
