@@ -1072,7 +1072,7 @@ class NodeService(HierarchyMixin):
     def start_aggregator_server(self) -> None:
         """Start aggregator gRPC server if this node is elected."""
         if self.aggregator_server is not None:
-            logger.warning("Aggregator server already running")
+            logger.debug("Aggregator server already running")
             return
 
         # Use clique members if available, otherwise all participants
@@ -1105,6 +1105,13 @@ class NodeService(HierarchyMixin):
             self._ensure_port_guard("_aggregator_port_guard", agg_port, "aggregator")
             raise
         logger.info(f"Started aggregator server on port {agg_port} for {len(participant_ids)} clique members")
+
+    def _prepare_local_aggregator(self, round_idx: int) -> None:
+        """Ensure the embedded aggregator servicer is ready for the supplied round."""
+        if not self.aggregator_servicer:
+            logger.error("Aggregator servicer unavailable on %s", self.node_id)
+            return
+        self.aggregator_servicer.prepare_round(round_idx)
 
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
@@ -2057,7 +2064,7 @@ class NodeService(HierarchyMixin):
             try:
                 if self.is_aggregator:
                     logger.info(f"*** This node is the AGGREGATOR for round {round_idx + 1} ***")
-                    self.start_aggregator_server()
+                    self._prepare_local_aggregator(round_idx)
 
                 logger.info(
                     "Waiting for aggregator %s to be ready (sleeping %ds)...",
@@ -2257,11 +2264,6 @@ class NodeService(HierarchyMixin):
                 round_failed = True
                 logger.error("Secure aggregation failed: %s", e, exc_info=True)
 
-            finally:
-                if self.is_aggregator:
-                    time.sleep(2)
-                    self.stop_aggregator_server()
-
             if round_failed:
                 if aggregator_unreachable_this_round:
                     self._consecutive_aggregator_failures += 1
@@ -2432,6 +2434,11 @@ class NodeService(HierarchyMixin):
 
         # Register with TTP
         self.register_with_ttp()
+        try:
+            self.start_aggregator_server()
+        except PortBindingError as exc:
+            logger.error("Unable to start persistent aggregator server on %s: %s", self.node_id, exc)
+            raise
 
         # Setup data and model
         self.setup_data()
@@ -2509,8 +2516,9 @@ class NodeService(HierarchyMixin):
             # Run training loop
             self.run_training_loop()
         finally:
-            # Cleanup bridge server
+            # Cleanup servers
             self.stop_bridge_server()
+            self.stop_aggregator_server()
 
         logger.info(f"Node {self.node_id} finished")
 

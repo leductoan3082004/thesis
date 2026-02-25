@@ -105,6 +105,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.threshold = threshold
         self.participant_ids = participant_ids
         config = SecureAggregationConfig(participants=participant_ids, threshold=threshold)
+        self._signing_public_keys = signing_public_keys
         self.aggregator = SecureAggregationAggregator(config=config, signing_public_keys=signing_public_keys)
         self.aggregated_result: Optional[List[float]] = None
         self.current_round = 0
@@ -112,6 +113,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._adverts_committed = False
         self._round3_signatures: Dict[str, bytes] = {}
         self._round4_payloads: List[UnmaskingSharesModel] = []
+        self._round_snapshots: Dict[int, secureagg_pb2.ModelResponse] = {}
 
         # ECM buffer for receiving ECMs from bridge nodes
         self.ecm_buffer = ecm_buffer
@@ -127,6 +129,9 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.convergence_streak: int = 0
         self.metadata_ready: bool = False
         self._convergence_signal_handler = convergence_signal_handler
+
+        # Ensure a clean baseline state.
+        self.prepare_round(0)
 
         logger.info(
             f"Aggregator {node_id} initialized with threshold={threshold}, participants={len(participant_ids)}"
@@ -309,34 +314,27 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             logger.warning(f"SAP-Round4 processing failed for {node_id}: {exc}")
             return secureagg_pb2.UnmaskAck(accepted=False, message=str(exc), aggregation_complete=False)
 
-    def GetGlobalModel(self, request: secureagg_pb2.ModelRequest, context) -> secureagg_pb2.ModelResponse:
-        """Return the global model with convergence signals.
-
-        If inter-cluster merge was performed, returns IPFS reference (cid, hash)
-        so nodes can fetch the merged model from IPFS. Otherwise returns the
-        intra-cluster aggregated weights directly.
-        """
-        if self.aggregated_result is None:
-            return secureagg_pb2.ModelResponse(
-                model_weights=[],
-                round=self.current_round,
-                aggregator_id=self.node_id,
-                should_stop=False,
-                stop_reason="",
-                delta_norm=0.0,
-                cluster_converged=False,
-                convergence_streak=0,
-                metadata_ready=self.metadata_ready,
-                model_cid="",
-                model_hash="",
-                model_data_id="",
-            )
-
-        logger.info(
-            f"Serving global model (round {self.current_round}, "
-            f"should_stop={self.should_stop}, delta={self.delta_norm:.2e}, "
-            f"cid={self.merged_model_cid[:16] if self.merged_model_cid else 'N/A'}...)"
+    def _default_model_response(self, round_idx: int) -> secureagg_pb2.ModelResponse:
+        """Return an empty placeholder response for callers still waiting on aggregation."""
+        return secureagg_pb2.ModelResponse(
+            model_weights=[],
+            round=round_idx,
+            aggregator_id=self.node_id,
+            should_stop=False,
+            stop_reason="",
+            delta_norm=0.0,
+            cluster_converged=False,
+            convergence_streak=0,
+            metadata_ready=False,
+            model_cid="",
+            model_hash="",
+            model_data_id="",
         )
+
+    def _build_model_response(self) -> secureagg_pb2.ModelResponse:
+        """Compose the response for the current round using the latest metadata."""
+        if self.aggregated_result is None:
+            return self._default_model_response(self.current_round)
         return secureagg_pb2.ModelResponse(
             model_weights=self.aggregated_result,
             round=self.current_round,
@@ -351,6 +349,43 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             model_hash=self.merged_model_hash or "",
             model_data_id=self.merged_model_data_id or "",
         )
+
+    def _cache_round_snapshot(self, round_idx: int, response: secureagg_pb2.ModelResponse) -> None:
+        """Store the completed round result so stragglers can still fetch it later."""
+        self._round_snapshots[round_idx] = response
+        # Retain only the most recent round and its predecessor to bound memory usage.
+        obsolete = [idx for idx in self._round_snapshots if idx < round_idx - 1]
+        for idx in obsolete:
+            self._round_snapshots.pop(idx, None)
+
+    def GetGlobalModel(self, request: secureagg_pb2.ModelRequest, context) -> secureagg_pb2.ModelResponse:
+        """Return the global model with convergence signals.
+
+        If inter-cluster merge was performed, returns IPFS reference (cid, hash)
+        so nodes can fetch the merged model from IPFS. Otherwise returns the
+        intra-cluster aggregated weights directly.
+        """
+        requested_round = request.round
+
+        if requested_round != self.current_round or self.aggregated_result is None:
+            cached = self._round_snapshots.get(requested_round)
+            if cached:
+                logger.debug(
+                    "Serving cached global model for round %d to requester %s",
+                    requested_round,
+                    getattr(request, "node_id", "unknown"),
+                )
+                return cached
+            return self._default_model_response(requested_round)
+
+        logger.info(
+            f"Serving global model (round {self.current_round}, "
+            f"should_stop={self.should_stop}, delta={self.delta_norm:.2e}, "
+            f"cid={self.merged_model_cid[:16] if self.merged_model_cid else 'N/A'}...)"
+        )
+        response = self._build_model_response()
+        self._cache_round_snapshot(self.current_round, response)
+        return response
 
     def SubmitECMs(
         self,
@@ -423,24 +458,32 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             logger.warning("Convergence signal handler failed for data_id=%s: %s", request.data_id, exc)
             return secureagg_pb2.ConvergenceAck(accepted=False, message=str(exc))
 
-    def reset_for_next_round(self) -> None:
-        """Reset state for next aggregation round."""
+    def prepare_round(self, round_idx: int) -> None:
+        """Reset state in preparation for the supplied aggregation round."""
         self.aggregator = SecureAggregationAggregator(
             config=SecureAggregationConfig(participants=self.participant_ids, threshold=self.threshold),
-            signing_public_keys=self.aggregator.signing_public_keys,
+            signing_public_keys=self._signing_public_keys,
         )
         self.aggregated_result = None
         self.merged_model_cid = None
         self.merged_model_hash = None
         self.merged_model_data_id = None
+        self.should_stop = False
+        self.stop_reason = ""
+        self.delta_norm = 0.0
+        self.cluster_converged = False
         self.convergence_streak = 0
         self.metadata_ready = False
         self._adverts.clear()
         self._adverts_committed = False
         self._round3_signatures.clear()
         self._round4_payloads.clear()
-        self.current_round += 1
-        logger.info(f"Reset for round {self.current_round}")
+        self.current_round = round_idx
+        logger.info("Aggregator %s prepared for round %d", self.node_id, round_idx)
+
+    def reset_for_next_round(self) -> None:
+        """Maintain backward compatibility with previous API."""
+        self.prepare_round(self.current_round + 1)
 
 
 def serve(
