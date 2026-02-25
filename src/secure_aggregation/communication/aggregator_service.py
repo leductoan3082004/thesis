@@ -184,13 +184,10 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             )
             existing = node_id in self._adverts
             prev_advert = self._adverts.get(node_id)
-            advert_changed = (
-                existing
-                and (
-                    prev_advert.c_public != advert.c_public
-                    or prev_advert.s_public != advert.s_public
-                    or prev_advert.signature != advert.signature
-                )
+            advert_changed = existing and (
+                prev_advert.c_public != advert.c_public
+                or prev_advert.s_public != advert.s_public
+                or prev_advert.signing_public != advert.signing_public
             )
             self._adverts[node_id] = advert
             if self._adverts_committed:
