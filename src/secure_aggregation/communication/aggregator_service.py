@@ -114,7 +114,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round3_signatures: Dict[str, bytes] = {}
         self._round4_payloads: List[UnmaskingSharesModel] = []
         self._round_snapshots: Dict[int, secureagg_pb2.ModelResponse] = {}
-        self._round1_payload_seen: bool = False
+        self._round1_started: Dict[str, bool] = {}
 
         # ECM buffer for receiving ECMs from bridge nodes
         self.ecm_buffer = ecm_buffer
@@ -195,7 +195,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 existing
                 and advert_changed
                 and self._adverts_committed
-                and self._round1_payload_seen
+                and self._round1_started.get(node_id, False)
             )
             if ignore_new_keys:
                 ignored_readvert = True
@@ -255,7 +255,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         try:
             ciphertexts = _decode_round1_ciphertexts(request.ciphertexts)
             if ciphertexts:
-                self._round1_payload_seen = True
+                self._round1_started[request.node_id] = True
             self.aggregator.receive_round1_ciphertexts(ciphertexts)
             mailbox = self.aggregator.deliver_round1_ciphertexts(node_id)
             return secureagg_pb2.ShareKeysAck(
@@ -514,7 +514,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round3_signatures.clear()
         self._round4_payloads.clear()
         self.current_round = round_idx
-        self._round1_payload_seen = False
+        self._round1_started.clear()
         logger.info("Aggregator %s prepared for round %d", self.node_id, round_idx)
 
     def reset_for_next_round(self) -> None:

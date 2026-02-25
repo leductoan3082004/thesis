@@ -211,3 +211,64 @@ def test_readvertisement_after_round1_is_ignored() -> None:
 
     after_mailboxes = {pid: len(servicer.aggregator.round1_mailboxes[pid]) for pid in participant_ids}
     assert after_mailboxes == before_mailboxes
+
+
+def test_other_nodes_can_re_advertise_before_they_start_round1() -> None:
+    participant_ids = ["u1", "u2"]
+    nodes: Dict[str, SecureAggregationNode] = {}
+    for pid in participant_ids:
+        pair = generate_signing_keypair()
+        nodes[pid] = SecureAggregationNode(pid, signing_private=pair.private_key, signing_public=pair.public_key)
+    signing_keys = {pid: node.signing_public for pid, node in nodes.items()}
+    servicer = AggregatorServicer(
+        node_id="agg",
+        threshold=2,
+        participant_ids=participant_ids,
+        signing_public_keys=signing_keys,
+    )
+
+    adverts = {pid: node.advertise_keys() for pid, node in nodes.items()}
+    for pid, advert in adverts.items():
+        servicer.Round0AdvertiseKeys(_build_advert(pid, advert), None)
+    ordered = list(adverts.keys())
+    ack = servicer.Round0AdvertiseKeys(_build_advert(ordered[0], adverts[ordered[0]]), None)
+    while not ack.all_keys:
+        ack = servicer.Round0AdvertiseKeys(_build_advert(ordered[0], adverts[ordered[0]]), None)
+    broadcast = [
+        AdvertiseMessage(
+            node_id=a.node_id,
+            c_public=bytes(a.c_public_key),
+            s_public=bytes(a.s_public_key),
+            signature=bytes(a.signature),
+            signing_public=None,
+        )
+        for a in ack.all_keys
+    ]
+    for node in nodes.values():
+        node.receive_advertisements(broadcast)
+
+    # u1 begins Round 1
+    cts_u1 = nodes["u1"].create_round1_ciphertexts(ordered, threshold=2)
+    req_u1 = secureagg_pb2.ShareKeysMessage(
+        node_id="u1",
+        ciphertexts=[
+            secureagg_pb2.Round1Ciphertext(
+                sender_id=ct.sender_id,
+                recipient_id=ct.recipient_id,
+                iv=ct.iv,
+                ciphertext=ct.ciphertext,
+                tag=ct.tag,
+            )
+            for ct in cts_u1
+        ],
+    )
+    servicer.Round1ShareKeys(req_u1, None)
+    assert len(servicer.aggregator.round1_mailboxes["u2"]) > 0
+
+    # u2 retries Round 0 before sending Round 1, so new keys should be accepted.
+    new_advert_u2 = nodes["u2"].advertise_keys()
+    resp = servicer.Round0AdvertiseKeys(_build_advert("u2", new_advert_u2), None)
+    assert resp.accepted
+    assert "Ignoring new keys" not in resp.message
+    assert servicer.aggregator.advertisements["u2"].c_public == new_advert_u2.c_public
+    assert servicer.aggregator.round1_mailboxes["u2"] == []
