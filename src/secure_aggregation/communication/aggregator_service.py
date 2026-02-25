@@ -182,15 +182,19 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 signature=bytes(request.signature),
                 signing_public=None,  # Expected from signing_public_keys provided at init
             )
-            if node_id not in self._adverts:
-                self._adverts[node_id] = advert
-            # Once we have threshold, commit into aggregator once.
-            if not self._adverts_committed and len(self._adverts) >= self.threshold:
+            existing = node_id in self._adverts
+            self._adverts[node_id] = advert
+            if self._adverts_committed:
+                if existing:
+                    self.aggregator.update_advertisement(advert)
+                    self.aggregator.reset_round1_state_for(node_id)
+                elif node_id not in self.aggregator.advertisements:
+                    # Add late adverts after initial commit.
+                    self.aggregator.receive_advertisements([advert])
+            elif len(self._adverts) >= self.threshold:
+                # Once we have threshold, commit into aggregator once.
                 self.aggregator.receive_advertisements(list(self._adverts.values()))
                 self._adverts_committed = True
-            elif self._adverts_committed and node_id not in self.aggregator.advertisements:
-                # Add late adverts after initial commit.
-                self.aggregator.receive_advertisements([advert])
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
             return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))

@@ -299,6 +299,24 @@ class SecureAggregationAggregator:
         if len(self.advertisements) < self.config.threshold:
             raise ValueError("Insufficient advertisements to meet threshold")
 
+    def update_advertisement(self, advert: AdvertiseMessage) -> None:
+        """Replace an existing advertisement (used when a node retries Round 0)."""
+        if advert.node_id not in self.participants:
+            raise ValueError(f"Unexpected participant {advert.node_id}")
+        if advert.node_id not in self.advertisements:
+            raise ValueError(f"No prior advertisement from {advert.node_id} to update")
+        message = advert.c_public + advert.s_public
+        expected_key = self.signing_public_keys.get(advert.node_id)
+        derived_key = advert.signing_public or expected_key
+        if expected_key and advert.signing_public and expected_key != advert.signing_public:
+            raise ValueError(f"Signing key mismatch for {advert.node_id}")
+        if not derived_key:
+            raise ValueError(f"Missing signing key for {advert.node_id}")
+        if not verify_signature(derived_key, message, advert.signature):
+            raise ValueError(f"Invalid signature for {advert.node_id}")
+        self.signing_public_keys[advert.node_id] = derived_key
+        self.advertisements[advert.node_id] = advert
+
     def broadcast_advertisements(self) -> List[AdvertiseMessage]:
         return [self.advertisements[p] for p in self.participants if p in self.advertisements]
 
@@ -307,6 +325,17 @@ class SecureAggregationAggregator:
             if payload.recipient_id not in self.round1_mailboxes:
                 raise ValueError(f"Unknown recipient {payload.recipient_id}")
             self.round1_mailboxes[payload.recipient_id].append(payload)
+
+    def reset_round1_state_for(self, node_id: str) -> None:
+        """Drop stored ciphertexts involving the supplied participant so they can retry safely."""
+        if node_id in self.round1_mailboxes:
+            self.round1_mailboxes[node_id] = []
+        for recipient, mailbox in self.round1_mailboxes.items():
+            if not mailbox:
+                continue
+            filtered = [ct for ct in mailbox if ct.sender_id != node_id]
+            if len(filtered) != len(mailbox):
+                self.round1_mailboxes[recipient] = filtered
 
     def deliver_round1_ciphertexts(self, node_id: str) -> List[Round1Ciphertext]:
         return list(self.round1_mailboxes.get(node_id, []))

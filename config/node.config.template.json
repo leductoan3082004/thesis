@@ -6,7 +6,7 @@
   "bridge_port_offset": 2000,
   "metrics_port": 8000,
   "dataset": {
-    "name": "mnist",
+    "name": "cifar10",
     "num_clients": 12,
     "alpha": 0.5,
     "seed": 42
