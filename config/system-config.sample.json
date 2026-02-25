@@ -14,9 +14,8 @@
       "scope_name": "state",
       "scope_id": "state_0",
       "enabled": true,
-      "approach": "ring_star",
       "rounds_per_scope": 0,
-      "interval_seconds": 120,
+      "interval_seconds": 600,
       "wait_seconds": 20,
       "max_aggregators": 2,
       "fanout_count": 2,
@@ -28,7 +27,7 @@
       "scope_id": "nation_0",
       "enabled": true,
       "rounds_per_scope": 0,
-      "interval_seconds": 300,
+      "interval_seconds": 1500,
       "wait_seconds": 30,
       "max_aggregators": 2,
       "fanout_count": 2,
@@ -38,5 +37,8 @@
   ],
   "training": {
     "max_rounds": 200
+  },
+  "secure_agg": {
+    "rpc_timeout_seconds": 60
   }
 }

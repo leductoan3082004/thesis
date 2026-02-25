@@ -189,6 +189,7 @@ class NodeService(HierarchyMixin):
         self.dataset_num_classes: Optional[int] = None
         self.training_config = self.config["training"]
         self.secagg_config = self.config["secure_agg"]
+        self.secagg_rpc_timeout = self._resolve_secagg_rpc_timeout()
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
@@ -356,6 +357,28 @@ class NodeService(HierarchyMixin):
             logger.warning("%s=%s cannot be negative; defaulting to %d", key, value, default)
             return default
         return offset
+
+    def _resolve_secagg_rpc_timeout(self) -> float:
+        """Determine secure aggregation RPC timeout in seconds."""
+        default_timeout = 30.0
+        timeout_value: Any = self.secagg_config.get("rpc_timeout_seconds", default_timeout)
+        system_secagg_cfg = None
+        if self.system_config and isinstance(self.system_config, dict):
+            system_secagg_cfg = self.system_config.get("secure_agg")
+        if isinstance(system_secagg_cfg, dict) and "rpc_timeout_seconds" in system_secagg_cfg:
+            timeout_value = system_secagg_cfg["rpc_timeout_seconds"]
+        try:
+            parsed = float(timeout_value)
+            if parsed <= 0:
+                raise ValueError
+            return parsed
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid secure aggregation RPC timeout '%s'; defaulting to %.1fs",
+                timeout_value,
+                default_timeout,
+            )
+            return default_timeout
 
     def _initialize_port_guards(self) -> None:
         """Reserve aggregator/bridge ports so the OS never assigns them to ephemeral sockets."""
@@ -1113,6 +1136,26 @@ class NodeService(HierarchyMixin):
             return
         self.aggregator_servicer.prepare_round(round_idx)
 
+    def _get_remote_aggregator_round(self) -> Optional[int]:
+        """Fetch the currently advertised round from the elected aggregator."""
+        agg_addr = self._aggregator_rpc_address()
+        if not agg_addr:
+            return None
+        channel = None
+        try:
+            channel = self._create_aggregator_channel(agg_addr)
+            stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
+            response = stub.GetGlobalModel(
+                secureagg_pb2.ModelRequest(round=self.current_round),
+                timeout=5,
+            )
+            return response.round
+        except grpc.RpcError:
+            return None
+        finally:
+            if channel:
+                channel.close()
+
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
         try:
@@ -1707,7 +1750,7 @@ class NodeService(HierarchyMixin):
                     "Round0AdvertiseKeys",
                     stub.Round0AdvertiseKeys,
                     round0_request,
-                    timeout=30,
+                    timeout=self.secagg_rpc_timeout,
                 )
                 break
             except grpc.RpcError as e:
@@ -1756,7 +1799,7 @@ class NodeService(HierarchyMixin):
                 "Round0AdvertiseKeys",
                 stub.Round0AdvertiseKeys,
                 round0_request,
-                timeout=30,
+                timeout=self.secagg_rpc_timeout,
             )
 
             logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
@@ -1801,7 +1844,7 @@ class NodeService(HierarchyMixin):
             "Round1ShareKeys",
             stub.Round1ShareKeys,
             round1_request,
-            timeout=30,
+            timeout=self.secagg_rpc_timeout,
         )
         mailbox = [
             Round1Ciphertext(
@@ -1824,7 +1867,7 @@ class NodeService(HierarchyMixin):
                 "Round1ShareKeys",
                 stub.Round1ShareKeys,
                 round1_poll_request,
-                timeout=30,
+                timeout=self.secagg_rpc_timeout,
             )
             mailbox = [
                 Round1Ciphertext(
@@ -1856,7 +1899,7 @@ class NodeService(HierarchyMixin):
             "Round2MaskedInput",
             stub.Round2MaskedInput,
             round2_request,
-            timeout=30,
+            timeout=self.secagg_rpc_timeout,
         )
 
         # Wait for survivors list
@@ -1872,7 +1915,7 @@ class NodeService(HierarchyMixin):
                 "Round2MaskedInput",
                 stub.Round2MaskedInput,
                 round2_poll_request,
-                timeout=30,
+                timeout=self.secagg_rpc_timeout,
             )
 
         logger.info(f"SAP-Round 2 complete: {len(response2.survivors)} survivors")
@@ -1894,7 +1937,7 @@ class NodeService(HierarchyMixin):
             "Round3ConsistencyCheck",
             stub.Round3ConsistencyCheck,
             round3_request,
-            timeout=30,
+            timeout=self.secagg_rpc_timeout,
         )
 
         # Record Round 3 timing
@@ -1916,7 +1959,7 @@ class NodeService(HierarchyMixin):
             "Round4Unmask",
             stub.Round4Unmask,
             round4_request,
-            timeout=30,
+            timeout=self.secagg_rpc_timeout,
         )
 
         # Wait for aggregation to complete
@@ -1933,7 +1976,7 @@ class NodeService(HierarchyMixin):
                 "Round4Unmask",
                 stub.Round4Unmask,
                 round4_poll_request,
-                timeout=30,
+                timeout=self.secagg_rpc_timeout,
             )
 
         logger.info("SAP-Round 4 complete: aggregation done")
@@ -1952,7 +1995,7 @@ class NodeService(HierarchyMixin):
                 "GetGlobalModel",
                 stub.GetGlobalModel,
                 model_request,
-                timeout=30,
+                timeout=self.secagg_rpc_timeout,
             )
             aggregated = list(model_response.model_weights)
             logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
@@ -2258,13 +2301,45 @@ class NodeService(HierarchyMixin):
             except AggregatorUnavailable as exc:
                 round_failed = True
                 aggregator_unreachable_this_round = True
+                if not self.is_aggregator:
+                    remote_round = self._get_remote_aggregator_round()
+                    if remote_round is not None and remote_round > round_idx:
+                        logger.warning(
+                            "Aggregator %s already advanced to round %d; skipping local round %d and catching up",
+                            self.aggregator_id,
+                            remote_round + 1,
+                            round_idx + 1,
+                        )
+                        self.current_round = remote_round
+                        round_failed = False
+                        aggregator_unreachable_this_round = False
+                        continue
                 logger.warning(
                     "%s. Will retry after backoff unless convergence is confirmed.",
                     exc,
                 )
+            except grpc.RpcError as exc:
+                round_failed = True
+                code = exc.code().name if hasattr(exc, "code") else "UNKNOWN"
+                details = exc.details() if hasattr(exc, "details") else ""
+                method = getattr(getattr(exc, "_rpc_event", None), "call_details", None)
+                method_name = getattr(method, "method", "unknown")
+                logger.error(
+                    "Secure aggregation RPC failed (method=%s, code=%s, details=%s). Retrying round %d.",
+                    method_name,
+                    code,
+                    details or "n/a",
+                    round_idx + 1,
+                )
             except Exception as e:
                 round_failed = True
                 logger.error("Secure aggregation failed: %s", e, exc_info=True)
+
+            finally:
+                if round_failed and self.is_aggregator:
+                    logger.info("Secure aggregation failed; restarting local aggregator server")
+                    time.sleep(1)
+                    self.stop_aggregator_server()
 
             if round_failed:
                 if aggregator_unreachable_this_round:

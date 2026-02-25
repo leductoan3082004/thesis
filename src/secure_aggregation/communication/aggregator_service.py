@@ -314,21 +314,21 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             logger.warning(f"SAP-Round4 processing failed for {node_id}: {exc}")
             return secureagg_pb2.UnmaskAck(accepted=False, message=str(exc), aggregation_complete=False)
 
-    def _default_model_response(self, round_idx: int) -> secureagg_pb2.ModelResponse:
+    def _default_model_response(self, _: int) -> secureagg_pb2.ModelResponse:
         """Return an empty placeholder response for callers still waiting on aggregation."""
         return secureagg_pb2.ModelResponse(
             model_weights=[],
-            round=round_idx,
+            round=self.current_round,
             aggregator_id=self.node_id,
-            should_stop=False,
-            stop_reason="",
-            delta_norm=0.0,
-            cluster_converged=False,
-            convergence_streak=0,
-            metadata_ready=False,
-            model_cid="",
-            model_hash="",
-            model_data_id="",
+            should_stop=self.should_stop,
+            stop_reason=self.stop_reason,
+            delta_norm=self.delta_norm,
+            cluster_converged=self.cluster_converged,
+            convergence_streak=self.convergence_streak,
+            metadata_ready=self.metadata_ready,
+            model_cid=self.merged_model_cid or "",
+            model_hash=self.merged_model_hash or "",
+            model_data_id=self.merged_model_data_id or "",
         )
 
     def _build_model_response(self) -> secureagg_pb2.ModelResponse:
