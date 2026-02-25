@@ -183,9 +183,18 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 signing_public=None,  # Expected from signing_public_keys provided at init
             )
             existing = node_id in self._adverts
+            prev_advert = self._adverts.get(node_id)
+            advert_changed = (
+                existing
+                and (
+                    prev_advert.c_public != advert.c_public
+                    or prev_advert.s_public != advert.s_public
+                    or prev_advert.signature != advert.signature
+                )
+            )
             self._adverts[node_id] = advert
             if self._adverts_committed:
-                if existing:
+                if existing and advert_changed:
                     self.aggregator.update_advertisement(advert)
                     self.aggregator.reset_round1_state_for(node_id)
                 elif node_id not in self.aggregator.advertisements:
