@@ -1888,6 +1888,23 @@ class NodeService(HierarchyMixin):
             ordered_participants = [p.node_id for p in response.all_keys]
             if round_state.ordered_participants is None:
                 round_state.ordered_participants = ordered_participants
+            elif round_state.ordered_participants != ordered_participants:
+                cached = list(round_state.ordered_participants)
+                cached_set, new_set = set(cached), set(ordered_participants)
+                added = sorted(new_set - cached_set)
+                removed = sorted(cached_set - new_set)
+                change_msg = []
+                if added:
+                    change_msg.append(f"added={added}")
+                if removed:
+                    change_msg.append(f"removed={removed}")
+                logger.info(
+                    "Detected updated participant roster for secure aggregation round %d (%s); refreshing Round 1 state",
+                    self.current_round,
+                    ", ".join(change_msg) if change_msg else "order changed",
+                )
+                round_state.ordered_participants = ordered_participants
+                round_state.round1_ciphertexts = None
             participants_for_round = round_state.ordered_participants
             adverts = [
                 AdvertiseMessage(
@@ -2042,6 +2059,18 @@ class NodeService(HierarchyMixin):
             sap_r4_start = time.monotonic()
             self.comm_tracker.set_phase("sap_round4")
             dropouts = set(participants_for_round) - set(response2.survivors)
+            # Survivors must all appear in our decrypted Round 1 mailbox; otherwise
+            # we won't contribute enough b-shares for the aggregator to unmask them.
+            missing_survivor_shares = [
+                survivor
+                for survivor in response2.survivors
+                if survivor != self.node_id and survivor not in client._peer_shares
+            ]
+            if missing_survivor_shares:
+                raise RuntimeError(
+                    "Missing Round 1 shares for survivors "
+                    f"{missing_survivor_shares}; forcing round retry to refresh key exchange"
+                )
             unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
             round4_request = secureagg_pb2.UnmaskShares(
                 node_id=self.node_id,
