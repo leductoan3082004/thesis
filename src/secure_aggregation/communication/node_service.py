@@ -1239,9 +1239,12 @@ class NodeService(HierarchyMixin):
             max_neighbors=self.inter_cluster_config.get("max_neighbors"),
         )
 
-        self.ecm_buffer = ECMBuffer(
-            freshness_window=self.inter_cluster_config.get("freshness_window", 300.0)
-        )
+        freshness_window = float(self.inter_cluster_config.get("freshness_window", 300.0))
+        if self.ecm_buffer is None:
+            self.ecm_buffer = ECMBuffer(freshness_window=freshness_window)
+        else:
+            # Reuse the existing buffer so bridge/aggregator services keep referencing it.
+            self.ecm_buffer.freshness_window = freshness_window
 
         self.inter_cluster_aggregator = InterClusterAggregator(
             cluster_id=f"cluster_{self.clique_id}",
