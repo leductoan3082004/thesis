@@ -1186,6 +1186,18 @@ class NodeService(HierarchyMixin):
         """Forget cached secure aggregation client state."""
         self._secureagg_round_state = None
 
+    def _sanitize_model_vector(self, vector: List[float]) -> Tuple[List[float], bool]:
+        """Replace NaN/Inf values in the supplied vector with zeros."""
+        sanitized: List[float] = []
+        dirty = False
+        for value in vector:
+            if not math.isfinite(value):
+                sanitized.append(0.0)
+                dirty = True
+            else:
+                sanitized.append(value)
+        return sanitized, dirty
+
     def _request_participant_state_reset(self, round_idx: int) -> bool:
         """Ask the aggregator to clear this node's state for the supplied round."""
         agg_addr = self._aggregator_rpc_address()
@@ -1970,6 +1982,12 @@ class NodeService(HierarchyMixin):
             sap_r2_start = time.monotonic()
             self.comm_tracker.set_phase("sap_round2")
             model_vec = flatten_params(self.model)
+            model_vec, sanitized = self._sanitize_model_vector(model_vec)
+            if sanitized:
+                logger.warning(
+                    "Detected non-finite model parameters before quantization; replacing with zeros"
+                )
+                load_params(self.model, model_vec)
             quantized = quantize_vector(model_vec, self.scale)
 
             masked = client.create_masked_input(quantized)
@@ -2342,6 +2360,12 @@ class NodeService(HierarchyMixin):
 
                     quantized_final = [int(w) for w in model_response.model_weights]
                     dequantized = dequantize_vector(quantized_final, self.scale)
+                    dequantized, sanitized = self._sanitize_model_vector(dequantized)
+                    if sanitized:
+                        logger.warning(
+                            "Received non-finite parameters from aggregator %s; sanitizing before load",
+                            self.aggregator_id,
+                        )
                     load_params(self.model, dequantized)
 
                     if self.is_bridge_node and response_cid and response_hash:
