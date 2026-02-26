@@ -393,6 +393,28 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         for idx in obsolete:
             self._round_snapshots.pop(idx, None)
 
+    def ResetParticipantState(
+        self, request: secureagg_pb2.ResetParticipantRequest, context
+    ) -> secureagg_pb2.ResetParticipantAck:
+        """Allow a participant to clear its state when retrying the same round."""
+        node_id = request.node_id
+        if not self._validate_participant(node_id):
+            logger.warning("Reset state rejected for %s: not a clique member", node_id)
+            return secureagg_pb2.ResetParticipantAck(accepted=False, message="Node not in clique")
+        if request.round != self.current_round:
+            return secureagg_pb2.ResetParticipantAck(
+                accepted=False,
+                message=f"Round {request.round} no longer active (current={self.current_round})",
+            )
+        if self.aggregated_result is not None:
+            return secureagg_pb2.ResetParticipantAck(
+                accepted=False,
+                message="Aggregation already completed",
+            )
+        self._reset_participant_state(node_id)
+        logger.info("Reset secure aggregation state for %s in round %d", node_id, self.current_round)
+        return secureagg_pb2.ResetParticipantAck(accepted=True, message="State reset")
+
     def GetGlobalModel(self, request: secureagg_pb2.ModelRequest, context) -> secureagg_pb2.ModelResponse:
         """Return the global model with convergence signals.
 
@@ -520,6 +542,26 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
     def reset_for_next_round(self) -> None:
         """Maintain backward compatibility with previous API."""
         self.prepare_round(self.current_round + 1)
+
+    def _reset_participant_state(self, node_id: str) -> None:
+        """Clear secure aggregation state for a single participant so it can retry."""
+        self._round1_started.pop(node_id, None)
+        self._round3_signatures.pop(node_id, None)
+        self._round4_payloads = [payload for payload in self._round4_payloads if payload.node_id != node_id]
+        self.aggregator.reset_round1_state_for(node_id)
+        if node_id in self.aggregator.masked_inputs:
+            self.aggregator.masked_inputs.pop(node_id, None)
+            self.aggregator.survivors = [s for s in self.aggregator.survivors if s != node_id]
+        self.aggregated_result = None
+        self.metadata_ready = False
+        self.merged_model_cid = None
+        self.merged_model_hash = None
+        self.merged_model_data_id = None
+        self.should_stop = False
+        self.stop_reason = ""
+        self.delta_norm = 0.0
+        self.cluster_converged = False
+        self.convergence_streak = 0
 
 
 def serve(

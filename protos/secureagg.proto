@@ -47,6 +47,7 @@ service AggregatorService {
   rpc Round3ConsistencyCheck(ConsistencySignature) returns (ConsistencyAck);
   rpc Round4Unmask(UnmaskShares) returns (UnmaskAck);
   rpc GetGlobalModel(ModelRequest) returns (ModelResponse);
+  rpc ResetParticipantState(ResetParticipantRequest) returns (ResetParticipantAck);
   // Bridge nodes forward ECMs to aggregator for inter-cluster merge
   rpc SubmitECMs(ECMSubmitRequest) returns (ECMSubmitResponse);
   // Clique members can notify the aggregator when convergence is confirmed.
@@ -144,6 +145,16 @@ message ModelResponse {
   string model_cid = 8;
   string model_hash = 9;
   string model_data_id = 10;
+}
+
+message ResetParticipantRequest {
+  string node_id = 1;
+  int32 round = 2;
+}
+
+message ResetParticipantAck {
+  bool accepted = 1;
+  string message = 2;
 }
 
 // Inter-cluster ECM (External Cluster Model) messages

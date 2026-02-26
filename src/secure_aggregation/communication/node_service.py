@@ -10,6 +10,7 @@ import socket
 import time
 from collections import deque, defaultdict
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import grpc
@@ -159,6 +160,17 @@ class AggregatorUnavailable(Exception):
     """Raised when the elected aggregator cannot be reached after repeated attempts."""
 
 
+@dataclass
+class _SecureAggRoundState:
+    """Caches secure aggregation client state for a specific cluster round."""
+
+    round_idx: int
+    client: SecureAggregationNode
+    advert_msg: Optional[AdvertiseMessage] = None
+    ordered_participants: Optional[List[str]] = None
+    round1_ciphertexts: Optional[List[Round1Ciphertext]] = None
+
+
 class NodeService(HierarchyMixin):
     """Node service that coordinates training and secure aggregation."""
 
@@ -192,6 +204,7 @@ class NodeService(HierarchyMixin):
         self.secagg_rpc_timeout = self._resolve_secagg_rpc_timeout()
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
+        self._secureagg_round_state: Optional[_SecureAggRoundState] = None
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
         default_round_cap = 200
         system_training_cfg = (self.system_config or {}).get("training") if self.system_config else None
@@ -1156,6 +1169,61 @@ class NodeService(HierarchyMixin):
             if channel:
                 channel.close()
 
+    def _get_or_create_secureagg_state(self, round_idx: int) -> _SecureAggRoundState:
+        """Return cached secure aggregation client state for the supplied round."""
+        state = self._secureagg_round_state
+        if state is None or state.round_idx != round_idx:
+            client = SecureAggregationNode(
+                self.node_id,
+                signing_private=self.signing_keypair.private_key if self.signing_keypair else None,
+                signing_public=self.signing_keypair.public_key if self.signing_keypair else None,
+            )
+            state = _SecureAggRoundState(round_idx=round_idx, client=client)
+            self._secureagg_round_state = state
+        return state
+
+    def _clear_secureagg_round_state(self) -> None:
+        """Forget cached secure aggregation client state."""
+        self._secureagg_round_state = None
+
+    def _request_participant_state_reset(self, round_idx: int) -> bool:
+        """Ask the aggregator to clear this node's state for the supplied round."""
+        agg_addr = self._aggregator_rpc_address()
+        if not agg_addr:
+            return False
+        channel = None
+        try:
+            channel = self._create_aggregator_channel(agg_addr)
+            stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
+            response = self._invoke_tracked_rpc(
+                "ResetParticipantState",
+                stub.ResetParticipantState,
+                secureagg_pb2.ResetParticipantRequest(node_id=self.node_id, round=round_idx),
+                timeout=self.secagg_rpc_timeout,
+            )
+            if response.accepted:
+                logger.info(
+                    "Aggregator %s reset secure aggregation state for round %d", self.aggregator_id, round_idx + 1
+                )
+                return True
+            logger.warning(
+                "Aggregator %s rejected reset request for round %d: %s",
+                self.aggregator_id,
+                round_idx + 1,
+                response.message,
+            )
+            return False
+        except grpc.RpcError as exc:
+            logger.warning(
+                "Failed to request secure aggregation reset from %s: %s",
+                self.aggregator_id,
+                exc,
+            )
+            return False
+        finally:
+            if channel:
+                channel.close()
+
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
         try:
@@ -1707,42 +1775,86 @@ class NodeService(HierarchyMixin):
             )
         return response
 
+
+
+
     def run_secure_aggregation_round(self) -> List[float]:
         """Run one round of secure aggregation protocol."""
         self._abort_if_global_stop()
         logger.info(f"Starting secure aggregation round {self.current_round}")
-        # Client-side secure aggregation state
-        client = SecureAggregationNode(
-            self.node_id,
-            signing_private=self.signing_keypair.private_key if self.signing_keypair else None,
-            signing_public=self.signing_keypair.public_key if self.signing_keypair else None,
-        )
+        round_state = self._get_or_create_secureagg_state(self.current_round)
+        client = round_state.client
 
-        # Get aggregator address
         agg_addr = self._aggregator_rpc_address()
         if not agg_addr:
             raise AggregatorUnavailable("Aggregator address unavailable")
 
         channel = self._create_aggregator_channel(agg_addr)
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
+        try:
+            logger.info("SAP-Round 0: Advertising keys")
+            sap_r0_start = time.monotonic()
+            self.comm_tracker.set_phase("sap_round0")
+            if round_state.advert_msg is None:
+                round_state.advert_msg = client.advertise_keys()
+            advert_msg = round_state.advert_msg
 
-        # SAP Round 0: Advertise keys
-        logger.info("SAP-Round 0: Advertising keys")
-        sap_r0_start = time.monotonic()
-        self.comm_tracker.set_phase("sap_round0")
-        advert_msg = client.advertise_keys()
+            retry_delay = 1
+            max_retries = 30
+            if self.inter_cluster_enabled:
+                retry_delay = 2
+                max_retries = 75
+            response = None
+            last_rpc_error: Optional[grpc.RpcError] = None
+            for attempt in range(max_retries):
+                self._abort_if_global_stop()
+                try:
+                    round0_request = secureagg_pb2.KeyAdvertisement(
+                        node_id=self.node_id,
+                        c_public_key=advert_msg.c_public,
+                        s_public_key=advert_msg.s_public,
+                        signature=advert_msg.signature,
+                    )
+                    response = self._invoke_tracked_rpc(
+                        "Round0AdvertiseKeys",
+                        stub.Round0AdvertiseKeys,
+                        round0_request,
+                        timeout=self.secagg_rpc_timeout,
+                    )
+                    break
+                except grpc.RpcError as e:
+                    last_rpc_error = e
+                    if attempt < max_retries - 1:
+                        if attempt < 5 or (attempt + 1) % 5 == 0:
+                            logger.warning(
+                                "Aggregator %s at %s connection attempt %d/%d failed (%s); retrying in %ds...",
+                                self.aggregator_id,
+                                agg_addr,
+                                attempt + 1,
+                                max_retries,
+                                e.code().name if hasattr(e, "code") else "unknown",
+                                retry_delay,
+                            )
+                        attempt_idx = attempt + 1
+                        self._maybe_check_convergence_during_retry(
+                            attempt_idx, max_retries, "Round0AdvertiseKeys"
+                        )
+                        time.sleep(retry_delay)
+                        self._abort_if_global_stop()
+                    else:
+                        break
 
-        # Retry logic for initial aggregator connection.
-        retry_delay = 1
-        max_retries = 30
-        if self.inter_cluster_enabled:
-            retry_delay = 2
-            max_retries = 75
-        response = None
-        last_rpc_error: Optional[grpc.RpcError] = None
-        for attempt in range(max_retries):
-            self._abort_if_global_stop()
-            try:
+            if response is None:
+                self._raise_aggregator_unavailable("Round0AdvertiseKeys", max_retries, last_rpc_error)
+
+            if not response.accepted:
+                raise RuntimeError(f"Round 0 failed: {response.message}")
+
+            expected_participants = len(self.clique_members)
+            while len(response.all_keys) < expected_participants:
+                self._abort_if_global_stop()
+                time.sleep(1)
+                self._abort_if_global_stop()
                 round0_request = secureagg_pb2.KeyAdvertisement(
                     node_id=self.node_id,
                     c_public_key=advert_msg.c_public,
@@ -1755,121 +1867,53 @@ class NodeService(HierarchyMixin):
                     round0_request,
                     timeout=self.secagg_rpc_timeout,
                 )
-                break
-            except grpc.RpcError as e:
-                last_rpc_error = e
-                if attempt < max_retries - 1:
-                    if attempt < 5 or (attempt + 1) % 5 == 0:
-                        logger.warning(
-                            "Aggregator %s at %s connection attempt %d/%d failed (%s); retrying in %ds...",
-                            self.aggregator_id,
-                            agg_addr,
-                            attempt + 1,
-                            max_retries,
-                            e.code().name if hasattr(e, "code") else "unknown",
-                            retry_delay,
-                        )
-                    attempt_idx = attempt + 1
-                    self._maybe_check_convergence_during_retry(
-                        attempt_idx, max_retries, "Round0AdvertiseKeys"
-                    )
-                    time.sleep(retry_delay)
-                    self._abort_if_global_stop()
-                else:
-                    break
 
-        if response is None:
-            self._raise_aggregator_unavailable(
-                "Round0AdvertiseKeys", max_retries, last_rpc_error
-            )
+                logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
 
-        if not response.accepted:
-            raise RuntimeError(f"Round 0 failed: {response.message}")
+            if self.prom_metrics:
+                self.prom_metrics.observe_sap_phase("round0", time.monotonic() - sap_r0_start)
 
-        # Wait for ALL clique members to advertise (not just threshold).
-        expected_participants = len(self.clique_members)
-        while len(response.all_keys) < expected_participants:
-            self._abort_if_global_stop()
-            time.sleep(1)
-            self._abort_if_global_stop()
-            round0_request = secureagg_pb2.KeyAdvertisement(
-                node_id=self.node_id,
-                c_public_key=advert_msg.c_public,
-                s_public_key=advert_msg.s_public,
-                signature=advert_msg.signature,
-            )
-            response = self._invoke_tracked_rpc(
-                "Round0AdvertiseKeys",
-                stub.Round0AdvertiseKeys,
-                round0_request,
-                timeout=self.secagg_rpc_timeout,
-            )
-
-            logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
-
-        # Record Round 0 timing
-        if self.prom_metrics:
-            self.prom_metrics.observe_sap_phase("round0", time.monotonic() - sap_r0_start)
-
-        # Pass received advertisements to client
-        ordered_participants = [p.node_id for p in response.all_keys]
-        adverts = [
-            AdvertiseMessage(
-                node_id=p.node_id,
-                c_public=bytes(p.c_public_key),
-                s_public=bytes(p.s_public_key),
-                signature=bytes(p.signature),
-                signing_public=None,
-            )
-            for p in response.all_keys
-        ]
-        client.receive_advertisements(adverts)
-
-        # SAP Round 1: Share keys (simplified - just send empty shares)
-        logger.info("SAP-Round 1: Sharing keys")
-        sap_r1_start = time.monotonic()
-        self.comm_tracker.set_phase("sap_round1")
-        ct_list = client.create_round1_ciphertexts(ordered_participants, self.threshold)
-        round1_request = secureagg_pb2.ShareKeysMessage(
-            node_id=self.node_id,
-            ciphertexts=[
-                secureagg_pb2.Round1Ciphertext(
-                    sender_id=ct.sender_id,
-                    recipient_id=ct.recipient_id,
-                    iv=ct.iv,
-                    ciphertext=ct.ciphertext,
-                    tag=ct.tag,
+            ordered_participants = [p.node_id for p in response.all_keys]
+            if round_state.ordered_participants is None:
+                round_state.ordered_participants = ordered_participants
+            participants_for_round = round_state.ordered_participants
+            adverts = [
+                AdvertiseMessage(
+                    node_id=p.node_id,
+                    c_public=bytes(p.c_public_key),
+                    s_public=bytes(p.s_public_key),
+                    signature=bytes(p.signature),
+                    signing_public=None,
                 )
-                for ct in ct_list
-            ],
-        )
-        response1 = self._invoke_tracked_rpc(
-            "Round1ShareKeys",
-            stub.Round1ShareKeys,
-            round1_request,
-            timeout=self.secagg_rpc_timeout,
-        )
-        mailbox = [
-            Round1Ciphertext(
-                sender_id=ct.sender_id,
-                recipient_id=ct.recipient_id,
-                iv=bytes(ct.iv),
-                ciphertext=bytes(ct.ciphertext),
-                tag=bytes(ct.tag),
+                for p in response.all_keys
+            ]
+            client.receive_advertisements(adverts)
+
+            logger.info("SAP-Round 1: Sharing keys")
+            sap_r1_start = time.monotonic()
+            self.comm_tracker.set_phase("sap_round1")
+            if round_state.round1_ciphertexts is None:
+                round_state.round1_ciphertexts = client.create_round1_ciphertexts(
+                    participants_for_round, self.threshold
+                )
+            ct_list = round_state.round1_ciphertexts
+            round1_request = secureagg_pb2.ShareKeysMessage(
+                node_id=self.node_id,
+                ciphertexts=[
+                    secureagg_pb2.Round1Ciphertext(
+                        sender_id=ct.sender_id,
+                        recipient_id=ct.recipient_id,
+                        iv=ct.iv,
+                        ciphertext=ct.ciphertext,
+                        tag=ct.tag,
+                    )
+                    for ct in ct_list
+                ],
             )
-            for ct in response1.mailbox
-        ]
-        # Poll until mailbox has entries from all n participants (each sends to all including self).
-        expected_mail = len(ordered_participants)
-        while len(mailbox) < expected_mail:
-            self._abort_if_global_stop()
-            time.sleep(1)
-            self._abort_if_global_stop()
-            round1_poll_request = secureagg_pb2.ShareKeysMessage(node_id=self.node_id, ciphertexts=[])
             response1 = self._invoke_tracked_rpc(
                 "Round1ShareKeys",
                 stub.Round1ShareKeys,
-                round1_poll_request,
+                round1_request,
                 timeout=self.secagg_rpc_timeout,
             )
             mailbox = [
@@ -1882,130 +1926,162 @@ class NodeService(HierarchyMixin):
                 )
                 for ct in response1.mailbox
             ]
-        client.receive_round1_ciphertexts(mailbox)
+            expected_mail = len(participants_for_round)
+            while len(mailbox) < expected_mail:
+                self._abort_if_global_stop()
+                time.sleep(1)
+                self._abort_if_global_stop()
+                round1_request = secureagg_pb2.ShareKeysMessage(
+                    node_id=self.node_id,
+                    ciphertexts=[
+                        secureagg_pb2.Round1Ciphertext(
+                            sender_id=ct.sender_id,
+                            recipient_id=ct.recipient_id,
+                            iv=ct.iv,
+                            ciphertext=ct.ciphertext,
+                            tag=ct.tag,
+                        )
+                        for ct in ct_list
+                    ],
+                )
+                response1 = self._invoke_tracked_rpc(
+                    "Round1ShareKeys",
+                    stub.Round1ShareKeys,
+                    round1_request,
+                    timeout=self.secagg_rpc_timeout,
+                )
+                mailbox = [
+                    Round1Ciphertext(
+                        sender_id=ct.sender_id,
+                        recipient_id=ct.recipient_id,
+                        iv=bytes(ct.iv),
+                        ciphertext=bytes(ct.ciphertext),
+                        tag=bytes(ct.tag),
+                    )
+                    for ct in response1.mailbox
+                ]
 
-        # Record Round 1 timing
-        if self.prom_metrics:
-            self.prom_metrics.observe_sap_phase("round1", time.monotonic() - sap_r1_start)
+            if self.prom_metrics:
+                self.prom_metrics.observe_sap_phase("round1", time.monotonic() - sap_r1_start)
 
-        # SAP Round 2: Send masked input
-        logger.info("SAP-Round 2: Sending masked model")
-        sap_r2_start = time.monotonic()
-        self.comm_tracker.set_phase("sap_round2")
-        model_vec = flatten_params(self.model)
-        quantized = quantize_vector(model_vec, self.scale)
+            client.receive_round1_ciphertexts(mailbox)
 
-        masked = client.create_masked_input(quantized)
-        masked_bytes = [_int_to_bytes(val, SHARE_BYTES) for val in masked.masked_vector]
-        round2_request = secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes)
-        response2 = self._invoke_tracked_rpc(
-            "Round2MaskedInput",
-            stub.Round2MaskedInput,
-            round2_request,
-            timeout=self.secagg_rpc_timeout,
-        )
+            logger.info("SAP-Round 2: Sending masked model")
+            sap_r2_start = time.monotonic()
+            self.comm_tracker.set_phase("sap_round2")
+            model_vec = flatten_params(self.model)
+            quantized = quantize_vector(model_vec, self.scale)
 
-        # Wait for survivors list
-        while not response2.survivors:
-            self._abort_if_global_stop()
-            time.sleep(1)
-            self._abort_if_global_stop()
-            round2_poll_request = secureagg_pb2.MaskedInputMessage(
-                node_id=self.node_id,
-                masked_vector=masked_bytes,
-            )
+            masked = client.create_masked_input(quantized)
+            masked_bytes = [_int_to_bytes(val, SHARE_BYTES) for val in masked.masked_vector]
+            round2_request = secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes)
             response2 = self._invoke_tracked_rpc(
                 "Round2MaskedInput",
                 stub.Round2MaskedInput,
-                round2_poll_request,
+                round2_request,
                 timeout=self.secagg_rpc_timeout,
             )
 
-        logger.info(f"SAP-Round 2 complete: {len(response2.survivors)} survivors")
+            while not response2.survivors:
+                self._abort_if_global_stop()
+                time.sleep(1)
+                self._abort_if_global_stop()
+                round2_poll_request = secureagg_pb2.MaskedInputMessage(
+                    node_id=self.node_id,
+                    masked_vector=masked_bytes,
+                )
+                response2 = self._invoke_tracked_rpc(
+                    "Round2MaskedInput",
+                    stub.Round2MaskedInput,
+                    round2_poll_request,
+                    timeout=self.secagg_rpc_timeout,
+                )
 
-        # Record Round 2 timing
-        if self.prom_metrics:
-            self.prom_metrics.observe_sap_phase("round2", time.monotonic() - sap_r2_start)
+            logger.info(f"SAP-Round 2 complete: {len(response2.survivors)} survivors")
 
-        # SAP Round 3: Consistency check
-        logger.info("SAP-Round 3: Consistency check")
-        sap_r3_start = time.monotonic()
-        self.comm_tracker.set_phase("sap_round3")
-        survivor_sig = client.sign_survivor_list(response2.survivors)
-        round3_request = secureagg_pb2.ConsistencySignature(
-            node_id=self.node_id,
-            signature=survivor_sig.signature,
-        )
-        response3 = self._invoke_tracked_rpc(
-            "Round3ConsistencyCheck",
-            stub.Round3ConsistencyCheck,
-            round3_request,
-            timeout=self.secagg_rpc_timeout,
-        )
+            if self.prom_metrics:
+                self.prom_metrics.observe_sap_phase("round2", time.monotonic() - sap_r2_start)
 
-        # Record Round 3 timing
-        if self.prom_metrics:
-            self.prom_metrics.observe_sap_phase("round3", time.monotonic() - sap_r3_start)
-
-        # SAP Round 4: Unmask (simplified - send empty shares)
-        logger.info("SAP-Round 4: Unmasking")
-        sap_r4_start = time.monotonic()
-        self.comm_tracker.set_phase("sap_round4")
-        dropouts = set(ordered_participants) - set(response2.survivors)
-        unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
-        round4_request = secureagg_pb2.UnmaskShares(
-            node_id=self.node_id,
-            dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
-            survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
-        )
-        response4 = self._invoke_tracked_rpc(
-            "Round4Unmask",
-            stub.Round4Unmask,
-            round4_request,
-            timeout=self.secagg_rpc_timeout,
-        )
-
-        # Wait for aggregation to complete
-        while not response4.aggregation_complete:
-            self._abort_if_global_stop()
-            time.sleep(1)
-            self._abort_if_global_stop()
-            round4_poll_request = secureagg_pb2.UnmaskShares(
+            logger.info("SAP-Round 3: Consistency check")
+            sap_r3_start = time.monotonic()
+            self.comm_tracker.set_phase("sap_round3")
+            survivor_sig = client.sign_survivor_list(response2.survivors)
+            round3_request = secureagg_pb2.ConsistencySignature(
                 node_id=self.node_id,
-                dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
-                survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
+                signature=survivor_sig.signature,
+            )
+            self._invoke_tracked_rpc(
+                "Round3ConsistencyCheck",
+                stub.Round3ConsistencyCheck,
+                round3_request,
+                timeout=self.secagg_rpc_timeout,
+            )
+
+            if self.prom_metrics:
+                self.prom_metrics.observe_sap_phase("sap_round3", time.monotonic() - sap_r3_start)
+
+            logger.info("SAP-Round 4: Unmasking")
+            sap_r4_start = time.monotonic()
+            self.comm_tracker.set_phase("sap_round4")
+            dropouts = set(participants_for_round) - set(response2.survivors)
+            unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
+            round4_request = secureagg_pb2.UnmaskShares(
+                node_id=self.node_id,
+                dropout_s_shares={
+                    k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()
+                },
+                survivor_b_shares={
+                    k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()
+                },
             )
             response4 = self._invoke_tracked_rpc(
                 "Round4Unmask",
                 stub.Round4Unmask,
-                round4_poll_request,
+                round4_request,
                 timeout=self.secagg_rpc_timeout,
             )
 
-        logger.info("SAP-Round 4 complete: aggregation done")
+            while not response4.aggregation_complete:
+                self._abort_if_global_stop()
+                time.sleep(1)
+                self._abort_if_global_stop()
+                round4_poll_request = secureagg_pb2.UnmaskShares(
+                    node_id=self.node_id,
+                    dropout_s_shares={
+                        k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()
+                    },
+                    survivor_b_shares={
+                        k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()
+                    },
+                )
+                response4 = self._invoke_tracked_rpc(
+                    "Round4Unmask",
+                    stub.Round4Unmask,
+                    round4_poll_request,
+                    timeout=self.secagg_rpc_timeout,
+                )
 
-        # Record Round 4 timing
-        if self.prom_metrics:
-            self.prom_metrics.observe_sap_phase("round4", time.monotonic() - sap_r4_start)
+            logger.info("SAP-Round 4 complete: aggregation done")
 
-        # Get global model
-        aggregated: List[float] = []
-        if self.is_aggregator:
-            logger.info("Fetching global model")
-            self.comm_tracker.set_phase("model_fetch")
-            model_request = secureagg_pb2.ModelRequest(round=self.current_round)
-            model_response = self._invoke_tracked_rpc(
-                "GetGlobalModel",
-                stub.GetGlobalModel,
-                model_request,
-                timeout=self.secagg_rpc_timeout,
-            )
-            aggregated = list(model_response.model_weights)
-            logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
+            if self.prom_metrics:
+                self.prom_metrics.observe_sap_phase("round4", time.monotonic() - sap_r4_start)
 
-        channel.close()
-
-        return aggregated
+            aggregated: List[float] = []
+            if self.is_aggregator:
+                logger.info("Fetching global model")
+                self.comm_tracker.set_phase("model_fetch")
+                model_request = secureagg_pb2.ModelRequest(round=self.current_round)
+                model_response = self._invoke_tracked_rpc(
+                    "GetGlobalModel",
+                    stub.GetGlobalModel,
+                    model_request,
+                    timeout=self.secagg_rpc_timeout,
+                )
+                aggregated = list(model_response.model_weights)
+                logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
+            return aggregated
+        finally:
+            channel.close()
 
     def run_training_loop(self) -> None:
         """Convergence-driven training loop with secure aggregation.
@@ -2345,6 +2421,26 @@ class NodeService(HierarchyMixin):
                     self.stop_aggregator_server()
 
             if round_failed:
+                remote_round: Optional[int] = None
+                if not self.is_aggregator:
+                    remote_round = self._get_remote_aggregator_round()
+                    if remote_round is not None and remote_round > self.current_round:
+                        logger.warning(
+                            "Aggregator %s advanced to round %d; skipping local round %d",
+                            self.aggregator_id,
+                            remote_round + 1,
+                            self.current_round + 1,
+                        )
+                        self._clear_secureagg_round_state()
+                        self._consecutive_aggregator_failures = 0
+                        self.current_round = remote_round
+                        continue
+                    if (
+                        remote_round is not None
+                        and remote_round == self.current_round
+                        and not aggregator_unreachable_this_round
+                    ):
+                        self._request_participant_state_reset(round_idx)
                 if aggregator_unreachable_this_round:
                     self._consecutive_aggregator_failures += 1
                     if self._consecutive_aggregator_failures >= self._max_aggregator_failure_rounds:
@@ -2400,6 +2496,7 @@ class NodeService(HierarchyMixin):
             self._maybe_schedule_scope_round(round_idx)
             self._process_high_level_rounds()
 
+            self._clear_secureagg_round_state()
             time.sleep(5)
             self.current_round += 1
 
