@@ -1217,6 +1217,7 @@ class NodeService(HierarchyMixin):
                 logger.info(
                     "Aggregator %s reset secure aggregation state for round %d", self.aggregator_id, round_idx + 1
                 )
+                self._clear_secureagg_round_state()
                 return True
             logger.warning(
                 "Aggregator %s rejected reset request for round %d: %s",
@@ -2066,10 +2067,22 @@ class NodeService(HierarchyMixin):
                 for survivor in response2.survivors
                 if survivor != self.node_id and survivor not in client._peer_shares
             ]
-            if missing_survivor_shares:
+            missing_dropout_shares = [
+                dropout
+                for dropout in dropouts
+                if dropout != self.node_id and dropout not in client._peer_shares
+            ]
+            if missing_survivor_shares or missing_dropout_shares:
+                details: List[str] = []
+                if missing_survivor_shares:
+                    details.append(f"survivors {missing_survivor_shares}")
+                if missing_dropout_shares:
+                    details.append(f"dropouts {missing_dropout_shares}")
+                self._clear_secureagg_round_state()
                 raise RuntimeError(
-                    "Missing Round 1 shares for survivors "
-                    f"{missing_survivor_shares}; forcing round retry to refresh key exchange"
+                    "Missing Round 1 shares for "
+                    + " and ".join(details)
+                    + "; forcing round retry to refresh key exchange"
                 )
             unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
             round4_request = secureagg_pb2.UnmaskShares(
@@ -2474,6 +2487,7 @@ class NodeService(HierarchyMixin):
                     self.stop_aggregator_server()
 
             if round_failed:
+                self._clear_secureagg_round_state()
                 remote_round: Optional[int] = None
                 if not self.is_aggregator:
                     remote_round = self._get_remote_aggregator_round()
