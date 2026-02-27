@@ -2,6 +2,8 @@
 
 import logging
 import os
+import threading
+import time
 from concurrent import futures
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -100,6 +102,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         signing_public_keys: Optional[Mapping[str, bytes]] = None,
         ecm_buffer: Optional[ECMBuffer] = None,
         convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
+        round0_timeout_seconds: float = 0.0,
     ) -> None:
         self.node_id = node_id
         self.threshold = threshold
@@ -114,6 +117,13 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round3_signatures: Dict[str, bytes] = {}
         self._round4_payloads: List[UnmaskingSharesModel] = []
         self._round_snapshots: Dict[int, secureagg_pb2.ModelResponse] = {}
+        self._committed_adverts: List[AdvertiseMessage] = []
+        self._round0_finalized: bool = False
+        self._round2_finalized: bool = False
+        self._round2_survivors: List[str] = []
+        self._round0_timeout_seconds = max(0.0, round0_timeout_seconds)
+        self._round0_opened_at = time.monotonic()
+        self._round0_lock = threading.Lock()
 
         # ECM buffer for receiving ECMs from bridge nodes
         self.ecm_buffer = ecm_buffer
@@ -166,6 +176,40 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
     def _validate_participant(self, node_id: str) -> bool:
         return node_id in self.participant_ids
 
+    def _round0_timeout_elapsed_locked(self) -> bool:
+        if self._round0_timeout_seconds <= 0:
+            return False
+        return (time.monotonic() - self._round0_opened_at) >= self._round0_timeout_seconds
+
+    def _finalize_round0_if_ready_locked(self) -> None:
+        if self._round0_finalized:
+            return
+        committed = len(self._committed_adverts)
+        total = len(self.participant_ids)
+        if committed >= total and total > 0:
+            self._round0_finalized = True
+            logger.info("SAP-Round 0 finalized after accepting all %d participants", total)
+            return
+        if committed >= self.threshold and self._round0_timeout_elapsed_locked():
+            self._round0_finalized = True
+            logger.info(
+                "SAP-Round 0 finalized after timeout (participants=%d, threshold=%d, timeout=%.1fs)",
+                committed,
+                self.threshold,
+                self._round0_timeout_seconds,
+            )
+
+    def _encoded_committed_adverts(self) -> List[secureagg_pb2.KeyAdvertisement]:
+        return [
+            secureagg_pb2.KeyAdvertisement(
+                node_id=adv.node_id,
+                c_public_key=adv.c_public,
+                s_public_key=adv.s_public,
+                signature=adv.signature,
+            )
+            for adv in self._committed_adverts
+        ]
+
     def Round0AdvertiseKeys(self, request: secureagg_pb2.KeyAdvertisement, context) -> secureagg_pb2.KeyAdvertisementAck:
         """Collect DH public keys from participants (SAP-Round 0)."""
         node_id = request.node_id
@@ -174,42 +218,66 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             logger.warning(f"Rejected key advertisement from {node_id}: not a clique member")
             return secureagg_pb2.KeyAdvertisementAck(accepted=False, message="Node not in clique")
 
-        try:
-            advert = AdvertiseMessage(
-                node_id=node_id,
-                c_public=bytes(request.c_public_key),
-                s_public=bytes(request.s_public_key),
-                signature=bytes(request.signature),
-                signing_public=None,  # Expected from signing_public_keys provided at init
-            )
-            if node_id not in self._adverts:
-                self._adverts[node_id] = advert
-            # Once we have threshold, commit into aggregator once.
-            if not self._adverts_committed and len(self._adverts) >= self.threshold:
-                self.aggregator.receive_advertisements(list(self._adverts.values()))
-                self._adverts_committed = True
-            elif self._adverts_committed and node_id not in self.aggregator.advertisements:
-                # Add late adverts after initial commit.
-                self.aggregator.receive_advertisements([advert])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
-            return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
+        response_keys: List[secureagg_pb2.KeyAdvertisement] = []
+        response_message = "Waiting for more participants"
+        accepted = True
+        with self._round0_lock:
+            if self._round0_finalized and node_id not in self._adverts:
+                logger.warning("Rejected key advertisement from %s: Round 0 already finalized", node_id)
+                return secureagg_pb2.KeyAdvertisementAck(
+                    accepted=False,
+                    message="Round 0 finalized",
+                    all_keys=self._encoded_committed_adverts(),
+                )
 
-        # Once we have threshold, return full list.
-        all_keys = self.aggregator.broadcast_advertisements() if self._adverts_committed else []
-        ack_keys = [
-            secureagg_pb2.KeyAdvertisement(
-                node_id=adv.node_id,
-                c_public_key=adv.c_public,
-                s_public_key=adv.s_public,
-                signature=adv.signature,
-            )
-            for adv in all_keys
-        ]
+            try:
+                advert = AdvertiseMessage(
+                    node_id=node_id,
+                    c_public=bytes(request.c_public_key),
+                    s_public=bytes(request.s_public_key),
+                    signature=bytes(request.signature),
+                    signing_public=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
+                return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
+
+            is_new_advert = node_id not in self._adverts
+            if is_new_advert:
+                self._adverts[node_id] = advert
+
+            try:
+                if not self._adverts_committed and len(self._adverts) >= self.threshold:
+                    self.aggregator.receive_advertisements(list(self._adverts.values()))
+                    self._adverts_committed = True
+                elif self._adverts_committed and is_new_advert:
+                    self.aggregator.receive_advertisements([advert])
+            except Exception as exc:  # noqa: BLE001
+                if is_new_advert:
+                    self._adverts.pop(node_id, None)
+                logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
+                return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
+
+            if self._adverts_committed:
+                self._committed_adverts = self.aggregator.broadcast_advertisements()
+            else:
+                self._committed_adverts = []
+
+            self._finalize_round0_if_ready_locked()
+            response_keys = self._encoded_committed_adverts()
+            if response_keys:
+                response_message = "SAP-Round 0 OK"
+            if self._round0_finalized and node_id not in self._adverts:
+                return secureagg_pb2.KeyAdvertisementAck(
+                    accepted=False,
+                    message="Round 0 finalized",
+                    all_keys=response_keys,
+                )
+
         return secureagg_pb2.KeyAdvertisementAck(
             accepted=True,
-            message="SAP-Round 0 OK" if len(all_keys) >= self.threshold else "Waiting for more participants",
-            all_keys=ack_keys if len(all_keys) >= self.threshold else [],
+            message=response_message,
+            all_keys=response_keys,
         )
 
     def Round1ShareKeys(self, request: secureagg_pb2.ShareKeysMessage, context) -> secureagg_pb2.ShareKeysAck:
@@ -244,6 +312,20 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             logger.warning(f"Rejected masked input from {node_id}: not a clique member")
             return secureagg_pb2.MaskedInputAck(accepted=False, message="Node not in clique")
         try:
+            if self._round2_finalized:
+                survivors = list(self._round2_survivors)
+                if node_id in self.aggregator.masked_inputs:
+                    return secureagg_pb2.MaskedInputAck(
+                        accepted=True,
+                        message="SAP-Round 2 OK",
+                        survivors=survivors,
+                    )
+                logger.warning("Masked input from %s rejected: Round 2 already finalized", node_id)
+                return secureagg_pb2.MaskedInputAck(
+                    accepted=False,
+                    message="Round 2 finalized",
+                    survivors=survivors,
+                )
             # Check if this node has already submitted (polling case).
             if node_id not in self.aggregator.masked_inputs:
                 masked = MaskedInput(
@@ -251,11 +333,17 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     masked_vector=[int.from_bytes(v, byteorder="big") for v in request.masked_vector],
                 )
                 self.aggregator.receive_masked_input(masked)
-            # Wait for ALL participants before returning survivors (not just threshold).
-            if len(self.aggregator.masked_inputs) >= len(self.participant_ids):
+            if len(self.aggregator.masked_inputs) >= self.threshold:
                 survivors = self.aggregator.broadcast_survivors()
+                self._round2_survivors = survivors
+                self._round2_finalized = True
+                logger.info(
+                    "SAP-Round 2 finalized with %d survivors (threshold=%d)",
+                    len(survivors),
+                    self.threshold,
+                )
                 return secureagg_pb2.MaskedInputAck(accepted=True, message="SAP-Round 2 OK", survivors=survivors)
-            return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for all participants", survivors=[])
+            return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for more participants", survivors=[])
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"SAP-Round2 processing failed for {node_id}: {exc}")
             survivors = self.aggregator.survivors or []
@@ -267,6 +355,9 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected signature from {node_id}: not a clique member")
             return secureagg_pb2.ConsistencyAck(accepted=False, message="Node not in clique")
+        if self._round2_finalized and node_id not in self.aggregator.survivors:
+            logger.warning("Rejected signature from %s: not a survivor", node_id)
+            return secureagg_pb2.ConsistencyAck(accepted=False, message="Node not a survivor")
         try:
             sig = SurvivorSignature(node_id=node_id, signature=bytes(request.signature))
             self._round3_signatures[node_id] = sig.signature
@@ -285,6 +376,13 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected unmask shares from {node_id}: not a clique member")
             return secureagg_pb2.UnmaskAck(accepted=False, message="Node not in clique", aggregation_complete=False)
+        if self._round2_finalized and node_id not in self.aggregator.survivors:
+            logger.warning("Rejected unmask shares from %s: not a survivor", node_id)
+            return secureagg_pb2.UnmaskAck(
+                accepted=False,
+                message="Node not a survivor",
+                aggregation_complete=False,
+            )
         try:
             # Only accept first submission from each node to prevent duplicates during polling.
             already_submitted = any(p.node_id == node_id for p in self._round4_payloads)
@@ -476,8 +574,13 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self.metadata_ready = False
         self._adverts.clear()
         self._adverts_committed = False
+        self._committed_adverts = []
+        self._round0_finalized = False
         self._round3_signatures.clear()
         self._round4_payloads.clear()
+        self._round2_finalized = False
+        self._round2_survivors = []
+        self._round0_opened_at = time.monotonic()
         self.current_round = round_idx
         logger.info("Aggregator %s prepared for round %d", self.node_id, round_idx)
 
@@ -494,6 +597,7 @@ def serve(
     signing_public_keys: Optional[Mapping[str, bytes]] = None,
     ecm_buffer: Optional[ECMBuffer] = None,
     convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
+    round0_timeout_seconds: float = 0.0,
 ) -> Tuple[grpc.Server, AggregatorServicer]:
     """Start the aggregator gRPC server.
 
@@ -507,6 +611,7 @@ def serve(
         signing_public_keys=signing_public_keys,
         ecm_buffer=ecm_buffer,
         convergence_signal_handler=convergence_signal_handler,
+        round0_timeout_seconds=round0_timeout_seconds,
     )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=10),

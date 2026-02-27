@@ -190,6 +190,7 @@ class NodeService(HierarchyMixin):
         self.training_config = self.config["training"]
         self.secagg_config = self.config["secure_agg"]
         self.secagg_rpc_timeout = self._resolve_secagg_rpc_timeout()
+        self.round0_timeout_seconds = self._resolve_round0_timeout()
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
@@ -375,6 +376,30 @@ class NodeService(HierarchyMixin):
         except (TypeError, ValueError):
             logger.warning(
                 "Invalid secure aggregation RPC timeout '%s'; defaulting to %.1fs",
+                timeout_value,
+                default_timeout,
+            )
+            return default_timeout
+
+    def _resolve_round0_timeout(self) -> float:
+        """Determine how long to wait before finalizing SAP Round 0."""
+        default_timeout = 30.0
+        timeout_value: Any = self.secagg_config.get("round0_timeout_seconds")
+        system_secagg_cfg = None
+        if self.system_config and isinstance(self.system_config, dict):
+            system_secagg_cfg = self.system_config.get("secure_agg")
+        if timeout_value is None and isinstance(system_secagg_cfg, dict):
+            timeout_value = system_secagg_cfg.get("round0_timeout_seconds")
+        if timeout_value is None:
+            timeout_value = default_timeout
+        try:
+            parsed = float(timeout_value)
+            if parsed <= 0:
+                return 0.0
+            return parsed
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid SAP Round 0 timeout '%s'; defaulting to %.1fs",
                 timeout_value,
                 default_timeout,
             )
@@ -1115,6 +1140,7 @@ class NodeService(HierarchyMixin):
                 signing_public_keys=signing_public_keys or None,
                 ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
                 convergence_signal_handler=convergence_handler,
+                round0_timeout_seconds=self.round0_timeout_seconds,
             )
         except PortBindingError:
             logger.error(
@@ -1786,9 +1812,9 @@ class NodeService(HierarchyMixin):
         if not response.accepted:
             raise RuntimeError(f"Round 0 failed: {response.message}")
 
-        # Wait for ALL clique members to advertise (not just threshold).
-        expected_participants = len(self.clique_members)
-        while len(response.all_keys) < expected_participants:
+        # Wait until we receive at least the threshold number of advertisements.
+        required_participants = max(self.threshold, 1)
+        while len(response.all_keys) < required_participants:
             self._abort_if_global_stop()
             time.sleep(1)
             self._abort_if_global_stop()
