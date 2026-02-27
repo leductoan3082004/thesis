@@ -122,6 +122,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round0_finalized: bool = False
         self._round2_finalized: bool = False
         self._round2_survivors: List[str] = []
+        self._round2_waiting_on_aggregator: bool = False
         self._active_threshold = max(1, min(self.threshold, len(self.participant_ids)))
         self._round0_timeout_seconds = max(0.0, round0_timeout_seconds)
         self._round0_opened_at = time.monotonic()
@@ -360,7 +361,23 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     masked_vector=[int.from_bytes(v, byteorder="big") for v in request.masked_vector],
                 )
                 self.aggregator.receive_masked_input(masked)
-            if len(self.aggregator.masked_inputs) >= self._active_threshold:
+            threshold_met = len(self.aggregator.masked_inputs) >= self._active_threshold
+            aggregator_submitted = self.node_id in self.aggregator.masked_inputs
+            if threshold_met and not aggregator_submitted:
+                if not self._round2_waiting_on_aggregator:
+                    logger.info(
+                        "SAP-Round 2 threshold met (%d masked inputs) but aggregator %s has not submitted yet; waiting",
+                        len(self.aggregator.masked_inputs),
+                        self.node_id,
+                    )
+                    self._round2_waiting_on_aggregator = True
+                return secureagg_pb2.MaskedInputAck(
+                    accepted=True,
+                    message="Waiting for aggregator masked input",
+                    survivors=[],
+                )
+            if threshold_met:
+                self._round2_waiting_on_aggregator = False
                 survivors = self.aggregator.broadcast_survivors()
                 self._round2_survivors = survivors
                 self._round2_finalized = True
@@ -609,6 +626,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round4_payloads.clear()
         self._round2_finalized = False
         self._round2_survivors = []
+        self._round2_waiting_on_aggregator = False
         self._round0_opened_at = time.monotonic()
         self.current_round = round_idx
         logger.info("Aggregator %s prepared for round %d", self.node_id, round_idx)
