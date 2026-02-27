@@ -1952,12 +1952,24 @@ class NodeService(HierarchyMixin):
         masked = client.create_masked_input(quantized)
         masked_bytes = [_int_to_bytes(val, SHARE_BYTES) for val in masked.masked_vector]
         round2_request = secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes)
-        response2 = self._invoke_tracked_rpc(
-            "Round2MaskedInput",
-            stub.Round2MaskedInput,
-            round2_request,
-            timeout=self.secagg_rpc_timeout,
-        )
+        masked_input_accepted = False
+        try:
+            response2 = self._invoke_tracked_rpc(
+                "Round2MaskedInput",
+                stub.Round2MaskedInput,
+                round2_request,
+                timeout=self.secagg_rpc_timeout,
+            )
+            masked_input_accepted = response2.accepted
+            logger.debug(
+                "SAP-Round 2 initial response: accepted=%s, timed_out=%s, survivors=%s",
+                response2.accepted,
+                response2.timed_out,
+                list(response2.survivors),
+            )
+        except grpc.RpcError as exc:
+            logger.error("SAP-Round 2 masked input RPC failed: %s", exc)
+            raise
         expected_survivors = len(self.clique_members) if self.clique_members else len(ordered_participants)
         expected_survivors = max(expected_survivors, self.threshold)
 
@@ -1979,14 +1991,28 @@ class NodeService(HierarchyMixin):
                 node_id=self.node_id,
                 masked_vector=masked_bytes,
             )
-            response2 = self._invoke_tracked_rpc(
-                "Round2MaskedInput",
-                stub.Round2MaskedInput,
-                round2_poll_request,
-                timeout=self.secagg_rpc_timeout,
-            )
+            try:
+                response2 = self._invoke_tracked_rpc(
+                    "Round2MaskedInput",
+                    stub.Round2MaskedInput,
+                    round2_poll_request,
+                    timeout=self.secagg_rpc_timeout,
+                )
+                if response2.accepted:
+                    masked_input_accepted = True
+                logger.debug(
+                    "SAP-Round 2 poll response: accepted=%s, timed_out=%s, survivors=%s",
+                    response2.accepted,
+                    response2.timed_out,
+                    list(response2.survivors),
+                )
+            except grpc.RpcError as exc:
+                logger.error("SAP-Round 2 polling RPC failed: %s", exc)
+                raise
 
         survivor_count = len(response2.survivors)
+        if not masked_input_accepted:
+            logger.warning("SAP-Round 2 masked input may not have been accepted by aggregator")
         if response2.timed_out or survivor_count < expected_survivors:
             survivor_list = ", ".join(sorted(response2.survivors))
             logger.warning(
@@ -2000,50 +2026,39 @@ class NodeService(HierarchyMixin):
         if self.prom_metrics:
             self.prom_metrics.observe_sap_phase("round2", time.monotonic() - sap_r2_start)
 
-        # SAP Round 3: Consistency check
-        logger.info("SAP-Round 3: Consistency check")
-        sap_r3_start = time.monotonic()
-        self.comm_tracker.set_phase("sap_round3")
-        survivor_sig = client.sign_survivor_list(response2.survivors)
-        round3_request = secureagg_pb2.ConsistencySignature(
-            node_id=self.node_id,
-            signature=survivor_sig.signature,
-        )
-        response3 = self._invoke_tracked_rpc(
-            "Round3ConsistencyCheck",
-            stub.Round3ConsistencyCheck,
-            round3_request,
-            timeout=self.secagg_rpc_timeout,
-        )
+        survived_round2 = self.node_id in response2.survivors
+        if not survived_round2:
+            logger.warning("SAP-Round 2 dropout detected; skipping rounds 3/4 and awaiting aggregation result")
+            response3 = None
+            response4 = secureagg_pb2.UnmaskAck(accepted=False, message="Node not a survivor", aggregation_complete=False)
+        else:
+            # SAP Round 3: Consistency check
+            logger.info("SAP-Round 3: Consistency check")
+            sap_r3_start = time.monotonic()
+            self.comm_tracker.set_phase("sap_round3")
+            survivor_sig = client.sign_survivor_list(response2.survivors)
+            round3_request = secureagg_pb2.ConsistencySignature(
+                node_id=self.node_id,
+                signature=survivor_sig.signature,
+            )
+            response3 = self._invoke_tracked_rpc(
+                "Round3ConsistencyCheck",
+                stub.Round3ConsistencyCheck,
+                round3_request,
+                timeout=self.secagg_rpc_timeout,
+            )
 
-        # Record Round 3 timing
-        if self.prom_metrics:
-            self.prom_metrics.observe_sap_phase("round3", time.monotonic() - sap_r3_start)
+            # Record Round 3 timing
+            if self.prom_metrics:
+                self.prom_metrics.observe_sap_phase("round3", time.monotonic() - sap_r3_start)
 
-        # SAP Round 4: Unmask (simplified - send empty shares)
-        logger.info("SAP-Round 4: Unmasking")
-        sap_r4_start = time.monotonic()
-        self.comm_tracker.set_phase("sap_round4")
-        dropouts = set(ordered_participants) - set(response2.survivors)
-        unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
-        round4_request = secureagg_pb2.UnmaskShares(
-            node_id=self.node_id,
-            dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
-            survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
-        )
-        response4 = self._invoke_tracked_rpc(
-            "Round4Unmask",
-            stub.Round4Unmask,
-            round4_request,
-            timeout=self.secagg_rpc_timeout,
-        )
-
-        # Wait for aggregation to complete
-        while not response4.aggregation_complete:
-            self._abort_if_global_stop()
-            time.sleep(1)
-            self._abort_if_global_stop()
-            round4_poll_request = secureagg_pb2.UnmaskShares(
+            # SAP Round 4: Unmask (simplified - send empty shares)
+            logger.info("SAP-Round 4: Unmasking")
+            sap_r4_start = time.monotonic()
+            self.comm_tracker.set_phase("sap_round4")
+            dropouts = set(ordered_participants) - set(response2.survivors)
+            unmask_payload = client.prepare_unmasking_payload(dropouts, response2.survivors)
+            round4_request = secureagg_pb2.UnmaskShares(
                 node_id=self.node_id,
                 dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
                 survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
@@ -2051,15 +2066,32 @@ class NodeService(HierarchyMixin):
             response4 = self._invoke_tracked_rpc(
                 "Round4Unmask",
                 stub.Round4Unmask,
-                round4_poll_request,
+                round4_request,
                 timeout=self.secagg_rpc_timeout,
             )
 
-        logger.info("SAP-Round 4 complete: aggregation done")
+            # Wait for aggregation to complete
+            while not response4.aggregation_complete:
+                self._abort_if_global_stop()
+                time.sleep(1)
+                self._abort_if_global_stop()
+                round4_poll_request = secureagg_pb2.UnmaskShares(
+                    node_id=self.node_id,
+                    dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
+                    survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
+                )
+                response4 = self._invoke_tracked_rpc(
+                    "Round4Unmask",
+                    stub.Round4Unmask,
+                    round4_poll_request,
+                    timeout=self.secagg_rpc_timeout,
+                )
 
-        # Record Round 4 timing
-        if self.prom_metrics:
-            self.prom_metrics.observe_sap_phase("round4", time.monotonic() - sap_r4_start)
+            logger.info("SAP-Round 4 complete: aggregation done")
+
+            # Record Round 4 timing
+            if self.prom_metrics:
+                self.prom_metrics.observe_sap_phase("round4", time.monotonic() - sap_r4_start)
 
         # Get global model
         aggregated: List[float] = []

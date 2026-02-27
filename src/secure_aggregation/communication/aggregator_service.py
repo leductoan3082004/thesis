@@ -367,13 +367,17 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                         survivors=survivors,
                         timed_out=self._round2_timed_out,
                     )
-                # Check if this node has already submitted (polling case).
                 if node_id not in self.aggregator.masked_inputs:
                     masked = MaskedInput(
                         node_id=node_id,
                         masked_vector=[int.from_bytes(v, byteorder="big") for v in request.masked_vector],
                     )
                     self.aggregator.receive_masked_input(masked)
+                    logger.info(
+                        "SAP-Round 2 recorded masked input from %s (%d total)",
+                        node_id,
+                        len(self.aggregator.masked_inputs),
+                    )
                 masked_count = len(self.aggregator.masked_inputs)
                 threshold_met = masked_count >= self._active_threshold
                 aggregator_submitted = self.node_id in self.aggregator.masked_inputs
@@ -394,6 +398,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     )
                 finalize_reason = ""
                 if total_expected > 0 and masked_count >= total_expected:
+                    logger.info("SAP-Round 2 received masked input from %s (%d/%d)", node_id, masked_count, total_expected)
                     finalize_reason = "all_participants"
                 elif threshold_met and self._round2_timeout_elapsed():
                     finalize_reason = "timeout"
