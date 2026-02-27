@@ -186,10 +186,11 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
     def _finalize_round0_if_ready_locked(self) -> None:
         if self._round0_finalized:
             return
-        committed = len(self._committed_adverts)
+        committed = len(self.aggregator.advertisements)
         total = len(self.all_participant_ids)
         if committed >= total and total > 0:
             self._round0_finalized = True
+            self._committed_adverts = self.aggregator.broadcast_advertisements()
             logger.info("SAP-Round 0 finalized after accepting all %d participants", total)
             self._activate_committed_participants_locked()
             return
@@ -203,6 +204,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 self._round0_timeout_seconds,
                 elapsed,
             )
+            self._committed_adverts = self.aggregator.broadcast_advertisements()
             self._activate_committed_participants_locked()
 
     def _activate_committed_participants_locked(self) -> None:
