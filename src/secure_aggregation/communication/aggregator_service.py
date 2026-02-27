@@ -284,15 +284,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
                 return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
 
-            if self._adverts_committed:
-                self._committed_adverts = self.aggregator.broadcast_advertisements()
-            else:
-                self._committed_adverts = []
-
             self._finalize_round0_if_ready_locked()
-            response_keys = self._encoded_committed_adverts()
-            if response_keys:
+            if self._round0_finalized:
+                self._committed_adverts = self.aggregator.broadcast_advertisements()
+                response_keys = self._encoded_committed_adverts()
                 response_message = "SAP-Round 0 OK"
+            else:
+                response_keys = []
+                response_message = "Waiting for more participants"
             if self._round0_finalized and node_id not in self._adverts:
                 return secureagg_pb2.KeyAdvertisementAck(
                     accepted=False,
