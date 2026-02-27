@@ -131,6 +131,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round2_timeout_seconds = max(0.0, round_timeout_seconds)
         self._round2_opened_at = time.monotonic()
         self._round0_lock = threading.Lock()
+        self._round2_lock = threading.Lock()
 
         # ECM buffer for receiving ECMs from bridge nodes
         self.ecm_buffer = ecm_buffer
@@ -348,95 +349,96 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected masked input from {node_id}: not a clique member")
             return secureagg_pb2.MaskedInputAck(accepted=False, message="Node not in clique")
-        try:
-            if self._round2_finalized:
-                survivors = list(self._round2_survivors)
-                if node_id in self.aggregator.masked_inputs:
+        with self._round2_lock:
+            try:
+                if self._round2_finalized:
+                    survivors = list(self._round2_survivors)
+                    if node_id in self.aggregator.masked_inputs:
+                        return secureagg_pb2.MaskedInputAck(
+                            accepted=True,
+                            message="SAP-Round 2 OK",
+                            survivors=survivors,
+                            timed_out=self._round2_timed_out,
+                        )
+                    logger.warning("Masked input from %s rejected: Round 2 already finalized", node_id)
                     return secureagg_pb2.MaskedInputAck(
-                        accepted=True,
-                        message="SAP-Round 2 OK",
+                        accepted=False,
+                        message="Round 2 finalized",
                         survivors=survivors,
                         timed_out=self._round2_timed_out,
                     )
-                logger.warning("Masked input from %s rejected: Round 2 already finalized", node_id)
-                return secureagg_pb2.MaskedInputAck(
-                    accepted=False,
-                    message="Round 2 finalized",
-                    survivors=survivors,
-                    timed_out=self._round2_timed_out,
-                )
-            # Check if this node has already submitted (polling case).
-            if node_id not in self.aggregator.masked_inputs:
-                masked = MaskedInput(
-                    node_id=node_id,
-                    masked_vector=[int.from_bytes(v, byteorder="big") for v in request.masked_vector],
-                )
-                self.aggregator.receive_masked_input(masked)
-            masked_count = len(self.aggregator.masked_inputs)
-            threshold_met = masked_count >= self._active_threshold
-            aggregator_submitted = self.node_id in self.aggregator.masked_inputs
-            total_expected = len(self.participant_ids)
-            if threshold_met and not aggregator_submitted:
-                if not self._round2_waiting_on_aggregator:
-                    logger.info(
-                        "SAP-Round 2 threshold met (%d masked inputs) but aggregator %s has not submitted yet; waiting",
-                        masked_count,
-                        self.node_id,
+                # Check if this node has already submitted (polling case).
+                if node_id not in self.aggregator.masked_inputs:
+                    masked = MaskedInput(
+                        node_id=node_id,
+                        masked_vector=[int.from_bytes(v, byteorder="big") for v in request.masked_vector],
                     )
-                    self._round2_waiting_on_aggregator = True
+                    self.aggregator.receive_masked_input(masked)
+                masked_count = len(self.aggregator.masked_inputs)
+                threshold_met = masked_count >= self._active_threshold
+                aggregator_submitted = self.node_id in self.aggregator.masked_inputs
+                total_expected = len(self.participant_ids)
+                if threshold_met and not aggregator_submitted:
+                    if not self._round2_waiting_on_aggregator:
+                        logger.info(
+                            "SAP-Round 2 threshold met (%d masked inputs) but aggregator %s has not submitted yet; waiting",
+                            masked_count,
+                            self.node_id,
+                        )
+                        self._round2_waiting_on_aggregator = True
+                    return secureagg_pb2.MaskedInputAck(
+                        accepted=True,
+                        message="Waiting for aggregator masked input",
+                        survivors=[],
+                        timed_out=False,
+                    )
+                finalize_reason = ""
+                if total_expected > 0 and masked_count >= total_expected:
+                    finalize_reason = "all_participants"
+                elif threshold_met and self._round2_timeout_elapsed():
+                    finalize_reason = "timeout"
+                    self._round2_timed_out = True
+                if finalize_reason:
+                    self._round2_waiting_on_aggregator = False
+                    survivors = self.aggregator.broadcast_survivors()
+                    self._round2_survivors = survivors
+                    self._round2_finalized = True
+                    if finalize_reason == "timeout":
+                        elapsed = time.monotonic() - self._round2_opened_at
+                        logger.warning(
+                            "SAP-Round 2 timeout after %.1fs; survivors=%s",
+                            elapsed,
+                            ", ".join(sorted(survivors)),
+                        )
+                        message = "SAP-Round 2 finalized after timeout"
+                    else:
+                        logger.info(
+                            "SAP-Round 2 finalized with %d survivors (threshold=%d)",
+                            len(survivors),
+                            self._active_threshold,
+                        )
+                        message = "SAP-Round 2 OK"
+                    return secureagg_pb2.MaskedInputAck(
+                        accepted=True,
+                        message=message,
+                        survivors=survivors,
+                        timed_out=self._round2_timed_out,
+                    )
                 return secureagg_pb2.MaskedInputAck(
                     accepted=True,
-                    message="Waiting for aggregator masked input",
+                    message="Waiting for more participants",
                     survivors=[],
                     timed_out=False,
                 )
-            finalize_reason = ""
-            if total_expected > 0 and masked_count >= total_expected:
-                finalize_reason = "all_participants"
-            elif threshold_met and self._round2_timeout_elapsed():
-                finalize_reason = "timeout"
-                self._round2_timed_out = True
-            if finalize_reason:
-                self._round2_waiting_on_aggregator = False
-                survivors = self.aggregator.broadcast_survivors()
-                self._round2_survivors = survivors
-                self._round2_finalized = True
-                if finalize_reason == "timeout":
-                    elapsed = time.monotonic() - self._round2_opened_at
-                    logger.warning(
-                        "SAP-Round 2 timeout after %.1fs; survivors=%s",
-                        elapsed,
-                        ", ".join(sorted(survivors)),
-                    )
-                    message = "SAP-Round 2 finalized after timeout"
-                else:
-                    logger.info(
-                        "SAP-Round 2 finalized with %d survivors (threshold=%d)",
-                        len(survivors),
-                        self._active_threshold,
-                    )
-                    message = "SAP-Round 2 OK"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"SAP-Round2 processing failed for {node_id}: {exc}")
+                survivors = self.aggregator.survivors or []
                 return secureagg_pb2.MaskedInputAck(
-                    accepted=True,
-                    message=message,
+                    accepted=False,
+                    message=str(exc),
                     survivors=survivors,
                     timed_out=self._round2_timed_out,
                 )
-            return secureagg_pb2.MaskedInputAck(
-                accepted=True,
-                message="Waiting for more participants",
-                survivors=[],
-                timed_out=False,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"SAP-Round2 processing failed for {node_id}: {exc}")
-            survivors = self.aggregator.survivors or []
-            return secureagg_pb2.MaskedInputAck(
-                accepted=False,
-                message=str(exc),
-                survivors=survivors,
-                timed_out=self._round2_timed_out,
-            )
 
     def Round3ConsistencyCheck(self, request: secureagg_pb2.ConsistencySignature, context) -> secureagg_pb2.ConsistencyAck:
         """Collect consistency signatures (SAP-Round 3)."""
