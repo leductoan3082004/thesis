@@ -106,7 +106,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
     ) -> None:
         self.node_id = node_id
         self.threshold = threshold
-        self.participant_ids = participant_ids
+        self.all_participant_ids = list(participant_ids)
+        self.participant_ids = list(participant_ids)
         config = SecureAggregationConfig(participants=participant_ids, threshold=threshold)
         self._signing_public_keys = signing_public_keys
         self.aggregator = SecureAggregationAggregator(config=config, signing_public_keys=signing_public_keys)
@@ -121,6 +122,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round0_finalized: bool = False
         self._round2_finalized: bool = False
         self._round2_survivors: List[str] = []
+        self._active_threshold = max(1, min(self.threshold, len(self.participant_ids)))
         self._round0_timeout_seconds = max(0.0, round0_timeout_seconds)
         self._round0_opened_at = time.monotonic()
         self._round0_lock = threading.Lock()
@@ -185,20 +187,44 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         if self._round0_finalized:
             return
         committed = len(self._committed_adverts)
-        total = len(self.participant_ids)
+        total = len(self.all_participant_ids)
         if committed >= total and total > 0:
             self._round0_finalized = True
             logger.info("SAP-Round 0 finalized after accepting all %d participants", total)
+            self._activate_committed_participants_locked()
             return
         if committed >= self.threshold and self._round0_timeout_elapsed_locked():
             self._round0_finalized = True
+            elapsed = time.monotonic() - self._round0_opened_at
             logger.info(
-                "SAP-Round 0 finalized after timeout (participants=%d, threshold=%d, timeout=%.1fs)",
+                "SAP-Round 0 finalized after timeout (participants=%d, threshold=%d, timeout=%.1fs, elapsed=%.1fs)",
                 committed,
                 self.threshold,
                 self._round0_timeout_seconds,
+                elapsed,
             )
+            self._activate_committed_participants_locked()
 
+    def _activate_committed_participants_locked(self) -> None:
+        committed_ids = [adv.node_id for adv in self._committed_adverts]
+        if not committed_ids:
+            return
+        self.participant_ids = committed_ids
+        self._active_threshold = max(1, min(self.threshold, len(self.participant_ids)))
+        self.aggregator = SecureAggregationAggregator(
+            config=SecureAggregationConfig(participants=self.participant_ids, threshold=self._active_threshold),
+            signing_public_keys=self._signing_public_keys,
+        )
+        try:
+            self.aggregator.receive_advertisements(self._committed_adverts)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to reapply committed adverts after Round 0 finalization: %s", exc)
+        logger.info(
+            "Activated %d Round 0 participants: %s (threshold=%d)",
+            len(self.participant_ids),
+            ", ".join(sorted(self.participant_ids)),
+            self._active_threshold,
+        )
     def _encoded_committed_adverts(self) -> List[secureagg_pb2.KeyAdvertisement]:
         return [
             secureagg_pb2.KeyAdvertisement(
@@ -333,14 +359,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     masked_vector=[int.from_bytes(v, byteorder="big") for v in request.masked_vector],
                 )
                 self.aggregator.receive_masked_input(masked)
-            if len(self.aggregator.masked_inputs) >= self.threshold:
+            if len(self.aggregator.masked_inputs) >= self._active_threshold:
                 survivors = self.aggregator.broadcast_survivors()
                 self._round2_survivors = survivors
                 self._round2_finalized = True
                 logger.info(
                     "SAP-Round 2 finalized with %d survivors (threshold=%d)",
                     len(survivors),
-                    self.threshold,
+                    self._active_threshold,
                 )
                 return secureagg_pb2.MaskedInputAck(accepted=True, message="SAP-Round 2 OK", survivors=survivors)
             return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for more participants", survivors=[])
@@ -395,7 +421,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     b_shares_for_survivors=surv_shares,
                 )
                 self._round4_payloads.append(payload)
-            if len(self._round4_payloads) >= self.threshold:
+            if len(self._round4_payloads) >= self._active_threshold:
                 result = self.aggregator.receive_unmasking_shares(self._round4_payloads)
                 self.aggregated_result = result.aggregate_mean
                 return secureagg_pb2.UnmaskAck(
@@ -558,8 +584,10 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
 
     def prepare_round(self, round_idx: int) -> None:
         """Reset state in preparation for the supplied aggregation round."""
+        self.participant_ids = list(self.all_participant_ids)
+        self._active_threshold = max(1, min(self.threshold, len(self.participant_ids)))
         self.aggregator = SecureAggregationAggregator(
-            config=SecureAggregationConfig(participants=self.participant_ids, threshold=self.threshold),
+            config=SecureAggregationConfig(participants=self.participant_ids, threshold=self._active_threshold),
             signing_public_keys=self._signing_public_keys,
         )
         self.aggregated_result = None

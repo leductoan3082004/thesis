@@ -361,7 +361,7 @@ class NodeService(HierarchyMixin):
 
     def _resolve_secagg_rpc_timeout(self) -> float:
         """Determine secure aggregation RPC timeout in seconds."""
-        default_timeout = 30.0
+        default_timeout = 10.0
         timeout_value: Any = self.secagg_config.get("rpc_timeout_seconds", default_timeout)
         system_secagg_cfg = None
         if self.system_config and isinstance(self.system_config, dict):
