@@ -98,6 +98,7 @@ message MaskedInputAck {
   bool accepted = 1;
   string message = 2;
   repeated string survivors = 3;  // U3 list
+  bool timed_out = 4;              // True if finalized after timeout with dropouts
 }
 
 // Round 3: Consistency signatures

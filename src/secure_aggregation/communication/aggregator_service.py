@@ -103,6 +103,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         ecm_buffer: Optional[ECMBuffer] = None,
         convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
         round0_timeout_seconds: float = 0.0,
+        round_timeout_seconds: float = 0.0,
     ) -> None:
         self.node_id = node_id
         self.threshold = threshold
@@ -123,9 +124,12 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round2_finalized: bool = False
         self._round2_survivors: List[str] = []
         self._round2_waiting_on_aggregator: bool = False
+        self._round2_timed_out: bool = False
         self._active_threshold = max(1, min(self.threshold, len(self.participant_ids)))
         self._round0_timeout_seconds = max(0.0, round0_timeout_seconds)
         self._round0_opened_at = time.monotonic()
+        self._round2_timeout_seconds = max(0.0, round_timeout_seconds)
+        self._round2_opened_at = time.monotonic()
         self._round0_lock = threading.Lock()
 
         # ECM buffer for receiving ECMs from bridge nodes
@@ -183,6 +187,11 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         if self._round0_timeout_seconds <= 0:
             return False
         return (time.monotonic() - self._round0_opened_at) >= self._round0_timeout_seconds
+
+    def _round2_timeout_elapsed(self) -> bool:
+        if self._round2_timeout_seconds <= 0:
+            return False
+        return (time.monotonic() - self._round2_opened_at) >= self._round2_timeout_seconds
 
     def _finalize_round0_if_ready_locked(self) -> None:
         if self._round0_finalized:
@@ -347,12 +356,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                         accepted=True,
                         message="SAP-Round 2 OK",
                         survivors=survivors,
+                        timed_out=self._round2_timed_out,
                     )
                 logger.warning("Masked input from %s rejected: Round 2 already finalized", node_id)
                 return secureagg_pb2.MaskedInputAck(
                     accepted=False,
                     message="Round 2 finalized",
                     survivors=survivors,
+                    timed_out=self._round2_timed_out,
                 )
             # Check if this node has already submitted (polling case).
             if node_id not in self.aggregator.masked_inputs:
@@ -361,13 +372,15 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     masked_vector=[int.from_bytes(v, byteorder="big") for v in request.masked_vector],
                 )
                 self.aggregator.receive_masked_input(masked)
-            threshold_met = len(self.aggregator.masked_inputs) >= self._active_threshold
+            masked_count = len(self.aggregator.masked_inputs)
+            threshold_met = masked_count >= self._active_threshold
             aggregator_submitted = self.node_id in self.aggregator.masked_inputs
+            total_expected = len(self.participant_ids)
             if threshold_met and not aggregator_submitted:
                 if not self._round2_waiting_on_aggregator:
                     logger.info(
                         "SAP-Round 2 threshold met (%d masked inputs) but aggregator %s has not submitted yet; waiting",
-                        len(self.aggregator.masked_inputs),
+                        masked_count,
                         self.node_id,
                     )
                     self._round2_waiting_on_aggregator = True
@@ -375,23 +388,55 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     accepted=True,
                     message="Waiting for aggregator masked input",
                     survivors=[],
+                    timed_out=False,
                 )
-            if threshold_met:
+            finalize_reason = ""
+            if total_expected > 0 and masked_count >= total_expected:
+                finalize_reason = "all_participants"
+            elif threshold_met and self._round2_timeout_elapsed():
+                finalize_reason = "timeout"
+                self._round2_timed_out = True
+            if finalize_reason:
                 self._round2_waiting_on_aggregator = False
                 survivors = self.aggregator.broadcast_survivors()
                 self._round2_survivors = survivors
                 self._round2_finalized = True
-                logger.info(
-                    "SAP-Round 2 finalized with %d survivors (threshold=%d)",
-                    len(survivors),
-                    self._active_threshold,
+                if finalize_reason == "timeout":
+                    elapsed = time.monotonic() - self._round2_opened_at
+                    logger.warning(
+                        "SAP-Round 2 timeout after %.1fs; survivors=%s",
+                        elapsed,
+                        ", ".join(sorted(survivors)),
+                    )
+                    message = "SAP-Round 2 finalized after timeout"
+                else:
+                    logger.info(
+                        "SAP-Round 2 finalized with %d survivors (threshold=%d)",
+                        len(survivors),
+                        self._active_threshold,
+                    )
+                    message = "SAP-Round 2 OK"
+                return secureagg_pb2.MaskedInputAck(
+                    accepted=True,
+                    message=message,
+                    survivors=survivors,
+                    timed_out=self._round2_timed_out,
                 )
-                return secureagg_pb2.MaskedInputAck(accepted=True, message="SAP-Round 2 OK", survivors=survivors)
-            return secureagg_pb2.MaskedInputAck(accepted=True, message="Waiting for more participants", survivors=[])
+            return secureagg_pb2.MaskedInputAck(
+                accepted=True,
+                message="Waiting for more participants",
+                survivors=[],
+                timed_out=False,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"SAP-Round2 processing failed for {node_id}: {exc}")
             survivors = self.aggregator.survivors or []
-            return secureagg_pb2.MaskedInputAck(accepted=False, message=str(exc), survivors=survivors)
+            return secureagg_pb2.MaskedInputAck(
+                accepted=False,
+                message=str(exc),
+                survivors=survivors,
+                timed_out=self._round2_timed_out,
+            )
 
     def Round3ConsistencyCheck(self, request: secureagg_pb2.ConsistencySignature, context) -> secureagg_pb2.ConsistencyAck:
         """Collect consistency signatures (SAP-Round 3)."""
@@ -627,6 +672,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round2_finalized = False
         self._round2_survivors = []
         self._round2_waiting_on_aggregator = False
+        self._round2_timed_out = False
+        self._round2_opened_at = time.monotonic()
         self._round0_opened_at = time.monotonic()
         self.current_round = round_idx
         logger.info("Aggregator %s prepared for round %d", self.node_id, round_idx)
@@ -645,6 +692,7 @@ def serve(
     ecm_buffer: Optional[ECMBuffer] = None,
     convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
     round0_timeout_seconds: float = 0.0,
+    round_timeout_seconds: float = 0.0,
 ) -> Tuple[grpc.Server, AggregatorServicer]:
     """Start the aggregator gRPC server.
 
@@ -659,6 +707,7 @@ def serve(
         ecm_buffer=ecm_buffer,
         convergence_signal_handler=convergence_signal_handler,
         round0_timeout_seconds=round0_timeout_seconds,
+        round_timeout_seconds=round_timeout_seconds,
     )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=10),

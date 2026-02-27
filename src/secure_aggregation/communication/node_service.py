@@ -191,6 +191,7 @@ class NodeService(HierarchyMixin):
         self.secagg_config = self.config["secure_agg"]
         self.secagg_rpc_timeout = self._resolve_secagg_rpc_timeout()
         self.round0_timeout_seconds = self._resolve_round0_timeout()
+        self.round_timeout_seconds = self._resolve_round_timeout()
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
@@ -384,11 +385,11 @@ class NodeService(HierarchyMixin):
     def _resolve_round0_timeout(self) -> float:
         """Determine how long to wait before finalizing SAP Round 0."""
         default_timeout = 30.0
-        timeout_value: Any = self.secagg_config.get("round0_timeout_seconds")
+        timeout_value: Any = None
         system_secagg_cfg = None
         if self.system_config and isinstance(self.system_config, dict):
             system_secagg_cfg = self.system_config.get("secure_agg")
-        if timeout_value is None and isinstance(system_secagg_cfg, dict):
+        if isinstance(system_secagg_cfg, dict):
             timeout_value = system_secagg_cfg.get("round0_timeout_seconds")
         if timeout_value is None:
             timeout_value = default_timeout
@@ -400,6 +401,32 @@ class NodeService(HierarchyMixin):
         except (TypeError, ValueError):
             logger.warning(
                 "Invalid SAP Round 0 timeout '%s'; defaulting to %.1fs",
+                timeout_value,
+                default_timeout,
+            )
+            return default_timeout
+
+    def _resolve_round_timeout(self) -> float:
+        """Determine how long to wait before concluding SAP Round 2."""
+        default_timeout = 10.0
+        timeout_value: Any = None
+        system_secagg_cfg = None
+        if self.system_config and isinstance(self.system_config, dict):
+            system_secagg_cfg = self.system_config.get("secure_agg")
+        if isinstance(system_secagg_cfg, dict):
+            timeout_value = system_secagg_cfg.get("round_timeout_seconds")
+            if timeout_value is None:
+                timeout_value = system_secagg_cfg.get("round0_timeout_seconds")
+        if timeout_value is None:
+            timeout_value = default_timeout
+        try:
+            parsed = float(timeout_value)
+            if parsed < 0:
+                raise ValueError
+            return parsed
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid secure aggregation round timeout '%s'; defaulting to %.1fs",
                 timeout_value,
                 default_timeout,
             )
@@ -1141,6 +1168,7 @@ class NodeService(HierarchyMixin):
                 ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
                 convergence_signal_handler=convergence_handler,
                 round0_timeout_seconds=self.round0_timeout_seconds,
+                round_timeout_seconds=self.round_timeout_seconds,
             )
         except PortBindingError:
             logger.error(
@@ -1930,9 +1958,20 @@ class NodeService(HierarchyMixin):
             round2_request,
             timeout=self.secagg_rpc_timeout,
         )
+        expected_survivors = len(self.clique_members) if self.clique_members else len(ordered_participants)
+        expected_survivors = max(expected_survivors, self.threshold)
+
+        def _survivor_goal_met(resp: secureagg_pb2.MaskedInputAck) -> bool:
+            if not resp.survivors:
+                return False
+            if len(resp.survivors) >= expected_survivors:
+                return True
+            if resp.timed_out and len(resp.survivors) >= self.threshold:
+                return True
+            return False
 
         # Wait for survivors list
-        while not response2.survivors:
+        while not _survivor_goal_met(response2):
             self._abort_if_global_stop()
             time.sleep(1)
             self._abort_if_global_stop()
@@ -1947,7 +1986,15 @@ class NodeService(HierarchyMixin):
                 timeout=self.secagg_rpc_timeout,
             )
 
-        logger.info(f"SAP-Round 2 complete: {len(response2.survivors)} survivors")
+        survivor_count = len(response2.survivors)
+        if response2.timed_out or survivor_count < expected_survivors:
+            survivor_list = ", ".join(sorted(response2.survivors))
+            logger.warning(
+                "SAP-Round 2 proceeding after timeout with survivors: %s",
+                survivor_list,
+            )
+        else:
+            logger.info(f"SAP-Round 2 complete: {survivor_count} survivors")
 
         # Record Round 2 timing
         if self.prom_metrics:
