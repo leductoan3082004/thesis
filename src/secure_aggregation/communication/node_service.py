@@ -43,7 +43,8 @@ from secure_aggregation.convergence.central_broadcast import (
 from secure_aggregation.config.models import NodeRole
 from secure_aggregation.config.system import load_system_config
 from secure_aggregation.crypto.sign import SigningKeyPair
-from secure_aggregation.data import dirichlet_partition, get_labels, load_dataset
+from secure_aggregation.data import dirichlet_partition
+from secure_aggregation.data.datasets import get_labels, load_dataset
 from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
@@ -100,14 +101,15 @@ class CifarConvNet(nn.Module):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            # GroupNorm instead of BatchNorm: no running statistics, so FL-safe across non-IID nodes.
+            nn.GroupNorm(8, 32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(16, 128),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2),
         )
@@ -918,7 +920,10 @@ class NodeService(HierarchyMixin):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = copy.deepcopy(self.model).to(device)
-        opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+        lr = self.training_config.get("lr", 0.01)
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
+        # Cosine decay prevents the model from oscillating when LR is too high near a local minimum.
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
         model.train()
 
         total_samples = 0
@@ -934,6 +939,7 @@ class NodeService(HierarchyMixin):
                 opt.step()
                 total_samples += data.size(0)
                 total_batches += 1
+            scheduler.step()
 
         self.model = model.cpu()
         logger.info(f"Local training completed for {epochs} epochs ({total_samples} samples, {total_batches} batches)")

@@ -1,4 +1,14 @@
 {
+  "nodes_map_path": "config/nodes-map.json",
+  "convergence": {
+    "enabled": true,
+    "runtime_enabled": true,
+    "warmup_rounds": 3,
+    "tol_abs": 1e-05,
+    "tol_rel": 0.001,
+    "patience": 3,
+    "signal_timeout": 30.0
+  },
   "hierarchy_defaults": {
     "collection_timeout_seconds": 30.0,
     "digest_timeout_seconds": 5.0,
@@ -14,12 +24,14 @@
       "scope_name": "state",
       "scope_id": "state_0",
       "enabled": true,
+      "approach": "ring_star",
       "rounds_per_scope": 0,
-      "interval_seconds": 600,
+      "interval_seconds": 120,
       "wait_seconds": 20,
       "max_aggregators": 2,
       "fanout_count": 2,
-      "apply_policy": "replace"
+      "apply_policy": "interpolate",
+      "apply_alpha": 0.3
     },
     {
       "scope_index": 2,
@@ -27,20 +39,12 @@
       "scope_id": "nation_0",
       "enabled": true,
       "rounds_per_scope": 0,
-      "interval_seconds": 1500,
+      "interval_seconds": 300,
       "wait_seconds": 30,
       "max_aggregators": 2,
       "fanout_count": 2,
       "apply_policy": "interpolate",
       "apply_alpha": 0.2
     }
-  ],
-  "training": {
-    "max_rounds": 20
-  },
-  "secure_agg": {
-    "rpc_timeout_seconds": 60,
-    "round0_timeout_seconds": 45,
-    "round_timeout_seconds": 10
-  }
+  ]
 }

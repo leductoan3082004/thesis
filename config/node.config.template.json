@@ -13,8 +13,9 @@
   },
   "training": {
     "rounds": 3,
-    "local_epochs": 1,
-    "batch_size": 64
+    "local_epochs": 5,
+    "batch_size": 64,
+    "lr": 0.01
   },
   "secure_agg": {
     "threshold": 3,
@@ -41,7 +42,7 @@
     },
     "window_size": 10,
     "alpha": 0.5,
-    "base_gamma": 0.2,
+    "base_gamma": 0.4,
     "freshness_window": 300.0,
     "max_neighbors": 4
   }

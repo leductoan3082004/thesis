@@ -1,83 +1,57 @@
-"""Partition utilities for federated datasets."""
-
-from __future__ import annotations
-
+import random
 from collections import defaultdict
-from typing import Dict, List, Mapping, Sequence
-
-import numpy as np
+from typing import Dict, Iterable, List, Mapping, Sequence
 
 
-def dirichlet_partition(
-    dataset: Sequence[int],
-    labels: Mapping[int, int],
-    num_clients: int,
-    alpha: float,
-    seed: int = 42,
-) -> Dict[str, List[int]]:
+def iid_partition(indices: Sequence[int], num_clients: int) -> Dict[str, List[int]]:
+    if num_clients <= 0:
+        raise ValueError("num_clients must be positive")
+    clients = [f"client_{i}" for i in range(num_clients)]
+    assignment: Dict[str, List[int]] = {c: [] for c in clients}
+    for idx in indices:
+        client = clients[idx % num_clients]
+        assignment[client].append(idx)
+    return assignment
+
+
+def _dirichlet_draw(alpha: float, labels: Iterable[int], num_clients: int, seed: int | None = None) -> Dict[str, Dict[int, float]]:
     """
-    Partition dataset indices across clients using a per-class Dirichlet draw.
+    Generate per-client label proportions using independent Dirichlet draws for each label.
+    """
+    if alpha <= 0:
+        raise ValueError("alpha must be positive")
+    rng = random.Random(seed)
+    proportions: Dict[str, Dict[int, float]] = {f"client_{i}": {} for i in range(num_clients)}
+    label_counts = defaultdict(int)
+    for label in labels:
+        label_counts[label] += 1
+    for label in label_counts:
+        samples = [rng.gammavariate(alpha, 1.0) for _ in range(num_clients)]
+        total = sum(samples)
+        for i, sample in enumerate(samples):
+            proportions[f"client_{i}"][label] = sample / total
+    return proportions
 
-    Returns a dict keyed as ``client_{i}`` where values are index lists.
+
+def dirichlet_partition(dataset: Sequence[int], labels: Mapping[int, int], num_clients: int, alpha: float, seed: int | None = None) -> Dict[str, List[int]]:
+    """
+    Non-IID partition using Dirichlet over label distributions.
     """
     if num_clients <= 0:
         raise ValueError("num_clients must be positive")
-    if alpha <= 0:
-        raise ValueError("alpha must be > 0")
-
-    indices = list(dataset)
-    if not indices:
-        return {f"client_{i}": [] for i in range(num_clients)}
-
-    rng = np.random.default_rng(seed)
-    by_label: dict[int, list[int]] = defaultdict(list)
-    for idx in indices:
-        if idx not in labels:
-            raise KeyError(f"Missing label for index {idx}")
-        by_label[int(labels[idx])].append(idx)
-
-    client_bins: list[list[int]] = [[] for _ in range(num_clients)]
-    for label_indices in by_label.values():
-        label_arr = np.array(label_indices, dtype=np.int64)
-        rng.shuffle(label_arr)
-        probs = rng.dirichlet(np.full(num_clients, alpha, dtype=np.float64))
-        counts = rng.multinomial(len(label_arr), probs)
-
-        start = 0
-        for client_idx, count in enumerate(counts):
-            if count == 0:
-                continue
-            end = start + count
-            client_bins[client_idx].extend(label_arr[start:end].tolist())
-            start = end
-
-    # Ensure each client has at least one sample when dataset is large enough.
-    if len(indices) >= num_clients:
-        _rebalance_min_one_sample(client_bins, rng)
-
-    for bucket in client_bins:
-        rng.shuffle(bucket)
-
-    return {f"client_{i}": client_bins[i] for i in range(num_clients)}
-
-
-def _rebalance_min_one_sample(client_bins: list[list[int]], rng: np.random.Generator) -> None:
-    empties = [idx for idx, bucket in enumerate(client_bins) if not bucket]
-    if not empties:
-        return
-
-    donors = sorted(
-        (idx for idx, bucket in enumerate(client_bins) if len(bucket) > 1),
-        key=lambda i: len(client_bins[i]),
-        reverse=True,
-    )
-    donor_ptr = 0
-    for empty_idx in empties:
-        while donor_ptr < len(donors) and len(client_bins[donors[donor_ptr]]) <= 1:
-            donor_ptr += 1
-        if donor_ptr >= len(donors):
-            break
-        donor_idx = donors[donor_ptr]
-        take_pos = int(rng.integers(0, len(client_bins[donor_idx])))
-        moved = client_bins[donor_idx].pop(take_pos)
-        client_bins[empty_idx].append(moved)
+    proportions = _dirichlet_draw(alpha, labels.values(), num_clients, seed=seed)
+    assignments: Dict[str, List[int]] = {f"client_{i}": [] for i in range(num_clients)}
+    label_to_indices: Dict[int, List[int]] = defaultdict(list)
+    for idx, label in labels.items():
+        label_to_indices[label].append(idx)
+    rng = random.Random(seed)
+    for label, idxs in label_to_indices.items():
+        rng.shuffle(idxs)
+        frac_left = {client: proportions[client][label] for client in assignments}
+        total = sum(frac_left.values())
+        frac_left = {c: v / total for c, v in frac_left.items()}
+        for idx in idxs:
+            target = max(frac_left.items(), key=lambda kv: kv[1])[0]
+            assignments[target].append(idx)
+            frac_left[target] = max(0.0, frac_left[target] - 1.0 / len(idxs))
+    return assignments
