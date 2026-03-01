@@ -266,3 +266,4 @@ pytest config: `testpaths = ["tests"]`, `pythonpath = ["src", "."]`.
 - Two FastAPI services: `registry_service.py` (port 8000, model anchor HTTP registry) and `blockchain_gateway.py` (port 9000, JWT-authenticated gateway simulating Hyperledger Fabric)
 - IPFS process-mode: 3 local Kubo nodes with API ports 15101-15103, swarm ports 14101-14103, gateway ports 18101-18103
 - `data/` module has two dataset loaders: `datasets.py` (full-featured with CSV support, normalization) and `dataset.py` (simpler torchvision-only, used by node/TTP services)
+
