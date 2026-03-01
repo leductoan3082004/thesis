@@ -191,9 +191,7 @@ class NodeService(HierarchyMixin):
         self.dataset_num_classes: Optional[int] = None
         self.training_config = self.config["training"]
         self.secagg_config = self.config["secure_agg"]
-        self.secagg_rpc_timeout = self._resolve_secagg_rpc_timeout()
-        self.round0_timeout_seconds = self._resolve_round0_timeout()
-        self.round_timeout_seconds = self._resolve_round_timeout()
+        self.sap_timeout_seconds = self._resolve_sap_timeout()
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
@@ -362,73 +360,22 @@ class NodeService(HierarchyMixin):
             return default
         return offset
 
-    def _resolve_secagg_rpc_timeout(self) -> float:
-        """Determine secure aggregation RPC timeout in seconds."""
-        default_timeout = 10.0
-        timeout_value: Any = self.secagg_config.get("rpc_timeout_seconds", default_timeout)
-        system_secagg_cfg = None
-        if self.system_config and isinstance(self.system_config, dict):
-            system_secagg_cfg = self.system_config.get("secure_agg")
-        if isinstance(system_secagg_cfg, dict) and "rpc_timeout_seconds" in system_secagg_cfg:
-            timeout_value = system_secagg_cfg["rpc_timeout_seconds"]
-        try:
-            parsed = float(timeout_value)
-            if parsed <= 0:
-                raise ValueError
-            return parsed
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid secure aggregation RPC timeout '%s'; defaulting to %.1fs",
-                timeout_value,
-                default_timeout,
-            )
-            return default_timeout
-
-    def _resolve_round0_timeout(self) -> float:
-        """Determine how long to wait before finalizing SAP Round 0."""
+    def _resolve_sap_timeout(self) -> float:
+        """Determine the unified SAP timeout (RPC calls and aggregator round wait)."""
         default_timeout = 30.0
-        timeout_value: Any = None
-        system_secagg_cfg = None
+        timeout_value: Any = self.secagg_config.get("timeout_seconds", default_timeout)
         if self.system_config and isinstance(self.system_config, dict):
             system_secagg_cfg = self.system_config.get("secure_agg")
-        if isinstance(system_secagg_cfg, dict):
-            timeout_value = system_secagg_cfg.get("round0_timeout_seconds")
-        if timeout_value is None:
-            timeout_value = default_timeout
+            if isinstance(system_secagg_cfg, dict) and "timeout_seconds" in system_secagg_cfg:
+                timeout_value = system_secagg_cfg["timeout_seconds"]
         try:
             parsed = float(timeout_value)
             if parsed <= 0:
-                return 0.0
-            return parsed
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid SAP Round 0 timeout '%s'; defaulting to %.1fs",
-                timeout_value,
-                default_timeout,
-            )
-            return default_timeout
-
-    def _resolve_round_timeout(self) -> float:
-        """Determine how long to wait before concluding SAP Round 2."""
-        default_timeout = 10.0
-        timeout_value: Any = None
-        system_secagg_cfg = None
-        if self.system_config and isinstance(self.system_config, dict):
-            system_secagg_cfg = self.system_config.get("secure_agg")
-        if isinstance(system_secagg_cfg, dict):
-            timeout_value = system_secagg_cfg.get("round_timeout_seconds")
-            if timeout_value is None:
-                timeout_value = system_secagg_cfg.get("round0_timeout_seconds")
-        if timeout_value is None:
-            timeout_value = default_timeout
-        try:
-            parsed = float(timeout_value)
-            if parsed < 0:
                 raise ValueError
             return parsed
         except (TypeError, ValueError):
             logger.warning(
-                "Invalid secure aggregation round timeout '%s'; defaulting to %.1fs",
+                "Invalid SAP timeout '%s'; defaulting to %.1fs",
                 timeout_value,
                 default_timeout,
             )
@@ -1173,8 +1120,7 @@ class NodeService(HierarchyMixin):
                 signing_public_keys=signing_public_keys or None,
                 ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
                 convergence_signal_handler=convergence_handler,
-                round0_timeout_seconds=self.round0_timeout_seconds,
-                round_timeout_seconds=self.round_timeout_seconds,
+                timeout_seconds=self.sap_timeout_seconds,
             )
         except PortBindingError:
             logger.error(
@@ -1813,7 +1759,7 @@ class NodeService(HierarchyMixin):
                     "Round0AdvertiseKeys",
                     stub.Round0AdvertiseKeys,
                     round0_request,
-                    timeout=self.secagg_rpc_timeout,
+                    timeout=self.sap_timeout_seconds,
                 )
                 break
             except grpc.RpcError as e:
@@ -1862,7 +1808,7 @@ class NodeService(HierarchyMixin):
                 "Round0AdvertiseKeys",
                 stub.Round0AdvertiseKeys,
                 round0_request,
-                timeout=self.secagg_rpc_timeout,
+                timeout=self.sap_timeout_seconds,
             )
 
             logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
@@ -1907,7 +1853,7 @@ class NodeService(HierarchyMixin):
             "Round1ShareKeys",
             stub.Round1ShareKeys,
             round1_request,
-            timeout=self.secagg_rpc_timeout,
+            timeout=self.sap_timeout_seconds,
         )
         mailbox = [
             Round1Ciphertext(
@@ -1930,7 +1876,7 @@ class NodeService(HierarchyMixin):
                 "Round1ShareKeys",
                 stub.Round1ShareKeys,
                 round1_poll_request,
-                timeout=self.secagg_rpc_timeout,
+                timeout=self.sap_timeout_seconds,
             )
             mailbox = [
                 Round1Ciphertext(
@@ -1964,7 +1910,7 @@ class NodeService(HierarchyMixin):
                 "Round2MaskedInput",
                 stub.Round2MaskedInput,
                 round2_request,
-                timeout=self.secagg_rpc_timeout,
+                timeout=self.sap_timeout_seconds,
             )
             masked_input_accepted = response2.accepted
             logger.debug(
@@ -2002,7 +1948,7 @@ class NodeService(HierarchyMixin):
                     "Round2MaskedInput",
                     stub.Round2MaskedInput,
                     round2_poll_request,
-                    timeout=self.secagg_rpc_timeout,
+                    timeout=self.sap_timeout_seconds,
                 )
                 if response2.accepted:
                     masked_input_accepted = True
@@ -2051,7 +1997,7 @@ class NodeService(HierarchyMixin):
                 "Round3ConsistencyCheck",
                 stub.Round3ConsistencyCheck,
                 round3_request,
-                timeout=self.secagg_rpc_timeout,
+                timeout=self.sap_timeout_seconds,
             )
 
             # Record Round 3 timing
@@ -2073,7 +2019,7 @@ class NodeService(HierarchyMixin):
                 "Round4Unmask",
                 stub.Round4Unmask,
                 round4_request,
-                timeout=self.secagg_rpc_timeout,
+                timeout=self.sap_timeout_seconds,
             )
 
             # Wait for aggregation to complete
@@ -2090,7 +2036,7 @@ class NodeService(HierarchyMixin):
                     "Round4Unmask",
                     stub.Round4Unmask,
                     round4_poll_request,
-                    timeout=self.secagg_rpc_timeout,
+                    timeout=self.sap_timeout_seconds,
                 )
 
             logger.info("SAP-Round 4 complete: aggregation done")
@@ -2109,7 +2055,7 @@ class NodeService(HierarchyMixin):
                 "GetGlobalModel",
                 stub.GetGlobalModel,
                 model_request,
-                timeout=self.secagg_rpc_timeout,
+                timeout=self.sap_timeout_seconds,
             )
             aggregated = list(model_response.model_weights)
             logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
