@@ -13,7 +13,7 @@
   },
   "training": {
     "rounds": 3,
-    "local_epochs": 5,
+    "local_epochs": 1,
     "batch_size": 64,
     "lr": 0.01
   },

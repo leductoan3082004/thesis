@@ -1660,7 +1660,8 @@ class HierarchyMixin:
             if candidate == self.node_id:
                 anchor = aggregator.get_anchor(scope_round)
                 if anchor:
-                    self._record_scope_model_application(runtime, scope_round, cid, hash_val, data_id, model)
+                    cid, hash_val = anchor
+                    self._record_scope_model_application(runtime, scope_round, cid, hash_val, None, model)
                     self._mark_scope_round_committed(scope_round, runtime=runtime)
                     return
                 try:
