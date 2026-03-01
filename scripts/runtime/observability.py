@@ -272,7 +272,9 @@ def generate_prometheus_config(runtime_dir: Path, node_count: int, base_metrics_
 def start_prometheus(runtime_dir: Path, node_count: int, base_metrics_port: int = 61000) -> ManagedProcess:
     config_path = generate_prometheus_config(runtime_dir, node_count, base_metrics_port)
     data_dir = runtime_dir / "observability" / "prometheus" / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+    data_dir.mkdir(parents=True)
     log_path = runtime_dir / "logs" / "prometheus.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     pid_file = runtime_dir / "pids" / "prometheus.pid"
