@@ -130,6 +130,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round2_opened_at = time.monotonic()
         self._round0_lock = threading.Lock()
         self._round2_lock = threading.Lock()
+        self._round4_lock = threading.Lock()
+        self._round4_computing: bool = False
 
         # ECM buffer for receiving ECMs from bridge nodes
         self.ecm_buffer = ecm_buffer
@@ -465,7 +467,12 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             return secureagg_pb2.ConsistencyAck(accepted=False, message=str(exc))
 
     def Round4Unmask(self, request: secureagg_pb2.UnmaskShares, context) -> secureagg_pb2.UnmaskAck:
-        """Collect unmasking shares and compute aggregate (SAP-Round 4)."""
+        """Collect unmasking shares and compute aggregate (SAP-Round 4).
+
+        The aggregation (mask removal + mean) is dispatched to a background thread once the
+        threshold is reached so that the gRPC handler never blocks.  Subsequent poll calls
+        return aggregation_complete=True as soon as the result is available.
+        """
         node_id = request.node_id
         if not self._validate_participant(node_id):
             logger.warning(f"Rejected unmask shares from {node_id}: not a clique member")
@@ -477,26 +484,41 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 message="Node not a survivor",
                 aggregation_complete=False,
             )
+
+        # Fast-path for polling nodes: background computation already finished.
+        if self.aggregated_result is not None:
+            return secureagg_pb2.UnmaskAck(accepted=True, message="Aggregation complete", aggregation_complete=True)
+
         try:
-            # Only accept first submission from each node to prevent duplicates during polling.
-            already_submitted = any(p.node_id == node_id for p in self._round4_payloads)
-            if not already_submitted:
-                drop_shares = {k: _decode_unmask_share(v) for k, v in request.dropout_s_shares.items()}
-                surv_shares = {k: _decode_unmask_share(v) for k, v in request.survivor_b_shares.items()}
-                payload = UnmaskingSharesModel(
-                    node_id=node_id,
-                    s_shares_for_dropouts=drop_shares,
-                    b_shares_for_survivors=surv_shares,
-                )
-                self._round4_payloads.append(payload)
-            if len(self._round4_payloads) >= self._active_threshold:
-                result = self.aggregator.receive_unmasking_shares(self._round4_payloads)
-                self.aggregated_result = result.aggregate_mean
-                return secureagg_pb2.UnmaskAck(
-                    accepted=True,
-                    message="Aggregation complete",
-                    aggregation_complete=True,
-                )
+            should_start_computing = False
+            payloads_snapshot: List[UnmaskingSharesModel] = []
+            with self._round4_lock:
+                # Only accept first submission from each node to prevent duplicates during polling.
+                already_submitted = any(p.node_id == node_id for p in self._round4_payloads)
+                if not already_submitted:
+                    drop_shares = {k: _decode_unmask_share(v) for k, v in request.dropout_s_shares.items()}
+                    surv_shares = {k: _decode_unmask_share(v) for k, v in request.survivor_b_shares.items()}
+                    payload = UnmaskingSharesModel(
+                        node_id=node_id,
+                        s_shares_for_dropouts=drop_shares,
+                        b_shares_for_survivors=surv_shares,
+                    )
+                    self._round4_payloads.append(payload)
+
+                # Dispatch computation exactly once when threshold is reached.
+                if len(self._round4_payloads) >= self._active_threshold and not self._round4_computing:
+                    self._round4_computing = True
+                    should_start_computing = True
+                    payloads_snapshot = list(self._round4_payloads)
+
+            if should_start_computing:
+                threading.Thread(
+                    target=self._run_unmasking,
+                    args=(payloads_snapshot,),
+                    daemon=True,
+                    name=f"round4-unmask-{self.current_round}",
+                ).start()
+
             return secureagg_pb2.UnmaskAck(
                 accepted=True,
                 message="Waiting for more unmask shares",
@@ -505,6 +527,21 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"SAP-Round4 processing failed for {node_id}: {exc}")
             return secureagg_pb2.UnmaskAck(accepted=False, message=str(exc), aggregation_complete=False)
+
+    def _run_unmasking(self, payloads: List[UnmaskingSharesModel]) -> None:
+        """Background thread: reconstruct masks and compute aggregate mean.
+
+        Runs off the gRPC thread pool so that mask removal (expensive Python bigint arithmetic
+        over the full model vector) never blocks handler threads or triggers client timeouts.
+        """
+        try:
+            result = self.aggregator.receive_unmasking_shares(payloads)
+            self.aggregated_result = result.aggregate_mean
+            logger.info("SAP-Round 4 aggregation complete (%d survivors)", len(result.survivors))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("SAP-Round 4 aggregation failed: %s", exc, exc_info=True)
+            # Reset flag so a retry poll can re-attempt if something went wrong.
+            self._round4_computing = False
 
     def _default_model_response(self, _: int) -> secureagg_pb2.ModelResponse:
         """Return an empty placeholder response for callers still waiting on aggregation."""
@@ -680,6 +717,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round2_timed_out = False
         self._round2_opened_at = time.monotonic()
         self._round0_opened_at = time.monotonic()
+        self._round4_computing = False
         self.current_round = round_idx
         logger.info("Aggregator %s prepared for round %d", self.node_id, round_idx)
 
