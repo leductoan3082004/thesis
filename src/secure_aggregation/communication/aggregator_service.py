@@ -102,8 +102,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         signing_public_keys: Optional[Mapping[str, bytes]] = None,
         ecm_buffer: Optional[ECMBuffer] = None,
         convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
-        round0_timeout_seconds: float = 0.0,
-        round_timeout_seconds: float = 0.0,
+        timeout_seconds: float = 0.0,
     ) -> None:
         self.node_id = node_id
         self.threshold = threshold
@@ -126,9 +125,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round2_waiting_on_aggregator: bool = False
         self._round2_timed_out: bool = False
         self._active_threshold = max(1, min(self.threshold, len(self.participant_ids)))
-        self._round0_timeout_seconds = max(0.0, round0_timeout_seconds)
+        self._timeout_seconds = max(0.0, timeout_seconds)
         self._round0_opened_at = time.monotonic()
-        self._round2_timeout_seconds = max(0.0, round_timeout_seconds)
         self._round2_opened_at = time.monotonic()
         self._round0_lock = threading.Lock()
         self._round2_lock = threading.Lock()
@@ -185,14 +183,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         return node_id in self.participant_ids
 
     def _round0_timeout_elapsed_locked(self) -> bool:
-        if self._round0_timeout_seconds <= 0:
+        if self._timeout_seconds <= 0:
             return False
-        return (time.monotonic() - self._round0_opened_at) >= self._round0_timeout_seconds
+        return (time.monotonic() - self._round0_opened_at) >= self._timeout_seconds
 
     def _round2_timeout_elapsed(self) -> bool:
-        if self._round2_timeout_seconds <= 0:
+        if self._timeout_seconds <= 0:
             return False
-        return (time.monotonic() - self._round2_opened_at) >= self._round2_timeout_seconds
+        return (time.monotonic() - self._round2_opened_at) >= self._timeout_seconds
 
     def _finalize_round0_if_ready_locked(self) -> None:
         if self._round0_finalized:
@@ -212,7 +210,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 "SAP-Round 0 finalized after timeout (participants=%d, threshold=%d, timeout=%.1fs, elapsed=%.1fs)",
                 committed,
                 self.threshold,
-                self._round0_timeout_seconds,
+                self._timeout_seconds,
                 elapsed,
             )
             self._committed_adverts = self.aggregator.broadcast_advertisements()
@@ -698,8 +696,7 @@ def serve(
     signing_public_keys: Optional[Mapping[str, bytes]] = None,
     ecm_buffer: Optional[ECMBuffer] = None,
     convergence_signal_handler: Optional[Callable[[str, int], None]] = None,
-    round0_timeout_seconds: float = 0.0,
-    round_timeout_seconds: float = 0.0,
+    timeout_seconds: float = 0.0,
 ) -> Tuple[grpc.Server, AggregatorServicer]:
     """Start the aggregator gRPC server.
 
@@ -713,8 +710,7 @@ def serve(
         signing_public_keys=signing_public_keys,
         ecm_buffer=ecm_buffer,
         convergence_signal_handler=convergence_signal_handler,
-        round0_timeout_seconds=round0_timeout_seconds,
-        round_timeout_seconds=round_timeout_seconds,
+        timeout_seconds=timeout_seconds,
     )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=10),
