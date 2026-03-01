@@ -222,6 +222,11 @@ class PrometheusMetrics:
             "Marker for committed hierarchy scope rounds (value=1)",
             ["node_id", "clique_id", "scope_name", "scope_id", "scope_round", "committer_node_id"],
         )
+        self.passive_sync_events = Counter(
+            "fl_passive_sync_events_total",
+            "Total passive sync transitions by SAP phase and sync code",
+            ["node_id", "clique_id", "phase", "sync_code"],
+        )
 
     @classmethod
     def get_instance(cls, node_id: str, clique_id: int) -> "PrometheusMetrics":
@@ -370,6 +375,15 @@ class PrometheusMetrics:
                 scope_round=str(scope_round),
                 leader_node_id=str(leader_node_id),
             ).set(1)
+
+    def inc_passive_sync(self, phase: str, sync_code: int) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.passive_sync_events.labels(
+                node_id=self.node_id,
+                clique_id=str(self.clique_id),
+                phase=phase,
+                sync_code=str(sync_code),
+            ).inc()
 
     def record_scope_round_commit(
         self,
