@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from secure_aggregation.communication import secureagg_pb2
 from secure_aggregation.communication.node_service import (
+    AggregatorUnavailable,
     FatalSyncError,
     NodeService,
     SapResult,
@@ -85,6 +87,88 @@ class TestSyncHandling:
         )
         with pytest.raises(FatalSyncError):
             node._check_sync_or_abort(response, "round1")
+
+    def test_check_sync_or_abort_raises_aggregator_unavailable_for_ahead(self):
+        node = NodeService.__new__(NodeService)
+        node.node_id = "node_a"
+        node.current_round = 22
+        node.prom_metrics = None
+
+        response = SimpleNamespace(
+            sync_code=secureagg_pb2.ROUND_SYNC_AHEAD,
+            server_round=18,
+        )
+        with pytest.raises(AggregatorUnavailable, match="sync_code=AHEAD"):
+            node._check_sync_or_abort(response, "round0")
+
+    def test_check_sync_or_abort_returns_passive_for_stale(self):
+        node = NodeService.__new__(NodeService)
+        node.node_id = "node_a"
+        node.current_round = 3
+        node.prom_metrics = None
+
+        response = SimpleNamespace(
+            sync_code=secureagg_pb2.ROUND_SYNC_STALE,
+            server_round=5,
+        )
+        result = node._check_sync_or_abort(response, "round0")
+        assert result is not None
+        assert result.passive_wait is True
+        assert result.target_round == 5
+
+
+class TestAwaitAggregatorRound:
+    """Tests for the readiness barrier that replaced the fixed pre-SAP sleep."""
+
+    @staticmethod
+    def _make_node(**overrides):
+        node = NodeService.__new__(NodeService)
+        node.node_id = "node_test"
+        node.aggregator_id = "node_agg"
+        node.sap_timeout_seconds = 30
+        node.prom_metrics = None
+        node._convergence_runtime_enabled = False
+        for k, v in overrides.items():
+            setattr(node, k, v)
+        return node
+
+    def test_immediate_ready(self):
+        """Aggregator already at target round — returns immediately."""
+        node = self._make_node()
+        with patch.object(node, "_get_remote_aggregator_round", return_value=10):
+            node._await_aggregator_round(10)
+
+    def test_delayed_ready(self):
+        """Aggregator starts behind then catches up on second poll."""
+        node = self._make_node()
+        side_effects = [8, 10]
+        with patch.object(
+            node, "_get_remote_aggregator_round", side_effect=side_effects
+        ), patch("time.sleep"):
+            node._await_aggregator_round(10)
+
+    def test_aggregator_ahead_raises(self):
+        """Aggregator already past target — out-of-sync catch-up condition."""
+        node = self._make_node()
+        with patch.object(node, "_get_remote_aggregator_round", return_value=15):
+            with pytest.raises(AggregatorUnavailable, match="already at round 15"):
+                node._await_aggregator_round(10)
+
+    def test_timeout_raises(self):
+        """Aggregator never reaches target within sap_timeout_seconds."""
+        node = self._make_node(sap_timeout_seconds=0.0)
+        with patch.object(node, "_get_remote_aggregator_round", return_value=5):
+            with pytest.raises(AggregatorUnavailable, match="not ready"):
+                node._await_aggregator_round(10)
+
+    def test_unreachable_then_ready(self):
+        """Aggregator unreachable initially (None), then becomes ready."""
+        node = self._make_node()
+        side_effects = [None, None, 10]
+        with patch.object(
+            node, "_get_remote_aggregator_round", side_effect=side_effects
+        ), patch("time.sleep"):
+            node._await_aggregator_round(10)
 
 
 class TestMergeCommStats:

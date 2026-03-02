@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from scripts.runtime.port_allocator import PortMap, allocate_ports, check_conflicts
-from scripts.runtime.process_registry import ManagedProcess, ProcessRegistry, SENTINEL_PID
+from scripts.runtime.process_registry import ManagedProcess, ProcessRegistry, SENTINEL_PID, kill_pids_on_ports
 from scripts.runtime.config_generator import generate_process_layout
 from scripts.runtime.ipfs_manager import start_ipfs
 from scripts.runtime import blockchain_helpers
@@ -38,6 +38,21 @@ DEFAULT_IPFS_CONFIG = ROOT_DIR / "config" / "ipfs-process.json"
 DEFAULT_GATEWAY_URL = os.environ.get("BLOCKCHAIN_GATEWAY_URL", "http://localhost:9000")
 TTP_SCRIPT = ROOT_DIR / "scripts" / "run_ttp_with_topology.py"
 PYTHON = sys.executable
+
+
+def _collect_managed_ports() -> List[int]:
+    """Collect all port numbers managed by this stack (IPFS + infra)."""
+    ports: List[int] = []
+    if DEFAULT_IPFS_CONFIG.exists():
+        try:
+            from scripts.runtime.ipfs_manager import load_layout
+            layout = load_layout(DEFAULT_IPFS_CONFIG)
+            for node in layout.nodes:
+                ports.extend([node.api_port, node.gateway_port, node.swarm_port])
+        except Exception:
+            pass
+    ports.extend([50051, 3000, 3100, 9080, 9090])
+    return ports
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +71,15 @@ def _cmd_start(args: argparse.Namespace) -> None:
             f"Processes still running: {names}. Run 'secureagg_ctl.py stop' first."
         )
     registry.cleanup_stale()
+
+    # Kill orphaned processes still occupying managed ports from a previous
+    # run that was not fully cleaned up.
+    orphan_ports = _collect_managed_ports()
+    if orphan_ports:
+        killed = kill_pids_on_ports(orphan_ports, label="pre-start sweep")
+        if killed:
+            print(f"Killed {killed} orphaned process(es) occupying managed ports.")
+            time.sleep(1)
 
     gateway_url = args.gateway_url or DEFAULT_GATEWAY_URL
     nodes_map_path = Path(args.nodes_map) if args.nodes_map else None
@@ -280,6 +304,15 @@ def _cmd_stop(_args: argparse.Namespace) -> None:
     # Always attempt blockchain shutdown — manage.sh is external to the
     # registry and may be running even when the registry file is stale.
     blockchain_helpers.stop_blockchain()
+
+    # Kill orphaned processes still holding managed ports (e.g. IPFS daemons
+    # that survived a previous stop due to PID tracking gaps).
+    orphan_ports = _collect_managed_ports()
+    if orphan_ports:
+        killed = kill_pids_on_ports(orphan_ports, label="post-stop sweep")
+        if killed:
+            print(f"Killed {killed} orphaned process(es) on managed ports.")
+
     print("All processes stopped.")
 
 

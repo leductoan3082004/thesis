@@ -237,3 +237,16 @@ def lsof_port_pids(port: int) -> List[int]:
         return [int(p) for p in result.stdout.split() if p.strip()]
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
         return []
+
+
+def kill_pids_on_ports(ports: List[int], *, label: str = "") -> int:
+    """Find and kill any process holding the given *ports*. Return count killed."""
+    killed_pids: set[int] = set()
+    for port in ports:
+        for pid in lsof_port_pids(port):
+            if pid > 0 and pid not in killed_pids:
+                if label:
+                    print(f"  Killing orphaned process pid={pid} on port {port} ({label})")
+                _kill_pid(pid, escalate=True)
+                killed_pids.add(pid)
+    return len(killed_pids)

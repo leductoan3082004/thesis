@@ -1182,6 +1182,47 @@ class NodeService(HierarchyMixin):
             if channel:
                 channel.close()
 
+    def _await_aggregator_round(self, target_round: int) -> None:
+        """Block until the remote aggregator advertises *target_round*.
+
+        Polls ``_get_remote_aggregator_round`` with a 1-second interval,
+        bounded by ``sap_timeout_seconds``.
+
+        Raises:
+            AggregatorUnavailable: on timeout or if the aggregator is already
+                past the target round.
+        """
+        deadline = time.monotonic() + self.sap_timeout_seconds
+        attempt = 0
+        while True:
+            self._abort_if_global_stop()
+            remote_round = self._get_remote_aggregator_round()
+
+            if remote_round is not None and remote_round == target_round:
+                return
+
+            if remote_round is not None and remote_round > target_round:
+                raise AggregatorUnavailable(
+                    f"Aggregator {self.aggregator_id} already at round {remote_round}, "
+                    f"expected {target_round}"
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AggregatorUnavailable(
+                    f"Aggregator {self.aggregator_id} not ready for round {target_round} "
+                    f"after {self.sap_timeout_seconds:.0f}s "
+                    f"(last remote_round={remote_round})"
+                )
+
+            attempt += 1
+            if attempt <= 3 or attempt % 5 == 0:
+                logger.info(
+                    "Waiting for aggregator %s to reach round %d (current=%s, attempt=%d)",
+                    self.aggregator_id, target_round, remote_round, attempt,
+                )
+            time.sleep(min(1.0, remaining))
+
     def stop_aggregator_server(self) -> None:
         """Stop aggregator server."""
         try:
@@ -1802,12 +1843,15 @@ class NodeService(HierarchyMixin):
         stage: str,
     ) -> Optional["SapResult"]:
         """Evaluate the sync fields on a SAP response and return a SapResult when the
-        node should stop active participation.  Returns None when the node may proceed.
+        node should stop active participation.  Returns ``None`` when the node may
+        proceed normally.
 
-        Raises RuntimeError for FATAL (NOT_MEMBER).  For RETRY_SAME_PHASE (AHEAD) the
-        node treats it the same as PASSIVE_WAIT because the aggregator has not yet
-        prepared the round the node expects, so the safest action is to fall back to
-        model-fetch-and-advance rather than busy-retrying inside SAP.
+        Raises:
+            FatalSyncError: for NOT_MEMBER.
+            AggregatorUnavailable: for AHEAD (stale aggregator that has not
+                prepared for this round yet).  The outer training loop catches
+                this and retries the entire round, which is the correct recovery
+                because the readiness barrier will re-synchronize.
         """
         sync_code = getattr(response, "sync_code", secureagg_pb2.ROUND_SYNC_UNSPECIFIED)
         server_round = getattr(response, "server_round", self.current_round)
@@ -1818,7 +1862,13 @@ class NodeService(HierarchyMixin):
             raise FatalSyncError(
                 f"Node {self.node_id} is not a member of the aggregator's clique (stage={stage})"
             )
-        # PASSIVE_WAIT and RETRY_SAME_PHASE both transition to passive sync.
+        if decision == "RETRY_SAME_PHASE":
+            raise AggregatorUnavailable(
+                f"Aggregator round mismatch at {stage}: "
+                f"local_round={self.current_round}, server_round={server_round} "
+                f"(sync_code=AHEAD)"
+            )
+        # PASSIVE_WAIT (STALE / FINALIZED): node is genuinely behind.
         return self._handle_passive_sync(stage, self.current_round, server_round, sync_code)
 
     def run_secure_aggregation_round(self) -> "SapResult":
@@ -2066,8 +2116,9 @@ class NodeService(HierarchyMixin):
         sync_result2 = self._check_sync_or_abort(response2, "round2")
         if sync_result2 is not None:
             return sync_result2
-        expected_survivors = len(self.clique_members) if self.clique_members else len(ordered_participants)
-        expected_survivors = max(expected_survivors, self.threshold)
+        # Use actual Round 0 participant count, not full clique size, because
+        # some clique members may have been excluded during Round 0 timeout.
+        expected_survivors = max(len(ordered_participants), self.threshold)
 
         def _survivor_goal_met(resp: secureagg_pb2.MaskedInputAck) -> bool:
             if not resp.survivors:
@@ -2314,11 +2365,6 @@ class NodeService(HierarchyMixin):
             self.aggregator_id = self.elect_aggregator(round_idx)
             self.aggregator_address = self.participant_map[self.aggregator_id]
             self.is_aggregator = (self.aggregator_id == self.node_id)
-            aggregator_is_bridge = is_bridge_node(self.aggregator_id, self.inter_edges)
-            wait_for_aggregator = 5
-            if self.inter_cluster_enabled and aggregator_is_bridge:
-                wait_for_aggregator = max(wait_for_aggregator, 8)
-
             cid: Optional[str] = None
             model_hash: Optional[str] = None
             model_data_id: Optional[str] = None
@@ -2330,24 +2376,8 @@ class NodeService(HierarchyMixin):
                     if self.aggregator_server is None:
                         self.start_aggregator_server()
                     self._prepare_local_aggregator(round_idx)
-
-                logger.info(
-                    "Waiting for aggregator %s to be ready (sleeping %ds)...",
-                    self.aggregator_id,
-                    wait_for_aggregator,
-                )
-                wait_remaining = wait_for_aggregator
-                while wait_remaining > 0 and not should_stop:
-                    interval = min(1.0, wait_remaining)
-                    time.sleep(interval)
-                    wait_remaining -= interval
-                    should_stop, stop_reason = self._refresh_convergence_state(should_stop, stop_reason)
-                    if should_stop:
-                        logger.info(f"Stopping training while waiting for aggregator: {stop_reason}")
-                        break
-
-                if should_stop:
-                    break
+                else:
+                    self._await_aggregator_round(round_idx)
 
                 # Phase 2: Secure aggregation
                 logger.info("Phase 2: Secure aggregation")
@@ -2355,11 +2385,7 @@ class NodeService(HierarchyMixin):
                 try:
                     sap_result = self.run_secure_aggregation_round()
                 except GlobalStopRequested:
-                    should_stop = True
-                    stop_reason = "global_convergence"
-                    round_failed = True
-                    logger.info("Aborting secure aggregation due to confirmed global convergence")
-                    break
+                    raise
                 finally:
                     agg_time = time.monotonic() - sap_start
                     self.prom_metrics.observe_aggregation(agg_time)
@@ -2534,6 +2560,12 @@ class NodeService(HierarchyMixin):
                 logger.info(f"Accuracy after aggregation: {acc_after:.4f}")
                 logger.info(f"Improvement: {acc_after - acc_before:+.4f}")
 
+            except GlobalStopRequested:
+                should_stop = True
+                stop_reason = "global_convergence"
+                round_failed = True
+                logger.info("Aborting round due to confirmed global convergence")
+                break
             except PortBindingError as exc:
                 round_failed = True
                 aggregator_unreachable_this_round = True
