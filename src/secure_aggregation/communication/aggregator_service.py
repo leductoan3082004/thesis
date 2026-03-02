@@ -184,6 +184,19 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
     def _validate_participant(self, node_id: str) -> bool:
         return node_id in self.participant_ids
 
+    @staticmethod
+    def _check_round_sync(request_round: int, server_round: int) -> int:
+        """Compare request round to the already-captured server round.
+
+        Accepts server_round explicitly to avoid re-reading self.current_round,
+        which could change between the caller's snapshot and this call.
+        """
+        if request_round < server_round:
+            return secureagg_pb2.ROUND_SYNC_STALE
+        if request_round > server_round:
+            return secureagg_pb2.ROUND_SYNC_AHEAD
+        return secureagg_pb2.ROUND_SYNC_OK
+
     def _round0_timeout_elapsed_locked(self) -> bool:
         if self._timeout_seconds <= 0:
             return False
@@ -252,14 +265,41 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
     def Round0AdvertiseKeys(self, request: secureagg_pb2.KeyAdvertisement, context) -> secureagg_pb2.KeyAdvertisementAck:
         """Collect DH public keys from participants (SAP-Round 0)."""
         node_id = request.node_id
+        server_round = self.current_round
+
+        if node_id not in self.all_participant_ids:
+            logger.warning(f"Rejected key advertisement from {node_id}: not a clique member")
+            return secureagg_pb2.KeyAdvertisementAck(
+                accepted=False,
+                message="Node not in clique",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_NOT_MEMBER,
+            )
+
+        if request.round != server_round:
+            sync_code = self._check_round_sync(request.round, server_round)
+            logger.warning(
+                "Round 0 mismatch from %s: request.round=%d, server_round=%d",
+                node_id, request.round, server_round,
+            )
+            return secureagg_pb2.KeyAdvertisementAck(
+                accepted=False,
+                message=f"Round mismatch: request={request.round}, server={server_round}",
+                server_round=server_round,
+                sync_code=sync_code,
+            )
 
         if not self._validate_participant(node_id):
-            logger.warning(f"Rejected key advertisement from {node_id}: not a clique member")
-            return secureagg_pb2.KeyAdvertisementAck(accepted=False, message="Node not in clique")
+            logger.warning(f"Rejected key advertisement from {node_id}: not active in current round")
+            return secureagg_pb2.KeyAdvertisementAck(
+                accepted=False,
+                message="Node not active in current round",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
+            )
 
         response_keys: List[secureagg_pb2.KeyAdvertisement] = []
         response_message = "Waiting for more participants"
-        accepted = True
         with self._round0_lock:
             if self._round0_finalized and node_id not in self._adverts:
                 logger.warning("Rejected key advertisement from %s: Round 0 already finalized", node_id)
@@ -267,6 +307,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     accepted=False,
                     message="Round 0 finalized",
                     all_keys=self._encoded_committed_adverts(),
+                    server_round=server_round,
+                    sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
                 )
 
             try:
@@ -279,7 +321,12 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
-                return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
+                return secureagg_pb2.KeyAdvertisementAck(
+                    accepted=False,
+                    message=str(exc),
+                    server_round=server_round,
+                    sync_code=secureagg_pb2.ROUND_SYNC_OK,
+                )
 
             is_new_advert = node_id not in self._adverts
             if is_new_advert:
@@ -295,7 +342,12 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 if is_new_advert:
                     self._adverts.pop(node_id, None)
                 logger.warning(f"SAP-Round0 advert rejected from {node_id}: {exc}")
-                return secureagg_pb2.KeyAdvertisementAck(accepted=False, message=str(exc))
+                return secureagg_pb2.KeyAdvertisementAck(
+                    accepted=False,
+                    message=str(exc),
+                    server_round=server_round,
+                    sync_code=secureagg_pb2.ROUND_SYNC_OK,
+                )
 
             self._finalize_round0_if_ready_locked()
             if self._round0_finalized:
@@ -310,20 +362,48 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     accepted=False,
                     message="Round 0 finalized",
                     all_keys=response_keys,
+                    server_round=server_round,
+                    sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
                 )
 
         return secureagg_pb2.KeyAdvertisementAck(
             accepted=True,
             message=response_message,
             all_keys=response_keys,
+            server_round=server_round,
+            sync_code=secureagg_pb2.ROUND_SYNC_OK,
         )
 
     def Round1ShareKeys(self, request: secureagg_pb2.ShareKeysMessage, context) -> secureagg_pb2.ShareKeysAck:
         """Collect encrypted secret shares (SAP-Round 1) and deliver mailbox."""
         node_id = request.node_id
-        if not self._validate_participant(node_id):
+        server_round = self.current_round
+
+        if node_id not in self.all_participant_ids:
             logger.warning(f"Rejected shares from {node_id}: not a clique member")
-            return secureagg_pb2.ShareKeysAck(accepted=False, message="Node not in clique")
+            return secureagg_pb2.ShareKeysAck(
+                accepted=False,
+                message="Node not in clique",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_NOT_MEMBER,
+            )
+
+        if request.round != server_round:
+            sync_code = self._check_round_sync(request.round, server_round)
+            return secureagg_pb2.ShareKeysAck(
+                accepted=False,
+                message=f"Round mismatch: request={request.round}, server={server_round}",
+                server_round=server_round,
+                sync_code=sync_code,
+            )
+
+        if not self._validate_participant(node_id):
+            return secureagg_pb2.ShareKeysAck(
+                accepted=False,
+                message="Node not active in current round",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
+            )
 
         try:
             ciphertexts = _decode_round1_ciphertexts(request.ciphertexts)
@@ -333,6 +413,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 accepted=True,
                 message="SAP-Round 1 OK",
                 mailbox=_encode_round1_ciphertexts(mailbox),
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_OK,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"SAP-Round1 processing failed for {node_id}: {exc}")
@@ -341,14 +423,44 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 accepted=False,
                 message=str(exc),
                 mailbox=_encode_round1_ciphertexts(mailbox),
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_OK,
             )
 
     def Round2MaskedInput(self, request: secureagg_pb2.MaskedInputMessage, context) -> secureagg_pb2.MaskedInputAck:
         """Collect masked model updates (SAP-Round 2)."""
         node_id = request.node_id
-        if not self._validate_participant(node_id):
+        server_round = self.current_round
+
+        if node_id not in self.all_participant_ids:
             logger.warning(f"Rejected masked input from {node_id}: not a clique member")
-            return secureagg_pb2.MaskedInputAck(accepted=False, message="Node not in clique")
+            return secureagg_pb2.MaskedInputAck(
+                accepted=False,
+                message="Node not in clique",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_NOT_MEMBER,
+            )
+
+        if request.round != server_round:
+            sync_code = self._check_round_sync(request.round, server_round)
+            return secureagg_pb2.MaskedInputAck(
+                accepted=False,
+                message=f"Round mismatch: request={request.round}, server={server_round}",
+                survivors=list(self._round2_survivors) if self._round2_finalized else [],
+                timed_out=self._round2_timed_out,
+                server_round=server_round,
+                sync_code=sync_code,
+            )
+
+        if not self._validate_participant(node_id):
+            logger.warning(f"Rejected masked input from {node_id}: not active in current round")
+            return secureagg_pb2.MaskedInputAck(
+                accepted=False,
+                message="Node not active in current round",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
+            )
+
         with self._round2_lock:
             try:
                 if self._round2_finalized:
@@ -359,6 +471,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                             message="SAP-Round 2 OK",
                             survivors=survivors,
                             timed_out=self._round2_timed_out,
+                            server_round=server_round,
+                            sync_code=secureagg_pb2.ROUND_SYNC_OK,
                         )
                     logger.warning("Masked input from %s rejected: Round 2 already finalized", node_id)
                     return secureagg_pb2.MaskedInputAck(
@@ -366,6 +480,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                         message="Round 2 finalized",
                         survivors=survivors,
                         timed_out=self._round2_timed_out,
+                        server_round=server_round,
+                        sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
                     )
                 if node_id not in self.aggregator.masked_inputs:
                     masked = MaskedInput(
@@ -395,6 +511,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                         message="Waiting for aggregator masked input",
                         survivors=[],
                         timed_out=False,
+                        server_round=server_round,
+                        sync_code=secureagg_pb2.ROUND_SYNC_OK,
                     )
                 finalize_reason = ""
                 if total_expected > 0 and masked_count >= total_expected:
@@ -428,12 +546,16 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                         message=message,
                         survivors=survivors,
                         timed_out=self._round2_timed_out,
+                        server_round=server_round,
+                        sync_code=secureagg_pb2.ROUND_SYNC_OK,
                     )
                 return secureagg_pb2.MaskedInputAck(
                     accepted=True,
                     message="Waiting for more participants",
                     survivors=[],
                     timed_out=False,
+                    server_round=server_round,
+                    sync_code=secureagg_pb2.ROUND_SYNC_OK,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"SAP-Round2 processing failed for {node_id}: {exc}")
@@ -443,28 +565,75 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     message=str(exc),
                     survivors=survivors,
                     timed_out=self._round2_timed_out,
+                    server_round=server_round,
+                    sync_code=secureagg_pb2.ROUND_SYNC_OK,
                 )
 
     def Round3ConsistencyCheck(self, request: secureagg_pb2.ConsistencySignature, context) -> secureagg_pb2.ConsistencyAck:
         """Collect consistency signatures (SAP-Round 3)."""
         node_id = request.node_id
-        if not self._validate_participant(node_id):
+        server_round = self.current_round
+
+        if node_id not in self.all_participant_ids:
             logger.warning(f"Rejected signature from {node_id}: not a clique member")
-            return secureagg_pb2.ConsistencyAck(accepted=False, message="Node not in clique")
+            return secureagg_pb2.ConsistencyAck(
+                accepted=False,
+                message="Node not in clique",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_NOT_MEMBER,
+            )
+
+        if request.round != server_round:
+            sync_code = self._check_round_sync(request.round, server_round)
+            return secureagg_pb2.ConsistencyAck(
+                accepted=False,
+                message=f"Round mismatch: request={request.round}, server={server_round}",
+                server_round=server_round,
+                sync_code=sync_code,
+            )
+
+        if not self._validate_participant(node_id):
+            return secureagg_pb2.ConsistencyAck(
+                accepted=False,
+                message="Node not active in current round",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
+            )
+
         if self._round2_finalized and node_id not in self.aggregator.survivors:
             logger.warning("Rejected signature from %s: not a survivor", node_id)
-            return secureagg_pb2.ConsistencyAck(accepted=False, message="Node not a survivor")
+            return secureagg_pb2.ConsistencyAck(
+                accepted=False,
+                message="Node not a survivor",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
+            )
         try:
             sig = SurvivorSignature(node_id=node_id, signature=bytes(request.signature))
             self._round3_signatures[node_id] = sig.signature
             if len(self._round3_signatures) >= len(self.aggregator.survivors):
                 sigs = [SurvivorSignature(node_id=n, signature=s) for n, s in self._round3_signatures.items()]
                 self.aggregator.verify_survivor_signatures(sigs)
-                return secureagg_pb2.ConsistencyAck(accepted=True, message="SAP-Round 3 OK")
-            return secureagg_pb2.ConsistencyAck(accepted=True, message="Waiting for more signatures")
+                return secureagg_pb2.ConsistencyAck(
+                    accepted=True,
+                    message="SAP-Round 3 OK",
+                    server_round=server_round,
+                    sync_code=secureagg_pb2.ROUND_SYNC_OK,
+                )
+            return secureagg_pb2.ConsistencyAck(
+                accepted=True,
+                message="Waiting for more signatures",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_OK,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"SAP-Round3 processing failed for {node_id}: {exc}")
-            return secureagg_pb2.ConsistencyAck(accepted=False, message=str(exc))
+            return secureagg_pb2.ConsistencyAck(
+                accepted=False,
+                message=str(exc),
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_OK,
+            )
 
     def Round4Unmask(self, request: secureagg_pb2.UnmaskShares, context) -> secureagg_pb2.UnmaskAck:
         """Collect unmasking shares and compute aggregate (SAP-Round 4).
@@ -474,20 +643,56 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         return aggregation_complete=True as soon as the result is available.
         """
         node_id = request.node_id
-        if not self._validate_participant(node_id):
+        server_round = self.current_round
+
+        if node_id not in self.all_participant_ids:
             logger.warning(f"Rejected unmask shares from {node_id}: not a clique member")
-            return secureagg_pb2.UnmaskAck(accepted=False, message="Node not in clique", aggregation_complete=False)
+            return secureagg_pb2.UnmaskAck(
+                accepted=False,
+                message="Node not in clique",
+                aggregation_complete=False,
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_NOT_MEMBER,
+            )
+
+        if request.round != server_round:
+            sync_code = self._check_round_sync(request.round, server_round)
+            return secureagg_pb2.UnmaskAck(
+                accepted=False,
+                message=f"Round mismatch: request={request.round}, server={server_round}",
+                aggregation_complete=self.aggregated_result is not None,
+                server_round=server_round,
+                sync_code=sync_code,
+            )
+
+        if not self._validate_participant(node_id):
+            return secureagg_pb2.UnmaskAck(
+                accepted=False,
+                message="Node not active in current round",
+                aggregation_complete=False,
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
+            )
+
         if self._round2_finalized and node_id not in self.aggregator.survivors:
             logger.warning("Rejected unmask shares from %s: not a survivor", node_id)
             return secureagg_pb2.UnmaskAck(
                 accepted=False,
                 message="Node not a survivor",
                 aggregation_complete=False,
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
             )
 
         # Fast-path for polling nodes: background computation already finished.
         if self.aggregated_result is not None:
-            return secureagg_pb2.UnmaskAck(accepted=True, message="Aggregation complete", aggregation_complete=True)
+            return secureagg_pb2.UnmaskAck(
+                accepted=True,
+                message="Aggregation complete",
+                aggregation_complete=True,
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_OK,
+            )
 
         try:
             should_start_computing = False
@@ -523,10 +728,18 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 accepted=True,
                 message="Waiting for more unmask shares",
                 aggregation_complete=False,
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_OK,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"SAP-Round4 processing failed for {node_id}: {exc}")
-            return secureagg_pb2.UnmaskAck(accepted=False, message=str(exc), aggregation_complete=False)
+            return secureagg_pb2.UnmaskAck(
+                accepted=False,
+                message=str(exc),
+                aggregation_complete=False,
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_OK,
+            )
 
     def _run_unmasking(self, payloads: List[UnmaskingSharesModel]) -> None:
         """Background thread: reconstruct masks and compute aggregate mean.

@@ -161,6 +161,26 @@ class AggregatorUnavailable(Exception):
     """Raised when the elected aggregator cannot be reached after repeated attempts."""
 
 
+class FatalSyncError(RuntimeError):
+    """Raised when aggregator reports a fatal round-sync condition (e.g., NOT_MEMBER)."""
+
+
+class SapResult:
+    """Outcome of a single secure aggregation round from the node's perspective."""
+
+    __slots__ = ("passive_wait", "target_round", "aggregated_weights")
+
+    def __init__(
+        self,
+        passive_wait: bool = False,
+        target_round: int = 0,
+        aggregated_weights: Optional[List[float]] = None,
+    ) -> None:
+        self.passive_wait = passive_wait
+        self.target_round = target_round
+        self.aggregated_weights: List[float] = aggregated_weights if aggregated_weights is not None else []
+
+
 class NodeService(HierarchyMixin):
     """Node service that coordinates training and secure aggregation."""
 
@@ -1713,16 +1733,98 @@ class NodeService(HierarchyMixin):
             )
         return response
 
-    def run_secure_aggregation_round(self) -> List[float]:
+    @staticmethod
+    def _merge_comm_stats(first: Dict[str, Any], second: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge two CommunicationTracker round-stat snapshots."""
+        first_msgs = int(first.get("messages_sent", 0))
+        second_msgs = int(second.get("messages_sent", 0))
+        total_msgs = first_msgs + second_msgs
+        first_avg = float(first.get("avg_latency_ms", 0.0))
+        second_avg = float(second.get("avg_latency_ms", 0.0))
+        avg_latency = 0.0
+        if total_msgs > 0:
+            avg_latency = ((first_avg * first_msgs) + (second_avg * second_msgs)) / total_msgs
+
+        by_phase: Dict[str, Dict[str, int]] = {}
+        for payload in (first, second):
+            phase_map = payload.get("by_phase", {})
+            if not isinstance(phase_map, dict):
+                continue
+            for phase, values in phase_map.items():
+                entry = by_phase.setdefault(phase, {"bytes_sent": 0, "bytes_received": 0})
+                entry["bytes_sent"] += int(values.get("bytes_sent", 0))
+                entry["bytes_received"] += int(values.get("bytes_received", 0))
+
+        return {
+            "bytes_sent": int(first.get("bytes_sent", 0)) + int(second.get("bytes_sent", 0)),
+            "bytes_received": int(first.get("bytes_received", 0)) + int(second.get("bytes_received", 0)),
+            "messages_sent": total_msgs,
+            "messages_received": int(first.get("messages_received", 0)) + int(second.get("messages_received", 0)),
+            "avg_latency_ms": avg_latency,
+            "by_phase": by_phase,
+        }
+
+    @staticmethod
+    def _evaluate_sync_decision(
+        sync_code: int,
+        local_round: int,
+        server_round: int,
+        stage: str,
+    ) -> str:
+        """Map aggregator sync response to a node-level action.
+
+        Returns one of: 'PROCEED', 'RETRY_SAME_PHASE', 'PASSIVE_WAIT', 'FATAL'.
+        """
+        if sync_code == secureagg_pb2.ROUND_SYNC_OK:
+            return "PROCEED"
+        if sync_code in (secureagg_pb2.ROUND_SYNC_STALE, secureagg_pb2.ROUND_SYNC_FINALIZED):
+            return "PASSIVE_WAIT"
+        if sync_code == secureagg_pb2.ROUND_SYNC_AHEAD:
+            return "RETRY_SAME_PHASE"
+        if sync_code == secureagg_pb2.ROUND_SYNC_NOT_MEMBER:
+            return "FATAL"
+        # ROUND_SYNC_UNSPECIFIED (0): legacy aggregator without sync support, proceed normally.
+        return "PROCEED"
+
+    def _handle_passive_sync(self, stage: str, local_round: int, server_round: int, sync_code: int) -> "SapResult":
+        """Record passive sync event and return a passive SapResult for the training loop."""
+        logger.warning(
+            "Passive sync at %s: local_round=%d, server_round=%d, sync_code=%d — skipping SAP contribution",
+            stage, local_round, server_round, sync_code,
+        )
+        if self.prom_metrics:
+            self.prom_metrics.inc_passive_sync(stage, sync_code)
+        return SapResult(passive_wait=True, target_round=server_round)
+
+    def _check_sync_or_abort(
+        self,
+        response: object,
+        stage: str,
+    ) -> Optional["SapResult"]:
+        """Evaluate the sync fields on a SAP response and return a SapResult when the
+        node should stop active participation.  Returns None when the node may proceed.
+
+        Raises RuntimeError for FATAL (NOT_MEMBER).  For RETRY_SAME_PHASE (AHEAD) the
+        node treats it the same as PASSIVE_WAIT because the aggregator has not yet
+        prepared the round the node expects, so the safest action is to fall back to
+        model-fetch-and-advance rather than busy-retrying inside SAP.
+        """
+        sync_code = getattr(response, "sync_code", secureagg_pb2.ROUND_SYNC_UNSPECIFIED)
+        server_round = getattr(response, "server_round", self.current_round)
+        decision = self._evaluate_sync_decision(sync_code, self.current_round, server_round, stage)
+        if decision == "PROCEED":
+            return None
+        if decision == "FATAL":
+            raise FatalSyncError(
+                f"Node {self.node_id} is not a member of the aggregator's clique (stage={stage})"
+            )
+        # PASSIVE_WAIT and RETRY_SAME_PHASE both transition to passive sync.
+        return self._handle_passive_sync(stage, self.current_round, server_round, sync_code)
+
+    def run_secure_aggregation_round(self) -> "SapResult":
         """Run one round of secure aggregation protocol."""
         self._abort_if_global_stop()
         logger.info(f"Starting secure aggregation round {self.current_round}")
-        # Client-side secure aggregation state
-        client = SecureAggregationNode(
-            self.node_id,
-            signing_private=self.signing_keypair.private_key if self.signing_keypair else None,
-            signing_public=self.signing_keypair.public_key if self.signing_keypair else None,
-        )
 
         # Get aggregator address
         agg_addr = self._aggregator_rpc_address()
@@ -1730,7 +1832,21 @@ class NodeService(HierarchyMixin):
             raise AggregatorUnavailable("Aggregator address unavailable")
 
         channel = self._create_aggregator_channel(agg_addr)
+        try:
+            return self._run_sap_rounds(channel, agg_addr)
+        finally:
+            channel.close()
+
+    def _run_sap_rounds(self, channel, agg_addr: str) -> "SapResult":
+        """Execute SAP Rounds 0-4 on an already-opened gRPC channel."""
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
+
+        # Client-side secure aggregation state
+        client = SecureAggregationNode(
+            self.node_id,
+            signing_private=self.signing_keypair.private_key if self.signing_keypair else None,
+            signing_public=self.signing_keypair.public_key if self.signing_keypair else None,
+        )
 
         # SAP Round 0: Advertise keys
         logger.info("SAP-Round 0: Advertising keys")
@@ -1754,6 +1870,7 @@ class NodeService(HierarchyMixin):
                     c_public_key=advert_msg.c_public,
                     s_public_key=advert_msg.s_public,
                     signature=advert_msg.signature,
+                    round=self.current_round,
                 )
                 response = self._invoke_tracked_rpc(
                     "Round0AdvertiseKeys",
@@ -1790,6 +1907,12 @@ class NodeService(HierarchyMixin):
             )
 
         if not response.accepted:
+            sync_result = self._check_sync_or_abort(response, "round0")
+            if sync_result is not None:
+                return sync_result
+            # Legacy fallback: message-based detection for old aggregators.
+            if "finalized" in (response.message or "").lower():
+                return self._handle_passive_sync("round0", self.current_round, self.current_round, 0)
             raise RuntimeError(f"Round 0 failed: {response.message}")
 
         # Wait until we receive at least the threshold number of advertisements.
@@ -1803,6 +1926,7 @@ class NodeService(HierarchyMixin):
                 c_public_key=advert_msg.c_public,
                 s_public_key=advert_msg.s_public,
                 signature=advert_msg.signature,
+                round=self.current_round,
             )
             response = self._invoke_tracked_rpc(
                 "Round0AdvertiseKeys",
@@ -1810,6 +1934,12 @@ class NodeService(HierarchyMixin):
                 round0_request,
                 timeout=self.sap_timeout_seconds,
             )
+            if not response.accepted:
+                sync_result = self._check_sync_or_abort(response, "round0_poll")
+                if sync_result is not None:
+                    return sync_result
+                if "finalized" in (response.message or "").lower():
+                    return self._handle_passive_sync("round0_poll", self.current_round, self.current_round, 0)
 
             logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
 
@@ -1848,6 +1978,7 @@ class NodeService(HierarchyMixin):
                 )
                 for ct in ct_list
             ],
+            round=self.current_round,
         )
         response1 = self._invoke_tracked_rpc(
             "Round1ShareKeys",
@@ -1855,6 +1986,9 @@ class NodeService(HierarchyMixin):
             round1_request,
             timeout=self.sap_timeout_seconds,
         )
+        sync_result1 = self._check_sync_or_abort(response1, "round1")
+        if sync_result1 is not None:
+            return sync_result1
         mailbox = [
             Round1Ciphertext(
                 sender_id=ct.sender_id,
@@ -1871,13 +2005,18 @@ class NodeService(HierarchyMixin):
             self._abort_if_global_stop()
             time.sleep(1)
             self._abort_if_global_stop()
-            round1_poll_request = secureagg_pb2.ShareKeysMessage(node_id=self.node_id, ciphertexts=[])
+            round1_poll_request = secureagg_pb2.ShareKeysMessage(
+                node_id=self.node_id, ciphertexts=[], round=self.current_round
+            )
             response1 = self._invoke_tracked_rpc(
                 "Round1ShareKeys",
                 stub.Round1ShareKeys,
                 round1_poll_request,
                 timeout=self.sap_timeout_seconds,
             )
+            sync_result1 = self._check_sync_or_abort(response1, "round1_poll")
+            if sync_result1 is not None:
+                return sync_result1
             mailbox = [
                 Round1Ciphertext(
                     sender_id=ct.sender_id,
@@ -1903,7 +2042,9 @@ class NodeService(HierarchyMixin):
 
         masked = client.create_masked_input(quantized)
         masked_bytes = [_int_to_bytes(val, SHARE_BYTES) for val in masked.masked_vector]
-        round2_request = secureagg_pb2.MaskedInputMessage(node_id=self.node_id, masked_vector=masked_bytes)
+        round2_request = secureagg_pb2.MaskedInputMessage(
+            node_id=self.node_id, masked_vector=masked_bytes, round=self.current_round
+        )
         masked_input_accepted = False
         try:
             response2 = self._invoke_tracked_rpc(
@@ -1922,6 +2063,9 @@ class NodeService(HierarchyMixin):
         except grpc.RpcError as exc:
             logger.error("SAP-Round 2 masked input RPC failed: %s", exc)
             raise
+        sync_result2 = self._check_sync_or_abort(response2, "round2")
+        if sync_result2 is not None:
+            return sync_result2
         expected_survivors = len(self.clique_members) if self.clique_members else len(ordered_participants)
         expected_survivors = max(expected_survivors, self.threshold)
 
@@ -1942,6 +2086,7 @@ class NodeService(HierarchyMixin):
             round2_poll_request = secureagg_pb2.MaskedInputMessage(
                 node_id=self.node_id,
                 masked_vector=masked_bytes,
+                round=self.current_round,
             )
             try:
                 response2 = self._invoke_tracked_rpc(
@@ -1961,6 +2106,9 @@ class NodeService(HierarchyMixin):
             except grpc.RpcError as exc:
                 logger.error("SAP-Round 2 polling RPC failed: %s", exc)
                 raise
+            sync_result2 = self._check_sync_or_abort(response2, "round2_poll")
+            if sync_result2 is not None:
+                return sync_result2
 
         survivor_count = len(response2.survivors)
         if not masked_input_accepted:
@@ -1992,6 +2140,7 @@ class NodeService(HierarchyMixin):
             round3_request = secureagg_pb2.ConsistencySignature(
                 node_id=self.node_id,
                 signature=survivor_sig.signature,
+                round=self.current_round,
             )
             response3 = self._invoke_tracked_rpc(
                 "Round3ConsistencyCheck",
@@ -1999,6 +2148,9 @@ class NodeService(HierarchyMixin):
                 round3_request,
                 timeout=self.sap_timeout_seconds,
             )
+            sync_result3 = self._check_sync_or_abort(response3, "round3")
+            if sync_result3 is not None:
+                return sync_result3
 
             # Record Round 3 timing
             if self.prom_metrics:
@@ -2014,6 +2166,7 @@ class NodeService(HierarchyMixin):
                 node_id=self.node_id,
                 dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
                 survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
+                round=self.current_round,
             )
             response4 = self._invoke_tracked_rpc(
                 "Round4Unmask",
@@ -2021,6 +2174,9 @@ class NodeService(HierarchyMixin):
                 round4_request,
                 timeout=self.sap_timeout_seconds,
             )
+            sync_result4 = self._check_sync_or_abort(response4, "round4")
+            if sync_result4 is not None:
+                return sync_result4
 
             # Wait for aggregation to complete
             while not response4.aggregation_complete:
@@ -2031,6 +2187,7 @@ class NodeService(HierarchyMixin):
                     node_id=self.node_id,
                     dropout_s_shares={k: _encode_share(x, s) for k, (x, s) in unmask_payload.s_shares_for_dropouts.items()},
                     survivor_b_shares={k: _encode_share(x, b) for k, (x, b) in unmask_payload.b_shares_for_survivors.items()},
+                    round=self.current_round,
                 )
                 response4 = self._invoke_tracked_rpc(
                     "Round4Unmask",
@@ -2038,6 +2195,9 @@ class NodeService(HierarchyMixin):
                     round4_poll_request,
                     timeout=self.sap_timeout_seconds,
                 )
+                sync_result4 = self._check_sync_or_abort(response4, "round4_poll")
+                if sync_result4 is not None:
+                    return sync_result4
 
             logger.info("SAP-Round 4 complete: aggregation done")
 
@@ -2060,9 +2220,7 @@ class NodeService(HierarchyMixin):
             aggregated = list(model_response.model_weights)
             logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
 
-        channel.close()
-
-        return aggregated
+        return SapResult(aggregated_weights=aggregated)
 
     def run_training_loop(self) -> None:
         """Convergence-driven training loop with secure aggregation.
@@ -2119,6 +2277,8 @@ class NodeService(HierarchyMixin):
             if self._process_high_level_rounds():
                 continue
             round_idx = self.current_round
+            comm_round_idx = round_idx
+            comm_round_shifted = False
             round_start_time = time.monotonic()
             self.comm_tracker.set_round(round_idx)
             self.prom_metrics.set_round(round_idx)
@@ -2193,7 +2353,7 @@ class NodeService(HierarchyMixin):
                 logger.info("Phase 2: Secure aggregation")
                 sap_start = time.monotonic()
                 try:
-                    aggregated_weights = self.run_secure_aggregation_round()
+                    sap_result = self.run_secure_aggregation_round()
                 except GlobalStopRequested:
                     should_stop = True
                     stop_reason = "global_convergence"
@@ -2203,6 +2363,26 @@ class NodeService(HierarchyMixin):
                 finally:
                     agg_time = time.monotonic() - sap_start
                     self.prom_metrics.observe_aggregation(agg_time)
+
+                if sap_result.passive_wait:
+                    logger.info(
+                        "Passive sync: skipping SAP contribution for round %d, "
+                        "advancing to server round %d",
+                        round_idx,
+                        sap_result.target_round,
+                    )
+                    self.current_round = max(self.current_round, sap_result.target_round)
+                    # Keep round_idx aligned so downstream bookkeeping
+                    # (remember_anchor, gossip_ecm, comm stats) uses the
+                    # server's round, not the stale local snapshot.
+                    round_idx = self.current_round
+                    if round_idx != comm_round_idx:
+                        comm_round_shifted = True
+                        self.comm_tracker.set_round(round_idx)
+                    # Fall through to non-aggregator model-fetch path below.
+                    aggregated_weights = []
+                else:
+                    aggregated_weights = sap_result.aggregated_weights
 
                 # Phase 3: Bridge nodes forward ECMs (if inter-cluster is enabled)
                 if self.is_bridge_node:
@@ -2391,6 +2571,13 @@ class NodeService(HierarchyMixin):
                     details or "n/a",
                     round_idx + 1,
                 )
+            except FatalSyncError as exc:
+                should_stop = True
+                stop_reason = "fatal_sync"
+                round_failed = False
+                aggregator_unreachable_this_round = False
+                logger.error("Stopping training due to fatal synchronization error: %s", exc)
+                break
             except Exception as e:
                 round_failed = True
                 logger.error("Secure aggregation failed: %s", e, exc_info=True)
@@ -2443,6 +2630,9 @@ class NodeService(HierarchyMixin):
 
             # Get communication stats from tracker and record to Prometheus
             comm_stats = self.comm_tracker.get_round_stats(round_idx)
+            if comm_round_shifted and comm_round_idx != round_idx:
+                previous_round_stats = self.comm_tracker.get_round_stats(comm_round_idx)
+                comm_stats = self._merge_comm_stats(previous_round_stats, comm_stats)
             self.prom_metrics.add_bytes_sent(comm_stats["bytes_sent"])
             self.prom_metrics.add_bytes_received(comm_stats["bytes_received"])
             self.prom_metrics.add_messages_sent(comm_stats["messages_sent"])

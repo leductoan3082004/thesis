@@ -244,12 +244,28 @@ Requires Python >= 3.10 (`pyproject.toml`). Package name: `secure-aggregation-fl
 
 16 test modules across `tests/`: crypto, protocol, data, models, node, communication, storage, topology, integration, hierarchy, runtime, config, docker, performance, utils, plus root-level convergence and system config tests.
 
+**Important: The venv is managed by `uv`. Always use `uv run` to execute tests.**
+
 ```bash
-make test                    # All tests
-make test-coverage           # Tests with coverage
-pytest tests/protocol/       # Protocol-specific tests
-pytest tests/integration/    # Full system integration tests
-pytest tests/runtime/        # Runtime infrastructure tests (port allocator, IPFS, blockchain, Loki, config generator)
+# Run all tests (uv-managed venv)
+uv run pytest tests/
+
+# Run targeted test subsets
+uv run pytest tests/communication/test_aggregator_service.py -v
+uv run pytest tests/node/test_round_sync.py -v
+uv run pytest tests/communication/ tests/node/ tests/protocol/ -v
+
+# Regenerate protobuf code after editing protos/secureagg.proto
+/usr/local/bin/python3 -m grpc_tools.protoc -I=protos \
+  --python_out=src/secure_aggregation/communication \
+  --grpc_python_out=src/secure_aggregation/communication \
+  protos/secureagg.proto
+
+# Known pre-existing broken tests (unrelated to SAP logic):
+# tests/data/test_datasets.py       -- CSVDataset import missing
+# tests/utils/test_retry_cleanup_metrics.py -- CompositeMetrics import missing
+# Run excluding them:
+uv run pytest tests/ --ignore=tests/data/test_datasets.py --ignore=tests/utils/test_retry_cleanup_metrics.py
 ```
 
 pytest config: `testpaths = ["tests"]`, `pythonpath = ["src", "."]`.
