@@ -343,15 +343,6 @@ class NodeService(HierarchyMixin):
             Tuple[str, int, str, Optional[str], Optional[str], AnchorScope]
         ] = []
         self._logged_central_addresses = False
-        max_failures = self.secagg_config.get("max_aggregator_failure_rounds", 2)
-        try:
-            self._max_aggregator_failure_rounds = max(1, int(max_failures))
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid max_aggregator_failure_rounds=%s; defaulting to 2", max_failures
-            )
-            self._max_aggregator_failure_rounds = 2
-        self._consecutive_aggregator_failures = 0
 
         # Metrics tracking state
         self.prom_metrics: Optional[PrometheusMetrics] = None
@@ -2621,19 +2612,6 @@ class NodeService(HierarchyMixin):
                     self.stop_aggregator_server()
 
             if round_failed:
-                if aggregator_unreachable_this_round:
-                    self._consecutive_aggregator_failures += 1
-                    if self._consecutive_aggregator_failures >= self._max_aggregator_failure_rounds:
-                        should_stop = True
-                        stop_reason = "aggregator_unreachable"
-                        logger.error(
-                            "Stopping training: failed to reach aggregator %s for %d consecutive rounds",
-                            self.aggregator_id,
-                            self._consecutive_aggregator_failures,
-                        )
-                        break
-                else:
-                    self._consecutive_aggregator_failures = 0
                 retry_delay = 5
                 logger.warning(
                     "Round %d failed. Retrying after %ds once aggregator %s is reachable.",
@@ -2643,8 +2621,6 @@ class NodeService(HierarchyMixin):
                 )
                 time.sleep(retry_delay)
                 continue
-            else:
-                self._consecutive_aggregator_failures = 0
 
             # Phase 6: ECM gossip with convergence status (bridge nodes only)
             if cid and model_hash and self.is_bridge_node:
