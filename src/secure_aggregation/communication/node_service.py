@@ -2116,8 +2116,9 @@ class NodeService(HierarchyMixin):
         sync_result2 = self._check_sync_or_abort(response2, "round2")
         if sync_result2 is not None:
             return sync_result2
-        expected_survivors = len(self.clique_members) if self.clique_members else len(ordered_participants)
-        expected_survivors = max(expected_survivors, self.threshold)
+        # Use actual Round 0 participant count, not full clique size, because
+        # some clique members may have been excluded during Round 0 timeout.
+        expected_survivors = max(len(ordered_participants), self.threshold)
 
         def _survivor_goal_met(resp: secureagg_pb2.MaskedInputAck) -> bool:
             if not resp.survivors:
