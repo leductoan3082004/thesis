@@ -71,8 +71,8 @@ class TrafficRecorder:
     def _resolve_base_dir(base_dir: Optional[str]) -> Path:
         if base_dir:
             return Path(base_dir).expanduser()
-        # Default to <repo_root>/process-runner/
-        return Path(__file__).resolve().parents[3] / "process-runner"
+        # Default to <repo_root>/process-runtime/nodes-message
+        return Path(__file__).resolve().parents[3] / "process-runtime" / "nodes-message"
 
     def record(
         self,

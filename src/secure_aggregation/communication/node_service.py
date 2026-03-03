@@ -705,7 +705,7 @@ class NodeService(HierarchyMixin):
             return
         if self.clique_id < 0:
             return
-        base_dir = os.environ.get("PROCESS_RUNNER_DIR")
+        base_dir = os.environ.get("PROCESS_RUNTIME_DIR") or os.environ.get("PROCESS_RUNNER_DIR")
         self.traffic_recorder = TrafficRecorder.configure(
             self.node_id,
             self.clique_id,
