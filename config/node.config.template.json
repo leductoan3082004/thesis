@@ -41,7 +41,7 @@
       "jwt_state": "system"
     },
     "window_size": 10,
-    "alpha": 0.5,
+    "alpha": 1.0,
     "base_gamma": 0.4,
     "freshness_window": 300.0,
     "max_neighbors": 4
