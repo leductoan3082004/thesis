@@ -69,9 +69,10 @@ from secure_aggregation.topology import (
     is_bridge_node,
 )
 from secure_aggregation.utils import (
+    CommunicationTracker,
+    TrafficRecorder,
     configure_logging,
     get_logger,
-    CommunicationTracker,
     track_rpc_call,
 )
 from secure_aggregation.utils.prometheus_metrics import PrometheusMetrics
@@ -256,6 +257,7 @@ class NodeService(HierarchyMixin):
         self.aggregator_id: Optional[str] = None
         self.aggregator_address: Optional[str] = None
         self.aggregator_server: Optional[grpc.Server] = None
+        self.traffic_recorder: Optional[TrafficRecorder] = None
 
         # Clique membership from TTP
         self.clique_id: int = -1
@@ -688,6 +690,7 @@ class NodeService(HierarchyMixin):
                 logger.info(f"Retrieved {len(self.participants)} total participants")
 
                 channel.close()
+                self._ensure_traffic_recorder_initialized()
                 return
 
             except grpc.RpcError as e:
@@ -695,6 +698,19 @@ class NodeService(HierarchyMixin):
                 time.sleep(2)
 
         raise RuntimeError("Failed to connect to TTP after max retries")
+
+    def _ensure_traffic_recorder_initialized(self) -> None:
+        """Set up the CSV recorder as soon as clique metadata becomes available."""
+        if self.traffic_recorder is not None:
+            return
+        if self.clique_id < 0:
+            return
+        base_dir = os.environ.get("PROCESS_RUNNER_DIR")
+        self.traffic_recorder = TrafficRecorder.configure(
+            self.node_id,
+            self.clique_id,
+            base_dir=base_dir,
+        )
 
     def setup_data(self) -> None:
         """Setup dataset using config-driven loader with indices assigned by TTP or local partition."""
@@ -1583,12 +1599,17 @@ class NodeService(HierarchyMixin):
             return
 
         cluster_id = f"cluster_{self.clique_id}"
+        neighbor_items = list(self.neighbor_address_map.items())
+        neighbor_ids = [node for node, _ in neighbor_items]
+        neighbor_addresses = [addr for _, addr in neighbor_items]
         accepted = self.bridge_client.broadcast_ecm(
-            self.neighbor_bridge_addresses,
+            neighbor_addresses,
             cluster_id,
             round_num,
             cid,
             model_hash,
+            neighbor_ids=neighbor_ids,
+            package_type="ecm_gossip",
         )
         logger.info(
             f"Gossiped ECM to {accepted}/{len(self.neighbor_bridge_addresses)} neighbors"
@@ -1652,7 +1673,18 @@ class NodeService(HierarchyMixin):
                 ecms=ecm_messages,
             )
 
-            response = stub.SubmitECMs(request, timeout=10)
+            if self.comm_tracker:
+                self.comm_tracker.set_phase("ecm_forward")
+            response = self._invoke_tracked_rpc(
+                "SubmitECMs",
+                stub.SubmitECMs,
+                request,
+                timeout=10,
+                target_node_id=self.aggregator_id,
+                package_type="ecm_forward",
+                round_override=self.current_round,
+                additional_info=f"ecms={len(ecm_messages)}",
+            )
             if response.accepted:
                 logger.info(
                     f"Forwarded {len(fresh_ecms)} ECMs to aggregator {self.aggregator_id}"
@@ -1751,19 +1783,59 @@ class NodeService(HierarchyMixin):
         rpc_fn: Callable[..., Any],
         request: Any,
         timeout: int = 30,
+        *,
+        target_node_id: Optional[str] = None,
+        package_type: str = "grpc",
+        round_override: Optional[int] = None,
+        additional_info: str = "",
     ) -> Any:
         """Invoke an RPC and record request/response sizes for comm metrics."""
         start = time.monotonic()
         response = rpc_fn(request, timeout=timeout)
-        if self.comm_tracker is not None:
-            track_rpc_call(
-                request=request,
-                response=response,
-                method_name=rpc_name,
-                latency_ms=(time.monotonic() - start) * 1000.0,
-                tracker=self.comm_tracker,
-            )
+        req_bytes, resp_bytes = track_rpc_call(
+            request=request,
+            response=response,
+            method_name=rpc_name,
+            latency_ms=(time.monotonic() - start) * 1000.0,
+            tracker=self.comm_tracker,
+        )
+        self._record_rpc_bytes(
+            rpc_name,
+            request_bytes=req_bytes,
+            response_bytes=resp_bytes,
+            target_node_id=target_node_id,
+            package_type=package_type,
+            round_override=round_override,
+            additional_info=additional_info,
+        )
         return response
+
+    def _record_rpc_bytes(
+        self,
+        rpc_name: str,
+        *,
+        request_bytes: int,
+        response_bytes: int,
+        target_node_id: Optional[str],
+        package_type: str,
+        round_override: Optional[int],
+        additional_info: str,
+    ) -> None:
+        """Emit CSV records for a single RPC exchange if recording is enabled."""
+        if not self.traffic_recorder:
+            return
+        destination = target_node_id or self.aggregator_id or ""
+        round_idx = round_override if round_override is not None else self.current_round
+        self.traffic_recorder.record_bytes_exchange(
+            cmd=rpc_name,
+            package_type=package_type,
+            round_idx=round_idx,
+            source=self.node_id,
+            destination=destination,
+            request_size=request_bytes,
+            response_size=response_bytes,
+            additional_info=additional_info,
+        )
 
     @staticmethod
     def _merge_comm_stats(first: Dict[str, Any], second: Dict[str, Any]) -> Dict[str, Any]:
@@ -1918,6 +1990,8 @@ class NodeService(HierarchyMixin):
                     stub.Round0AdvertiseKeys,
                     round0_request,
                     timeout=self.sap_timeout_seconds,
+                    target_node_id=self.aggregator_id,
+                    package_type="sap",
                 )
                 break
             except grpc.RpcError as e:
@@ -1974,6 +2048,8 @@ class NodeService(HierarchyMixin):
                 stub.Round0AdvertiseKeys,
                 round0_request,
                 timeout=self.sap_timeout_seconds,
+                target_node_id=self.aggregator_id,
+                package_type="sap",
             )
             if not response.accepted:
                 sync_result = self._check_sync_or_abort(response, "round0_poll")
@@ -2026,6 +2102,8 @@ class NodeService(HierarchyMixin):
             stub.Round1ShareKeys,
             round1_request,
             timeout=self.sap_timeout_seconds,
+            target_node_id=self.aggregator_id,
+            package_type="sap",
         )
         sync_result1 = self._check_sync_or_abort(response1, "round1")
         if sync_result1 is not None:
@@ -2054,6 +2132,8 @@ class NodeService(HierarchyMixin):
                 stub.Round1ShareKeys,
                 round1_poll_request,
                 timeout=self.sap_timeout_seconds,
+                target_node_id=self.aggregator_id,
+                package_type="sap",
             )
             sync_result1 = self._check_sync_or_abort(response1, "round1_poll")
             if sync_result1 is not None:
@@ -2093,6 +2173,8 @@ class NodeService(HierarchyMixin):
                 stub.Round2MaskedInput,
                 round2_request,
                 timeout=self.sap_timeout_seconds,
+                target_node_id=self.aggregator_id,
+                package_type="sap",
             )
             masked_input_accepted = response2.accepted
             logger.debug(
@@ -2136,6 +2218,8 @@ class NodeService(HierarchyMixin):
                     stub.Round2MaskedInput,
                     round2_poll_request,
                     timeout=self.sap_timeout_seconds,
+                    target_node_id=self.aggregator_id,
+                    package_type="sap",
                 )
                 if response2.accepted:
                     masked_input_accepted = True
@@ -2189,6 +2273,8 @@ class NodeService(HierarchyMixin):
                 stub.Round3ConsistencyCheck,
                 round3_request,
                 timeout=self.sap_timeout_seconds,
+                target_node_id=self.aggregator_id,
+                package_type="sap",
             )
             sync_result3 = self._check_sync_or_abort(response3, "round3")
             if sync_result3 is not None:
@@ -2215,6 +2301,8 @@ class NodeService(HierarchyMixin):
                 stub.Round4Unmask,
                 round4_request,
                 timeout=self.sap_timeout_seconds,
+                target_node_id=self.aggregator_id,
+                package_type="sap",
             )
             sync_result4 = self._check_sync_or_abort(response4, "round4")
             if sync_result4 is not None:
@@ -2236,6 +2324,8 @@ class NodeService(HierarchyMixin):
                     stub.Round4Unmask,
                     round4_poll_request,
                     timeout=self.sap_timeout_seconds,
+                    target_node_id=self.aggregator_id,
+                    package_type="sap",
                 )
                 sync_result4 = self._check_sync_or_abort(response4, "round4_poll")
                 if sync_result4 is not None:
@@ -2258,6 +2348,9 @@ class NodeService(HierarchyMixin):
                 stub.GetGlobalModel,
                 model_request,
                 timeout=self.sap_timeout_seconds,
+                target_node_id=self.aggregator_id,
+                package_type="sap_model",
+                round_override=self.current_round,
             )
             aggregated = list(model_response.model_weights)
             logger.info(f"Received aggregated model ({len(aggregated)} parameters)")
@@ -2695,6 +2788,9 @@ class NodeService(HierarchyMixin):
                         stub.GetGlobalModel,
                         secureagg_pb2.ModelRequest(round=self.current_round),
                         timeout=10,
+                        target_node_id=self.aggregator_id,
+                        package_type="sap_model",
+                        round_override=self.current_round,
                     )
                 except grpc.RpcError as exc:
                     code = exc.code().name if hasattr(exc, "code") else "UNKNOWN"

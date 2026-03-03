@@ -1542,6 +1542,8 @@ class HierarchyMixin:
             cluster_round,
             payload_cid,
             payload_hash,
+            neighbor_ids=[aggregator_id],
+            package_type="scope_fanout",
         )
         hierarchy_logger.info(
             "Dispatched %s artifacts for round %d to aggregator %s (accepted=%d)",

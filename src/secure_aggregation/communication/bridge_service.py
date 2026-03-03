@@ -7,13 +7,14 @@ Bridge nodes use this service to:
 """
 
 from concurrent import futures
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import grpc
 
 from secure_aggregation.communication import secureagg_pb2, secureagg_pb2_grpc
 from secure_aggregation.node import ECM, ECMBuffer
 from secure_aggregation.utils import get_logger
+from secure_aggregation.utils.traffic_recorder import TrafficRecorder
 
 logger = get_logger("bridge_service")
 STATE_CHANNEL_PREFIX = "state::"
@@ -40,6 +41,36 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Bridge ECM hook raised error: %s", exc)
 
+    def _record_exchange(
+        self,
+        *,
+        cmd: str,
+        package_type: str,
+        round_idx: Optional[int],
+        source: str,
+        request: Optional[Any] = None,
+        response: Optional[Any] = None,
+        additional_info: str = "",
+    ) -> None:
+        recorder = TrafficRecorder.get_instance()
+        if not recorder:
+            return
+        req_size = request.ByteSize() if request is not None else 0
+        resp_size = response.ByteSize() if response is not None else 0
+        info = additional_info
+        if source:
+            info = f"{additional_info},peer={source}" if additional_info else f"peer={source}"
+        recorder.record_bytes_exchange(
+            cmd=cmd,
+            package_type=package_type,
+            round_idx=round_idx,
+            source=self.node_id,
+            destination=source,
+            request_size=req_size,
+            response_size=resp_size,
+            additional_info=info,
+        )
+
     def SubmitECMs(
         self,
         request: secureagg_pb2.ECMSubmitRequest,
@@ -56,10 +87,21 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
             self._emit_hooks(ecm)
             logger.debug(f"Received ECM submission: cid={ecm.cid[:8]}...")
 
-        return secureagg_pb2.ECMSubmitResponse(
+        received_count = len(request.ecms)
+        response = secureagg_pb2.ECMSubmitResponse(
             accepted=True,
-            message=f"Received {len(request.ecms)} ECMs",
+            message=f"Received {received_count} ECMs",
         )
+        self._record_exchange(
+            cmd="Bridge.SubmitECMs",
+            package_type="ecm_submission",
+            round_idx=None,
+            source=request.node_id or context.peer(),
+            request=request,
+            response=response,
+            additional_info=f"ecms={received_count}",
+        )
+        return response
 
     def ReceiveECM(
         self,
@@ -90,10 +132,21 @@ class BridgeServicer(secureagg_pb2_grpc.BridgeServiceServicer):
                 f"round {request.round}: cid={request.cid[:8]}..."
             )
 
-        return secureagg_pb2.ECMSubmitResponse(
+        response = secureagg_pb2.ECMSubmitResponse(
             accepted=True,
             message=f"Received ECM from cluster {request.cluster_id}",
         )
+        package = "ecm_gossip" if not is_state_channel else "scope_fanout"
+        self._record_exchange(
+            cmd="Bridge.ReceiveECM",
+            package_type=package,
+            round_idx=request.round,
+            source=request.cluster_id or context.peer(),
+            request=request,
+            response=response,
+            additional_info=f"cid={cid}",
+        )
+        return response
 
 
 class BridgeClient:
@@ -119,6 +172,9 @@ class BridgeClient:
         round_num: int,
         cid: str,
         model_hash: str,
+        *,
+        destination_node_id: Optional[str] = None,
+        package_type: str = "ecm_gossip",
     ) -> bool:
         """
         Send ECM to a neighbor cluster bridge node.
@@ -141,7 +197,34 @@ class BridgeClient:
                 cid=cid,
                 hash=model_hash,
             )
-            response = stub.ReceiveECM(request, timeout=10)
+            response = None
+            rpc_error: Optional[grpc.RpcError] = None
+            info = f"cid={cid},channel={cluster_id}"
+            try:
+                response = stub.ReceiveECM(request, timeout=10)
+            except grpc.RpcError as exc:
+                rpc_error = exc
+            finally:
+                recorder = TrafficRecorder.get_instance()
+                if recorder:
+                    extra = info
+                    if rpc_error is not None:
+                        status = rpc_error.code().name if hasattr(rpc_error, "code") else "error"
+                        extra = f"{info},error={status}"
+                    elif response is not None:
+                        extra = f"{info},accepted={response.accepted}"
+                    recorder.record_bytes_exchange(
+                        cmd="Bridge.ReceiveECM",
+                        package_type=package_type,
+                        round_idx=round_num,
+                        source=self.node_id,
+                        destination=destination_node_id or neighbor_address,
+                        request_size=request.ByteSize(),
+                        response_size=response.ByteSize() if response else 0,
+                        additional_info=extra,
+                    )
+            if rpc_error is not None:
+                raise rpc_error
             if response.accepted:
                 logger.debug(f"ECM sent to {neighbor_address}")
             return response.accepted
@@ -156,6 +239,9 @@ class BridgeClient:
         round_num: int,
         cid: str,
         model_hash: str,
+        *,
+        neighbor_ids: Optional[List[str]] = None,
+        package_type: str = "ecm_gossip",
     ) -> int:
         """
         Broadcast ECM to all neighbor cluster bridge nodes.
@@ -164,8 +250,19 @@ class BridgeClient:
             Number of neighbors that accepted the ECM.
         """
         accepted = 0
-        for addr in neighbor_addresses:
-            if self.send_ecm(addr, cluster_id, round_num, cid, model_hash):
+        for idx, addr in enumerate(neighbor_addresses):
+            dest_id = None
+            if neighbor_ids and idx < len(neighbor_ids):
+                dest_id = neighbor_ids[idx]
+            if self.send_ecm(
+                addr,
+                cluster_id,
+                round_num,
+                cid,
+                model_hash,
+                destination_node_id=dest_id,
+                package_type=package_type,
+            ):
                 accepted += 1
 
         if cluster_id.startswith(STATE_CHANNEL_PREFIX):
@@ -188,6 +285,9 @@ class BridgeClient:
         cid: str,
         model_hash: str,
         metadata: Optional[str] = None,
+        *,
+        destination_node_id: Optional[str] = None,
+        package_type: str = "scope_fanout",
     ) -> bool:
         """Send ECM with auxiliary metadata (used for state artifacts)."""
         try:
@@ -199,7 +299,34 @@ class BridgeClient:
                 hash=model_hash,
                 convergence_data_id=metadata or "",
             )
-            response = stub.ReceiveECM(request, timeout=10)
+            response = None
+            rpc_error: Optional[grpc.RpcError] = None
+            info = f"cid={cid},channel={cluster_id},metadata={metadata or ''}"
+            try:
+                response = stub.ReceiveECM(request, timeout=10)
+            except grpc.RpcError as exc:
+                rpc_error = exc
+            finally:
+                recorder = TrafficRecorder.get_instance()
+                if recorder:
+                    extra = info
+                    if rpc_error is not None:
+                        status = rpc_error.code().name if hasattr(rpc_error, "code") else "error"
+                        extra = f"{info},error={status}"
+                    elif response is not None:
+                        extra = f"{info},accepted={response.accepted}"
+                    recorder.record_bytes_exchange(
+                        cmd="Bridge.ReceiveECM",
+                        package_type=package_type,
+                        round_idx=round_num,
+                        source=self.node_id,
+                        destination=destination_node_id or neighbor_address,
+                        request_size=request.ByteSize(),
+                        response_size=response.ByteSize() if response else 0,
+                        additional_info=extra,
+                    )
+            if rpc_error is not None:
+                raise rpc_error
             if response.accepted:
                 logger.debug(f"ECM with metadata sent to {neighbor_address}")
             return response.accepted
@@ -215,10 +342,16 @@ class BridgeClient:
         cid: str,
         model_hash: str,
         metadata: Optional[str] = None,
+        *,
+        neighbor_ids: Optional[List[str]] = None,
+        package_type: str = "scope_fanout",
     ) -> int:
         """Broadcast ECM with optional metadata to all neighbor bridge nodes."""
         accepted = 0
-        for addr in neighbor_addresses:
+        for idx, addr in enumerate(neighbor_addresses):
+            dest_id = None
+            if neighbor_ids and idx < len(neighbor_ids):
+                dest_id = neighbor_ids[idx]
             if self.send_ecm_with_metadata(
                 addr,
                 cluster_id,
@@ -226,6 +359,8 @@ class BridgeClient:
                 cid,
                 model_hash,
                 metadata=metadata,
+                destination_node_id=dest_id,
+                package_type=package_type,
             ):
                 accepted += 1
         return accepted
