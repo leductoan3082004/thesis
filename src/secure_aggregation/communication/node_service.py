@@ -2869,6 +2869,13 @@ class NodeService(HierarchyMixin):
         # Setup data and model
         self.setup_data()
         self.setup_model()
+        if self.model is not None:
+            logger.info(
+                "Node %s using training model %s for dataset %s",
+                self.node_id,
+                self.model.__class__.__name__,
+                self.dataset_name,
+            )
 
         # Setup inter-cluster aggregation
         self.setup_inter_cluster()
