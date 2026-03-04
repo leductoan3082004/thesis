@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import atexit
 import csv
+import os
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl unavailable on Windows
+    fcntl = None
 
 
 class TrafficRecorder:
@@ -26,28 +32,44 @@ class TrafficRecorder:
         self.clique_id = clique_id
         root = self._resolve_base_dir(base_dir)
         root.mkdir(parents=True, exist_ok=True)
-        filename = f"messages-{self.node_id}.csv"
-        self.file_path = root / filename
+        self.file_path = root / "node-packets.csv"
         self._file_lock = threading.Lock()
-        new_file = not self.file_path.exists()
+        self._ensure_header()
         # Line buffering keeps the CSV flushed without excessive fsyncs.
         self._handle = self.file_path.open("a", newline="", buffering=1)
         self._writer = csv.writer(self._handle)
-        atexit.register(self._handle.close)
-        if new_file:
-            self._writer.writerow(
-                [
-                    "timestamp",
-                    "cmd",
-                    "direction",
-                    "package_type",
-                    "package_size",
-                    "round",
-                    "source",
-                    "destination",
-                    "additional_info",
-                ]
-            )
+        atexit.register(self._close_handle)
+
+    def _close_handle(self) -> None:
+        try:
+            self._handle.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ensure_header(self) -> None:
+        """Create the shared CSV with header if it does not exist."""
+        header = [
+            "timestamp",
+            "node_id",
+            "clique_id",
+            "cmd",
+            "direction",
+            "package_type",
+            "packet_bytes",
+            "round",
+            "peer_node",
+            "additional_info",
+        ]
+        with self.file_path.open("a+", newline="") as handle:
+            if fcntl is not None:  # pragma: no cover - Windows lacks fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                writer = csv.writer(handle)
+                writer.writerow(header)
+                handle.flush()
+            if fcntl is not None:  # pragma: no cover - Windows lacks fcntl
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
     @classmethod
     def configure(
@@ -87,22 +109,33 @@ class TrafficRecorder:
         additional_info: str = "",
     ) -> None:
         """Append a single traffic event to the CSV."""
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
-        dest = destination or "unknown"
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        peer = destination or "unknown"
         round_field = "" if round_idx is None else str(round_idx)
         row = [
             timestamp,
+            self.node_id,
+            str(self.clique_id),
             cmd,
             direction,
             package_type,
             str(int(package_size)),
             round_field,
-            source or "unknown",
-            dest,
+            peer,
             additional_info,
         ]
+        self._write_row(row)
+
+    def _write_row(self, row: list[str]) -> None:
         with self._file_lock:
-            self._writer.writerow(row)
+            try:
+                if fcntl is not None:  # pragma: no cover - Windows lacks fcntl
+                    fcntl.flock(self._handle, fcntl.LOCK_EX)
+                self._writer.writerow(row)
+                self._handle.flush()
+            finally:
+                if fcntl is not None:  # pragma: no cover - Windows lacks fcntl
+                    fcntl.flock(self._handle, fcntl.LOCK_UN)
 
     def record_bytes_exchange(
         self,

@@ -76,6 +76,7 @@ from secure_aggregation.utils import (
     track_rpc_call,
 )
 from secure_aggregation.utils.prometheus_metrics import PrometheusMetrics
+from secure_aggregation.utils.resource_monitor import SystemResourceMonitor
 
 logger = get_logger("node_service")
 
@@ -348,6 +349,7 @@ class NodeService(HierarchyMixin):
 
         # Metrics tracking state
         self.prom_metrics: Optional[PrometheusMetrics] = None
+        self.resource_monitor: Optional[SystemResourceMonitor] = None
         self.comm_tracker: Optional[CommunicationTracker] = None
         self.val_loader: Optional[DataLoader] = None
         self.train_indices: List[int] = []
@@ -2397,6 +2399,16 @@ class NodeService(HierarchyMixin):
         if pending_type:
             self.prom_metrics.set_topology_type(pending_type)
         self.comm_tracker = CommunicationTracker(self.node_id)
+        monitor_interval = float(self.config.get("resource_monitor_interval_seconds", 5.0) or 5.0)
+        metrics_dir = self.config.get("resource_metrics_dir")
+        self.resource_monitor = SystemResourceMonitor(
+            node_id=self.node_id,
+            clique_id=self.clique_id,
+            metrics=self.prom_metrics,
+            interval_seconds=monitor_interval,
+            csv_base_dir=metrics_dir,
+        )
+        self.resource_monitor.start()
 
         logger.info(
             f"Starting convergence-driven training (max_rounds={max_rounds}, "
@@ -2756,6 +2768,8 @@ class NodeService(HierarchyMixin):
         logger.info("\n" + "="*60)
         logger.info(f"Training completed after {self.current_round + 1} rounds (reason: {stop_reason or 'max_rounds'})")
         logger.info("="*60)
+        if self.resource_monitor:
+            self.resource_monitor.stop()
 
     def _await_aggregated_model(
         self,

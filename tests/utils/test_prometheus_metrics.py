@@ -76,3 +76,10 @@ def test_set_round_and_bytes(metrics):
     metrics.set_round(5)
     metrics.set_total_bytes_per_round(2048)
     assert True
+
+
+def test_resource_usage_metrics(metrics):
+    metrics.set_cpu_percent(42.5)
+    metrics.set_ram_percent(55.0)
+    metrics.set_gpu_percent(0.0)
+    assert True

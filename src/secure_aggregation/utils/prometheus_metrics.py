@@ -176,6 +176,21 @@ class PrometheusMetrics:
             "Total messages received",
             labels,
         )
+        self.cpu_percent = Gauge(
+            "fl_cpu_percent",
+            "System-wide CPU utilization percentage",
+            labels,
+        )
+        self.ram_percent = Gauge(
+            "fl_ram_percent",
+            "System memory utilization percentage",
+            labels,
+        )
+        self.gpu_percent = Gauge(
+            "fl_gpu_percent",
+            "GPU memory utilization percentage for the active device",
+            labels,
+        )
 
         self.topology_max_degree = Gauge(
             "fl_topology_max_degree",
@@ -334,6 +349,18 @@ class PrometheusMetrics:
     def add_messages_received(self, count: int) -> None:
         if PROMETHEUS_AVAILABLE:
             self.messages_received.labels(**self._labels()).inc(count)
+
+    def set_cpu_percent(self, percent: float) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.cpu_percent.labels(**self._labels()).set(percent)
+
+    def set_ram_percent(self, percent: float) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.ram_percent.labels(**self._labels()).set(percent)
+
+    def set_gpu_percent(self, percent: float) -> None:
+        if PROMETHEUS_AVAILABLE:
+            self.gpu_percent.labels(**self._labels()).set(percent)
 
     def set_topology_max_degree(self, max_degree: int) -> None:
         if PROMETHEUS_AVAILABLE:
