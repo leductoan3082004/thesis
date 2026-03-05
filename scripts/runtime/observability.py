@@ -39,6 +39,11 @@ def _dump_yaml(data: Any, path: Path) -> None:
         path.write_text(json.dumps(data, indent=2))
 
 
+def _promtail_disabled() -> bool:
+    value = os.environ.get("SKIP_PROMTAIL", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Loki
 # ---------------------------------------------------------------------------
@@ -202,7 +207,10 @@ def start_promtail(
     runtime_dir: Path,
     node_count: int,
     node_ids: Optional[List[str]] = None,
-) -> ManagedProcess:
+) -> Optional[ManagedProcess]:
+    if _promtail_disabled():
+        print("[observability] SKIP_PROMTAIL set; skipping Promtail startup.")
+        return None
     # Promtail opens one FD per file target; scale soft limit with cluster size.
     fd_target = max(8192, node_count * 64)
     new_limit = _ensure_nofile_limit(fd_target)

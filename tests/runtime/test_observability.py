@@ -125,6 +125,11 @@ class TestGeneratePromtailConfig:
         with pytest.raises(SystemExit, match="Promtail exited immediately"):
             start_promtail(tmp_path, node_count=2, node_ids=["trainer-node-001", "trainer-node-002"])
 
+    def test_start_promtail_skips_when_env_set(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SKIP_PROMTAIL", "1")
+        result = start_promtail(tmp_path, node_count=1)
+        assert result is None
+
 
 class TestGeneratePrometheusConfig:
     def test_creates_config_file(self, tmp_path):

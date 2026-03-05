@@ -235,8 +235,10 @@ def _cmd_start(args: argparse.Namespace) -> None:
 
             node_ids = [a["trainer_id"] for a in layout["assignments"]]
             promtail_proc = observability.start_promtail(PROCESS_RUNTIME_DIR, node_count, node_ids=node_ids)
-            registry.register(promtail_proc)
-            started.append(promtail_proc.name)
+            promtail_started = promtail_proc is not None
+            if promtail_proc:
+                registry.register(promtail_proc)
+                started.append(promtail_proc.name)
 
             prometheus_proc = observability.start_prometheus(
                 PROCESS_RUNTIME_DIR, node_count, args.base_metrics_port,
@@ -249,7 +251,10 @@ def _cmd_start(args: argparse.Namespace) -> None:
             started.append(grafana_proc.name)
 
             print("  Loki      -> http://localhost:3100")
-            print("  Promtail  -> http://localhost:9080")
+            if promtail_started:
+                print("  Promtail  -> http://localhost:9080")
+            else:
+                print("  Promtail  -> skipped (SKIP_PROMTAIL=1)")
             print("  Prometheus-> http://localhost:9090")
             print("  Grafana   -> http://localhost:3000 (admin/admin)")
 
