@@ -133,6 +133,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round2_lock = threading.Lock()
         self._round4_lock = threading.Lock()
         self._round4_computing: bool = False
+        self._round0_failed: bool = False
 
         # ECM buffer for receiving ECMs from bridge nodes
         self.ecm_buffer = ecm_buffer
@@ -208,6 +209,18 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             return False
         return (time.monotonic() - self._round0_opened_at) >= self._timeout_seconds
 
+    def _abort_round0_shortfall_locked(self, committed: int) -> None:
+        if self._round0_failed:
+            return
+        self._round0_finalized = True
+        self._round0_failed = True
+        logger.warning(
+            "SAP-Round 0 aborted after %.1fs (participants=%d, threshold=%d)",
+            time.monotonic() - self._round0_opened_at,
+            committed,
+            self.threshold,
+        )
+
     def _round2_timeout_elapsed(self) -> bool:
         if self._timeout_seconds <= 0:
             return False
@@ -224,18 +237,21 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             logger.info("SAP-Round 0 finalized after accepting all %d participants", total)
             self._activate_committed_participants_locked()
             return
-        if committed >= self.threshold and self._round0_timeout_elapsed_locked():
-            self._round0_finalized = True
-            elapsed = time.monotonic() - self._round0_opened_at
-            logger.info(
-                "SAP-Round 0 finalized after timeout (participants=%d, threshold=%d, timeout=%.1fs, elapsed=%.1fs)",
-                committed,
-                self.threshold,
-                self._timeout_seconds,
-                elapsed,
-            )
-            self._committed_adverts = self.aggregator.broadcast_advertisements()
-            self._activate_committed_participants_locked()
+        if self._round0_timeout_elapsed_locked():
+            if committed >= self.threshold:
+                self._round0_finalized = True
+                elapsed = time.monotonic() - self._round0_opened_at
+                logger.info(
+                    "SAP-Round 0 finalized after timeout (participants=%d, threshold=%d, timeout=%.1fs, elapsed=%.1fs)",
+                    committed,
+                    self.threshold,
+                    self._timeout_seconds,
+                    elapsed,
+                )
+                self._committed_adverts = self.aggregator.broadcast_advertisements()
+                self._activate_committed_participants_locked()
+            else:
+                self._abort_round0_shortfall_locked(committed)
 
     def _activate_committed_participants_locked(self) -> None:
         committed_ids = [adv.node_id for adv in self._committed_adverts]
@@ -308,6 +324,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         response_message = "Waiting for more participants"
         with self._round0_lock:
             if self._round0_finalized and node_id not in self._adverts:
+                if self._round0_failed:
+                    return secureagg_pb2.KeyAdvertisementAck(
+                        accepted=False,
+                        message="Round 0 aborted due to insufficient participants",
+                        all_keys=[],
+                        server_round=server_round,
+                        sync_code=secureagg_pb2.ROUND_SYNC_AHEAD,
+                    )
                 logger.warning("Rejected key advertisement from %s: Round 0 already finalized", node_id)
                 return secureagg_pb2.KeyAdvertisementAck(
                     accepted=False,
@@ -357,6 +381,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
 
             self._finalize_round0_if_ready_locked()
             if self._round0_finalized:
+                if self._round0_failed:
+                    return secureagg_pb2.KeyAdvertisementAck(
+                        accepted=False,
+                        message="Round 0 aborted due to insufficient participants",
+                        all_keys=[],
+                        server_round=server_round,
+                        sync_code=secureagg_pb2.ROUND_SYNC_AHEAD,
+                    )
                 self._committed_adverts = self.aggregator.broadcast_advertisements()
                 response_keys = self._encoded_committed_adverts()
                 response_message = "SAP-Round 0 OK"
@@ -1064,6 +1096,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round2_opened_at = time.monotonic()
         self._round0_opened_at = time.monotonic()
         self._round4_computing = False
+        self._round0_failed = False
         self.current_round = round_idx
         self._plaintext_updates.clear()
         self._plaintext_vector_length = None

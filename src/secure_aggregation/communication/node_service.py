@@ -3,7 +3,6 @@
 import argparse
 import copy
 import json
-import math
 import os
 import re
 import socket
@@ -365,7 +364,6 @@ class NodeService(HierarchyMixin):
         self._last_model_hash: Optional[str] = None
         self._last_model_data_id: Optional[str] = None
         self._sap_retry_counts: Dict[int, int] = defaultdict(int)
-        self._dropout_threshold_adjusted = False
         self.central_metadata = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
         self._bootstrap_anchors: List[
@@ -448,36 +446,6 @@ class NodeService(HierarchyMixin):
         if attempts > 0:
             return None
         return self._sap_dropout_manager.stage_for(self.node_id, round_idx)
-
-    def _estimate_dropout_allowance_per_clique(self, clique_size: int) -> int:
-        if clique_size <= 1 or self._sap_dropout_count <= 0:
-            return 0
-        total_nodes = len(self.participants) or int(self.dataset_config.get("num_clients", clique_size))
-        if total_nodes <= 0:
-            total_nodes = clique_size
-        total_cliques = max(1, math.ceil(total_nodes / clique_size))
-        estimated = math.ceil(self._sap_dropout_count / total_cliques)
-        return min(max(estimated, 0), clique_size - 1)
-
-    def _maybe_adjust_threshold_for_dropouts(self) -> None:
-        if self._dropout_threshold_adjusted or self._sap_dropout_count <= 0:
-            return
-        clique_size = len(self.clique_members)
-        if clique_size <= 1:
-            return
-        allowance = self._estimate_dropout_allowance_per_clique(clique_size)
-        if allowance <= 0:
-            return
-        new_threshold = max(2, clique_size - allowance)
-        if new_threshold < self.threshold:
-            logger.info(
-                "Adjusting SAP threshold from %d to %d to tolerate ~%d dropout(s) per clique",
-                self.threshold,
-                new_threshold,
-                allowance,
-            )
-            self.threshold = new_threshold
-        self._dropout_threshold_adjusted = True
 
     def _resolve_sap_timeout(self) -> float:
         """Determine the unified SAP timeout (RPC calls and aggregator round wait)."""
@@ -794,7 +762,6 @@ class NodeService(HierarchyMixin):
                 self.participants = list(participants_response.participants)
                 self.participant_map = {p.node_id: p.address for p in self.participants}
                 logger.info(f"Retrieved {len(self.participants)} total participants")
-                self._maybe_adjust_threshold_for_dropouts()
 
                 channel.close()
                 self._ensure_traffic_recorder_initialized()
