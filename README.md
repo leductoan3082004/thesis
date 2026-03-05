@@ -533,6 +533,16 @@ process-runtime/
 | `make test` | Run unit tests |
 | `make test-coverage` | Run tests with coverage |
 
+### Simulating SAP Dropouts
+
+Set `DROP_OUT_NODES=<count>` when running `make start` to randomly select that many nodes per cluster round that will skip the SAP contribution (their models are excluded from that round's clique aggregate). Example:
+
+```bash
+make start NODES_MAP=config/nodes-map.json CLIQUE_SIZE=3 DROP_OUT_NODES=3
+```
+
+All nodes share the same deterministic schedule (controlled via optional `DROP_OUT_SEED`), so every process agrees on who drops each round. Aggregators always remain active coordinators; if a round selects an aggregator they participate normally to keep the clique running, but other selected nodes will drop either before Round 0 or prior to submitting the masked vector in Round 2.
+
 ## Troubleshooting
 
 ### Port Conflicts

@@ -45,7 +45,15 @@ from secure_aggregation.config.system import load_system_config
 from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition
 from secure_aggregation.data.datasets import get_labels, load_dataset
-from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
+from secure_aggregation.node import (
+    DropoutManager,
+    DropoutStage,
+    ECM,
+    ECMBuffer,
+    NodeEngine,
+    NodeRuntimeConfig,
+    ReliabilityScore,
+)
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
 from secure_aggregation.state import HierarchyLevelConfig, StateAggregator
@@ -198,6 +206,9 @@ class NodeService(HierarchyMixin):
         self.aggregator_port_offset = self._resolve_port_offset("aggregator_port_offset", 1000)
         self.bridge_port_offset = self._resolve_port_offset("bridge_port_offset", 2000)
         self._aggregator_port_guard: Optional[socket.socket] = None
+        self._sap_dropout_count = self._resolve_sap_dropout_count()
+        self._sap_dropout_seed = self._resolve_sap_dropout_seed()
+        self._sap_dropout_manager: Optional[DropoutManager] = None
         self._bridge_port_guard: Optional[socket.socket] = None
         self._port_guard_notices: Set[str] = set()
         self._initialize_port_guards()
@@ -353,6 +364,7 @@ class NodeService(HierarchyMixin):
         self._last_model_cid: Optional[str] = None
         self._last_model_hash: Optional[str] = None
         self._last_model_data_id: Optional[str] = None
+        self._sap_retry_counts: Dict[int, int] = defaultdict(int)
         self.central_metadata = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
         self._bootstrap_anchors: List[
@@ -387,6 +399,54 @@ class NodeService(HierarchyMixin):
             logger.warning("%s=%s cannot be negative; defaulting to %d", key, value, default)
             return default
         return offset
+
+    def _resolve_sap_dropout_count(self) -> int:
+        raw_value = os.environ.get("DROP_OUT_NODES")
+        if raw_value is None or str(raw_value).strip() == "":
+            return 0
+        try:
+            parsed = int(str(raw_value).strip())
+        except ValueError:
+            logger.warning("Ignoring invalid DROP_OUT_NODES=%r (expected integer)", raw_value)
+            return 0
+        return max(0, parsed)
+
+    def _resolve_sap_dropout_seed(self) -> int:
+        raw_value = os.environ.get("DROP_OUT_SEED")
+        if raw_value is None or str(raw_value).strip() == "":
+            return 0
+        try:
+            return int(str(raw_value).strip())
+        except ValueError:
+            logger.warning("Invalid DROP_OUT_SEED=%r; defaulting to 0", raw_value)
+            return 0
+
+    def _initialize_dropout_manager(self) -> None:
+        """Instantiate dropout manager once the full roster is known."""
+        if self._sap_dropout_manager or self._sap_dropout_count <= 0:
+            return
+        participants = sorted(self.participant_map.keys())
+        if not participants:
+            return
+        self._sap_dropout_manager = DropoutManager(
+            participants=participants,
+            per_round=self._sap_dropout_count,
+            seed=self._sap_dropout_seed,
+        )
+        logger.info(
+            "SAP dropout simulation enabled: per_round=%d (participants=%d, seed=%d)",
+            self._sap_dropout_count,
+            len(participants),
+            self._sap_dropout_seed,
+        )
+
+    def _dropout_decision_for_round(self, round_idx: int) -> Optional[DropoutStage]:
+        if not self._sap_dropout_manager:
+            return None
+        attempts = self._sap_retry_counts.get(round_idx, 0)
+        if attempts > 0:
+            return None
+        return self._sap_dropout_manager.stage_for(self.node_id, round_idx)
 
     def _resolve_sap_timeout(self) -> float:
         """Determine the unified SAP timeout (RPC calls and aggregator round wait)."""
@@ -2032,7 +2092,7 @@ class NodeService(HierarchyMixin):
                 )
             time.sleep(delay)
 
-    def run_secure_aggregation_round(self) -> "SapResult":
+    def run_secure_aggregation_round(self, dropout_stage: Optional[DropoutStage] = None) -> "SapResult":
         """Run one round of secure aggregation protocol."""
         if not self.secure_aggregation_enabled:
             return self._run_plaintext_aggregation_round()
@@ -2046,11 +2106,11 @@ class NodeService(HierarchyMixin):
 
         channel = self._create_aggregator_channel(agg_addr)
         try:
-            return self._run_sap_rounds(channel, agg_addr)
+            return self._run_sap_rounds(channel, agg_addr, dropout_stage=dropout_stage)
         finally:
             channel.close()
 
-    def _run_sap_rounds(self, channel, agg_addr: str) -> "SapResult":
+    def _run_sap_rounds(self, channel, agg_addr: str, dropout_stage: Optional[DropoutStage] = None) -> "SapResult":
         """Execute SAP Rounds 0-4 on an already-opened gRPC channel."""
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
@@ -2060,6 +2120,14 @@ class NodeService(HierarchyMixin):
             signing_private=self.signing_keypair.private_key if self.signing_keypair else None,
             signing_public=self.signing_keypair.public_key if self.signing_keypair else None,
         )
+
+        if dropout_stage == DropoutStage.BEFORE_ROUND0:
+            logger.info(
+                "SAP dropout: %s skipping entire protocol before Round 0 for round %d",
+                self.node_id,
+                self.current_round + 1,
+            )
+            return SapResult()
 
         # SAP Round 0: Advertise keys
         logger.info("SAP-Round 0: Advertising keys")
@@ -2253,6 +2321,14 @@ class NodeService(HierarchyMixin):
         # Record Round 1 timing
         if self.prom_metrics:
             self.prom_metrics.observe_sap_phase("round1", time.monotonic() - sap_r1_start)
+
+        if dropout_stage == DropoutStage.BEFORE_MASKED_INPUT:
+            logger.info(
+                "SAP dropout: %s skipping masked input submission for round %d",
+                self.node_id,
+                self.current_round + 1,
+            )
+            return SapResult()
 
         # SAP Round 2: Send masked input
         logger.info("SAP-Round 2: Sending masked model")
@@ -2575,9 +2651,22 @@ class NodeService(HierarchyMixin):
 
                 # Phase 2: Secure aggregation
                 logger.info("Phase 2: Secure aggregation")
+                dropout_stage = self._dropout_decision_for_round(round_idx)
+                if dropout_stage and self.is_aggregator:
+                    logger.info(
+                        "Dropout stage %s selected for aggregator; forcing participation to keep round active",
+                        dropout_stage.value,
+                    )
+                    dropout_stage = None
+                if dropout_stage:
+                    logger.warning(
+                        "Simulating SAP dropout (%s) for round %d",
+                        dropout_stage.value,
+                        round_idx + 1,
+                    )
                 sap_start = time.monotonic()
                 try:
-                    sap_result = self.run_secure_aggregation_round()
+                    sap_result = self.run_secure_aggregation_round(dropout_stage=dropout_stage)
                 except GlobalStopRequested:
                     raise
                 finally:
@@ -2816,6 +2905,7 @@ class NodeService(HierarchyMixin):
 
             if round_failed:
                 retry_delay = 5
+                self._sap_retry_counts[round_idx] = self._sap_retry_counts.get(round_idx, 0) + 1
                 logger.warning(
                     "Round %d failed. Retrying after %ds once aggregator %s is reachable.",
                     round_idx + 1,
@@ -2859,6 +2949,7 @@ class NodeService(HierarchyMixin):
             self._process_high_level_rounds()
 
             time.sleep(5)
+            self._sap_retry_counts.pop(round_idx, None)
             self.current_round += 1
 
         self._log_final_model_status()
@@ -3045,6 +3136,7 @@ class NodeService(HierarchyMixin):
                 self.register_with_ttp()
             logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
 
+        self._initialize_dropout_manager()
         self._log_scope_aggregator_candidates()
 
         if inter_edges:

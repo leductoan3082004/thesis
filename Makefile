@@ -31,8 +31,12 @@ CLIQUE_SIZE ?= 3
 NODES_MAP ?=
 STATE_MAP ?=
 NO_SAP ?= 0
+DROP_OUT_NODES ?= 0
+DROP_OUT_SEED ?=
 
 export NO_SAP
+export DROP_OUT_NODES
+export DROP_OUT_SEED
 
 MAP_PATH := $(strip $(if $(NODES_MAP),$(NODES_MAP),$(STATE_MAP)))
 
