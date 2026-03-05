@@ -30,6 +30,9 @@ NODES ?= 6
 CLIQUE_SIZE ?= 3
 NODES_MAP ?=
 STATE_MAP ?=
+NO_SAP ?= 0
+
+export NO_SAP
 
 MAP_PATH := $(strip $(if $(NODES_MAP),$(NODES_MAP),$(STATE_MAP)))
 
@@ -60,6 +63,7 @@ help:
 	@echo "  CLIQUE_SIZE=N           Size of each clique (default: 3)"
 	@echo "  NODES_MAP=path          Hierarchical node roster (overrides NODES)"
 	@echo "  STATE_MAP=path          Legacy alias for NODES_MAP"
+	@echo "  NO_SAP=1                Disable secure aggregation (plaintext clique rounds)"
 	@echo "  BLOCKCHAIN_REPO_URL=... Override thesis-blockchain git URL"
 	@echo ""
 	@echo "Examples:"

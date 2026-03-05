@@ -216,6 +216,19 @@ class NodeService(HierarchyMixin):
         self.sap_timeout_seconds = self._resolve_sap_timeout()
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
+        secagg_enabled = bool(self.secagg_config.get("enabled", True))
+        env_no_sap = os.getenv("NO_SAP")
+        if env_no_sap is not None:
+            env_flag = env_no_sap.strip().lower()
+            if env_flag in ("1", "true", "yes", "on"):
+                secagg_enabled = False
+            elif env_flag in ("0", "false", "no", "off"):
+                secagg_enabled = True
+        self.secure_aggregation_enabled = bool(secagg_enabled)
+        if not self.secure_aggregation_enabled:
+            logger.warning(
+                "Secure aggregation disabled via configuration/NO_SAP — running plaintext aggregation rounds"
+            )
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
         default_round_cap = 200
         system_training_cfg = (self.system_config or {}).get("training") if self.system_config else None
@@ -1150,6 +1163,7 @@ class NodeService(HierarchyMixin):
                 ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
                 convergence_signal_handler=convergence_handler,
                 timeout_seconds=self.sap_timeout_seconds,
+                plaintext_mode=not self.secure_aggregation_enabled,
             )
         except PortBindingError:
             logger.error(
@@ -1936,8 +1950,92 @@ class NodeService(HierarchyMixin):
         # PASSIVE_WAIT (STALE / FINALIZED): node is genuinely behind.
         return self._handle_passive_sync(stage, self.current_round, server_round, sync_code)
 
+    def _run_plaintext_aggregation_round(self) -> "SapResult":
+        """Aggregate quantized models without secure masking."""
+        self._abort_if_global_stop()
+        logger.info(f"Starting plaintext aggregation round {self.current_round}")
+        agg_addr = self._aggregator_rpc_address()
+        if not agg_addr:
+            raise AggregatorUnavailable("Aggregator address unavailable")
+
+        channel = self._create_aggregator_channel(agg_addr)
+        stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
+        try:
+            self.comm_tracker.set_phase("plaintext_submit")
+            model_vec = flatten_params(self.model)
+            quantized = quantize_vector(model_vec, self.scale)
+            update_request = secureagg_pb2.PlaintextUpdate(
+                node_id=self.node_id,
+                round=self.current_round,
+                model_weights=[float(v) for v in quantized],
+            )
+            response = self._invoke_tracked_rpc(
+                "SubmitPlaintextUpdate",
+                stub.SubmitPlaintextUpdate,
+                update_request,
+                timeout=self.sap_timeout_seconds,
+                target_node_id=self.aggregator_id,
+                package_type="plaintext",
+                round_override=self.current_round,
+            )
+            sync_result = self._check_sync_or_abort(response, "plaintext_submit")
+            if sync_result is not None:
+                return sync_result
+
+            aggregated: List[float] = []
+            if self.is_aggregator:
+                aggregated = self._wait_for_plaintext_model(stub)
+            return SapResult(aggregated_weights=aggregated)
+        except grpc.RpcError as exc:
+            code = exc.code().name if hasattr(exc, "code") else "UNKNOWN"
+            raise AggregatorUnavailable(
+                f"Plaintext aggregation RPC failed (stage=submit, code={code})"
+            ) from exc
+        finally:
+            channel.close()
+
+    def _wait_for_plaintext_model(self, stub) -> List[float]:
+        """Poll the aggregator until the unmasked aggregate is published."""
+        self.comm_tracker.set_phase("plaintext_wait")
+        delay = 2
+        attempts = 0
+        while True:
+            self._abort_if_global_stop()
+            try:
+                response = self._invoke_tracked_rpc(
+                    "GetGlobalModel",
+                    stub.GetGlobalModel,
+                    secureagg_pb2.ModelRequest(round=self.current_round),
+                    timeout=self.sap_timeout_seconds,
+                    target_node_id=self.aggregator_id,
+                    package_type="sap_model",
+                    round_override=self.current_round,
+                )
+            except grpc.RpcError as exc:
+                code = exc.code().name if hasattr(exc, "code") else "UNKNOWN"
+                raise AggregatorUnavailable(
+                    f"Aggregator {self.aggregator_id} unreachable during plaintext model fetch "
+                    f"(attempt {attempts + 1}, code={code})"
+                ) from exc
+
+            if response.model_weights:
+                logger.info("Plaintext aggregation complete with %d parameters", len(response.model_weights))
+                return list(response.model_weights)
+
+            attempts += 1
+            if attempts % 5 == 0:
+                logger.info(
+                    "Aggregator %s still finalizing plaintext model (attempt %d); waiting %ds",
+                    self.aggregator_id,
+                    attempts,
+                    delay,
+                )
+            time.sleep(delay)
+
     def run_secure_aggregation_round(self) -> "SapResult":
         """Run one round of secure aggregation protocol."""
+        if not self.secure_aggregation_enabled:
+            return self._run_plaintext_aggregation_round()
         self._abort_if_global_stop()
         logger.info(f"Starting secure aggregation round {self.current_round}")
 

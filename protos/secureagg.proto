@@ -46,6 +46,8 @@ service AggregatorService {
   rpc Round2MaskedInput(MaskedInputMessage) returns (MaskedInputAck);
   rpc Round3ConsistencyCheck(ConsistencySignature) returns (ConsistencyAck);
   rpc Round4Unmask(UnmaskShares) returns (UnmaskAck);
+  // Plaintext fallback when secure aggregation is disabled.
+  rpc SubmitPlaintextUpdate(PlaintextUpdate) returns (PlaintextAck);
   rpc GetGlobalModel(ModelRequest) returns (ModelResponse);
   // Bridge nodes forward ECMs to aggregator for inter-cluster merge
   rpc SubmitECMs(ECMSubmitRequest) returns (ECMSubmitResponse);
@@ -149,6 +151,22 @@ message UnmaskAck {
   bool aggregation_complete = 3;
   int32 server_round = 4;
   RoundSyncCode sync_code = 5;
+}
+
+// Plaintext aggregation (no SAP)
+message PlaintextUpdate {
+  string node_id = 1;
+  int32 round = 2;
+  repeated float model_weights = 3;
+}
+
+message PlaintextAck {
+  bool accepted = 1;
+  string message = 2;
+  bool aggregation_complete = 3;
+  int32 submissions = 4;
+  int32 server_round = 5;
+  RoundSyncCode sync_code = 6;
 }
 
 // Model distribution
