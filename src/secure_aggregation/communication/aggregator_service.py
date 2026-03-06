@@ -266,7 +266,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 key=lambda adv: adv.node_id,
             )
             self._round0_broadcast_keys = self._encoded_committed_adverts()
-            logger.info("SAP-Round 0 finalized after accepting all %d participants", total)
+            committed_ids = [adv.node_id for adv in self._committed_adverts]
+            self._active_threshold = max(1, min(self.threshold, len(committed_ids)))
+            logger.info(
+                "SAP-Round 0 finalized after accepting all %d participants: %s (threshold=%d)",
+                total,
+                ", ".join(committed_ids),
+                self._active_threshold,
+            )
             self._activate_committed_participants_locked()
             return
         if self._round0_timeout_elapsed_locked():
@@ -285,6 +292,14 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     key=lambda adv: adv.node_id,
                 )
                 self._round0_broadcast_keys = self._encoded_committed_adverts()
+                committed_ids = [adv.node_id for adv in self._committed_adverts]
+                self._active_threshold = max(1, min(self.threshold, len(committed_ids)))
+                logger.info(
+                    "SAP-Round 0 finalized after timeout with %d participants: %s (threshold=%d)",
+                    committed,
+                    ", ".join(committed_ids),
+                    self._active_threshold,
+                )
                 self._activate_committed_participants_locked()
             else:
                 self._abort_round0_shortfall_locked(committed)
@@ -303,12 +318,6 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             self.aggregator.receive_advertisements(self._committed_adverts)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to reapply committed adverts after Round 0 finalization: %s", exc)
-        logger.info(
-            "Activated %d Round 0 participants: %s (threshold=%d)",
-            len(self.participant_ids),
-            ", ".join(sorted(self.participant_ids)),
-            self._active_threshold,
-        )
     def _encoded_committed_adverts(self) -> List[secureagg_pb2.KeyAdvertisement]:
         return [
             secureagg_pb2.KeyAdvertisement(

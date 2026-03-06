@@ -2474,6 +2474,10 @@ class NodeService(HierarchyMixin):
 
         survived_round2 = self.node_id in response2.survivors
         if not survived_round2:
+            if self.is_aggregator:
+                raise AggregatorUnavailable(
+                    f"Aggregator {self.node_id} excluded from survivor list; restarting round"
+                )
             logger.warning("SAP-Round 2 dropout detected; skipping rounds 3/4 and awaiting aggregation result")
             response3 = None
             response4 = secureagg_pb2.UnmaskAck(accepted=False, message="Node not a survivor", aggregation_complete=False)
