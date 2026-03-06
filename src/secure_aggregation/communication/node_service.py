@@ -2226,7 +2226,10 @@ class NodeService(HierarchyMixin):
                 return self._handle_passive_sync("round0", self.current_round, self.current_round, 0)
             raise RuntimeError(f"Round 0 failed: {response.message}")
 
-        # Wait until we receive at least the threshold number of advertisements.
+        # Wait until we receive at least the full clique roster (or whatever the
+        # aggregator finalized after a timeout).  This prevents nodes from
+        # entering Round 1 with an incomplete participant list, which would break
+        # pairwise key derivation.
         clique_size = len(self.clique_members) if self.clique_members else len(self.participant_map)
         required_participants = max(clique_size, self.threshold, 1)
 
@@ -2237,12 +2240,21 @@ class NodeService(HierarchyMixin):
             else:
                 logger.info("SAP-Round 0 progress: no participants yet")
 
-        def _is_round0_finalized(resp: secureagg_pb2.KeyAdvertisementAck) -> bool:
+        def _round0_finalized(resp: secureagg_pb2.KeyAdvertisementAck) -> bool:
             message = (resp.message or "").lower()
-            return "sap-round 0" in message or "round 0 finalized" in message
+            if not message:
+                return False
+            tokens = (
+                "sap-round 0 ok",
+                "sap-round 0 finalized",
+                "round 0 finalized",
+                "sap-round 0 aborted",
+                "round 0 aborted",
+            )
+            return any(token in message for token in tokens)
 
         _log_round0_progress(response.all_keys)
-        if _is_round0_finalized(response):
+        if _round0_finalized(response):
             required_participants = max(1, len(response.all_keys))
         while len(response.all_keys) < required_participants:
             self._abort_if_global_stop()
@@ -2271,7 +2283,7 @@ class NodeService(HierarchyMixin):
                     return self._handle_passive_sync("round0_poll", self.current_round, self.current_round, 0)
 
             _log_round0_progress(response.all_keys)
-            if _is_round0_finalized(response):
+            if _round0_finalized(response):
                 required_participants = max(1, len(response.all_keys))
                 break
 
@@ -2281,12 +2293,18 @@ class NodeService(HierarchyMixin):
 
         # Pass received advertisements to client
         ordered_participants = [p.node_id for p in response.all_keys]
-        if not self.is_aggregator:
-            roster_preview = ", ".join(ordered_participants)
+        if len(ordered_participants) < clique_size:
+            logger.warning(
+                "SAP-Round 0 finalized after timeout with %d/%d participants: %s",
+                len(ordered_participants),
+                clique_size,
+                ", ".join(ordered_participants),
+            )
+        else:
             logger.info(
                 "SAP-Round 0 finalized roster (%d participants): %s",
                 len(ordered_participants),
-                roster_preview,
+                ", ".join(ordered_participants),
             )
         adverts = [
             AdvertiseMessage(
