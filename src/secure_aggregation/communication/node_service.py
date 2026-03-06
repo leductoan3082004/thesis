@@ -2227,8 +2227,8 @@ class NodeService(HierarchyMixin):
             raise RuntimeError(f"Round 0 failed: {response.message}")
 
         # Wait until we receive at least the threshold number of advertisements.
-        clique_size = len(self.clique_members) if self.clique_members else 0
-        required_participants = max(self.threshold, clique_size, 1)
+        clique_size = len(self.clique_members) if self.clique_members else len(self.participant_map)
+        required_participants = max(clique_size, self.threshold, 1)
 
         def _log_round0_progress(keys: Sequence[secureagg_pb2.KeyAdvertisement]) -> None:
             ids = sorted({adv.node_id for adv in keys})
@@ -2416,18 +2416,13 @@ class NodeService(HierarchyMixin):
                 return
             logger.info("SAP-Round 2 progress: %d participant(s) -> %s", len(ids), ", ".join(sorted(ids)))
         _log_round2_survivors(response2.survivors)
-        # Use actual Round 0 participant count, not full clique size, because
-        # some clique members may have been excluded during Round 0 timeout.
-        expected_survivors = max(len(ordered_participants), self.threshold)
+        # Require the same roster that completed Round 0 to appear in the survivor list.
+        expected_survivors = len(ordered_participants)
 
         def _survivor_goal_met(resp: secureagg_pb2.MaskedInputAck) -> bool:
             if not resp.survivors:
                 return False
-            if len(resp.survivors) >= expected_survivors:
-                return True
-            if resp.timed_out and len(resp.survivors) >= self.threshold:
-                return True
-            return False
+            return len(resp.survivors) >= expected_survivors
 
         # Wait for survivors list
         while not _survivor_goal_met(response2):
@@ -2467,14 +2462,19 @@ class NodeService(HierarchyMixin):
         survivor_count = len(response2.survivors)
         if not masked_input_accepted:
             logger.warning("SAP-Round 2 masked input may not have been accepted by aggregator")
-        if response2.timed_out or survivor_count < expected_survivors:
+        if survivor_count < expected_survivors:
             survivor_list = ", ".join(sorted(response2.survivors))
             logger.warning(
-                "SAP-Round 2 proceeding after timeout with survivors: %s",
+                "SAP-Round 2 incomplete survivors (expected %d, got %d): %s",
+                expected_survivors,
+                survivor_count,
                 survivor_list,
             )
-        else:
-            logger.info(f"SAP-Round 2 complete: {survivor_count} survivors")
+            raise AggregatorUnavailable(
+                f"Aggregator {self.aggregator_id} finalized Round 2 with insufficient survivors "
+                f"({survivor_count}/{expected_survivors})"
+            )
+        logger.info(f"SAP-Round 2 complete: {survivor_count} survivors")
 
         if not self.is_aggregator:
             survivor_preview = ", ".join(sorted(response2.survivors))
