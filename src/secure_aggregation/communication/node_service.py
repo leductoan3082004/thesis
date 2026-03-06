@@ -2237,7 +2237,13 @@ class NodeService(HierarchyMixin):
             else:
                 logger.info("SAP-Round 0 progress: no participants yet")
 
+        def _is_round0_finalized(resp: secureagg_pb2.KeyAdvertisementAck) -> bool:
+            message = (resp.message or "").lower()
+            return "sap-round 0" in message or "round 0 finalized" in message
+
         _log_round0_progress(response.all_keys)
+        if _is_round0_finalized(response):
+            required_participants = max(1, len(response.all_keys))
         while len(response.all_keys) < required_participants:
             self._abort_if_global_stop()
             time.sleep(1)
@@ -2265,6 +2271,9 @@ class NodeService(HierarchyMixin):
                     return self._handle_passive_sync("round0_poll", self.current_round, self.current_round, 0)
 
             _log_round0_progress(response.all_keys)
+            if _is_round0_finalized(response):
+                required_participants = max(1, len(response.all_keys))
+                break
 
         # Record Round 0 timing
         if self.prom_metrics:
