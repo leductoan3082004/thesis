@@ -262,8 +262,9 @@ class InterClusterAggregator:
             max_neighbors=self.merge_config.max_neighbors,
         )
         logger.info(
-            f"Round {round_num}: merged with {len(merged_cids)} neighbor models, "
-            f"clipping threshold={self.merger.get_current_threshold():.4f}"
+            "Round %d: merged with %d neighbor models",
+            round_num,
+            len(merged_cids),
         )
 
         cid, model_hash = self.publish_model(merged_model, round_num)

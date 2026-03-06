@@ -131,23 +131,24 @@ This blends 30% state model with 70% local, preserving cluster training momentum
 
 **Symptom:** Cliques converge to different accuracy levels (34%, 39%, 46%).
 
-**Root cause:** Adaptive gamma formula `gamma = base_gamma / (1 + alpha * avg_disagreement)`
-with `base_gamma=0.2` and `alpha=0.5` yields very small mixing weights when disagreement
-is high (common early in training). Effective gamma can drop to 0.05-0.10, meaning only
-5-10% weight is given to neighbor clusters.
+**Root cause:** The previous convex combination relied on `gamma = base_gamma / (1 + alpha * avg_disagreement)`.
+When disagreement was high (common early in training) gamma collapsed to ~0.05, so neighbor
+signals barely influenced the clique model.
 
 **Files:**
-- Formula: `src/secure_aggregation/protocol/inter_cluster.py:82`
-- Config: `config/node.config.template.json:43-44`
+- Merge logic: `src/secure_aggregation/protocol/inter_cluster.py`
+- Config: `config/node.config.template.json`
 
-**Solution:** Increase `base_gamma` from 0.2 to 0.4 to allow more cross-clique learning.
+**Solution:** Replace the gamma-based convex combination with simple D-SGD:
+average the local model with all verified neighbor models directly. This gives each
+participant equal weight and removes the fragile `base_gamma` / `alpha` knobs.
 
-```json
-"inter_cluster": {
-    "alpha": 0.5,
-    "base_gamma": 0.4
-}
+```python
+theta_final = np.mean([theta_local] + neighbor_models, axis=0)
 ```
+
+**Config Impact:** `alpha`, `base_gamma`, and clipping-related knobs were removed from
+`inter_cluster` configs; only `max_neighbors` remains configurable.
 
 ---
 
@@ -209,7 +210,7 @@ convergence should be faster and plateau around 100 rounds.
 | 2 | 1 local epoch | HIGH | Increase to 5 | +10-15% accuracy |
 | 3 | LR=0.1, no scheduler | HIGH | LR=0.01 + cosine decay | +3-5% accuracy |
 | 4 | State replace policy | MEDIUM | Switch to interpolate(0.3) | +3-5% accuracy |
-| 5 | Conservative inter-cluster gamma | MEDIUM | base_gamma 0.2 -> 0.4 | +2-3% accuracy |
+| 5 | Conservative inter-cluster merge | MEDIUM | Switch to D-SGD averaging | +2-3% accuracy |
 | 6 | No data augmentation | LOW-MEDIUM | Add RandomCrop + HFlip | +2-5% accuracy |
 | 7 | Only 49 rounds | LOW | Run to 150-200 rounds | Full convergence |
 
@@ -226,4 +227,4 @@ Recommended order for incremental testing:
 4. **Run 150+ rounds** to verify convergence
 5. **State replace -> interpolate** (config change)
 6. **Add augmentation** (requires train/test transform separation)
-7. **Tune base_gamma** (config change, test last)
+7. **Verify D-SGD merge** (code change, test last)

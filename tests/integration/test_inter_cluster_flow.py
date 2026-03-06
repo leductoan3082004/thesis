@@ -4,7 +4,7 @@ End-to-end integration test for inter-cluster aggregation flow.
 This test verifies the complete inter-cluster aggregation pipeline:
 1. ECM buffer receives and stores references from neighbor clusters
 2. InterClusterAggregator fetches and verifies models from IPFS
-3. InterClusterMerger performs adaptive clipping and weighted merge
+3. InterClusterMerger performs decentralized averaging
 4. Merged model is published to IPFS and anchored on blockchain
 5. Bridge nodes can gossip ECMs to neighbor clusters
 """
@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
-import pytest
 
 from secure_aggregation.communication.bridge_service import BridgeClient
 from secure_aggregation.communication.inter_cluster_aggregator import InterClusterAggregator
@@ -74,13 +73,13 @@ class TestInterClusterFlowIntegration:
                 cluster_id="cluster_0",
                 ipfs=ipfs,
                 blockchain=blockchain,
-                merge_config=MergeConfig(window_size=10, alpha=0.5, base_gamma=0.2),
+                merge_config=MergeConfig(),
             )
             agg_c1 = InterClusterAggregator(
                 cluster_id="cluster_1",
                 ipfs=ipfs,
                 blockchain=blockchain,
-                merge_config=MergeConfig(window_size=10, alpha=0.5, base_gamma=0.2),
+                merge_config=MergeConfig(),
             )
 
             # Cluster 0 receives ECM from Cluster 1
@@ -175,46 +174,6 @@ class TestInterClusterFlowIntegration:
             original_variance = np.var([m.mean() for m in models.values()])
             merged_variance = np.var([m.mean() for m in merged_models.values()])
             assert merged_variance < original_variance
-
-    def test_adaptive_clipping_across_rounds(self) -> None:
-        """
-        Test that adaptive clipping threshold adjusts across multiple rounds.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ipfs_path = str(Path(tmpdir) / "ipfs")
-            blockchain_path = str(Path(tmpdir) / "blockchain.json")
-
-            ipfs = MockIPFS(storage_path=ipfs_path)
-            blockchain = MockBlockchain(storage_path=blockchain_path)
-
-            agg = InterClusterAggregator(
-                cluster_id="cluster_0",
-                ipfs=ipfs,
-                blockchain=blockchain,
-                merge_config=MergeConfig(window_size=5, alpha=0.5, base_gamma=0.2),
-            )
-
-            local_model = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            thresholds = []
-
-            for round_num in range(5):
-                # Neighbor model gets progressively more different
-                neighbor_model = np.array([1.0, 1.0, 1.0], dtype=np.float32) * (round_num + 1)
-                cid = ipfs.add(neighbor_model)
-                h = compute_model_hash(neighbor_model)
-                blockchain.anchor("cluster_1", round_num=round_num, cid=cid, hash_val=h)
-
-                agg.ecm_buffer.clear()
-                ecm = ECM(cid=cid, hash=h, source_cluster="cluster_1")
-                agg.receive_ecms("bridge", [ecm])
-
-                merged, _, _ = agg.process_round(local_model, round_num)
-                thresholds.append(agg.inter_cluster_aggregator.get_current_threshold()
-                                  if hasattr(agg, 'inter_cluster_aggregator') else
-                                  agg.merger.get_current_threshold())
-
-            # Threshold should increase as norms increase
-            assert thresholds[-1] > thresholds[0]
 
     def test_publish_and_retrieve_model(self) -> None:
         """Test model publishing to IPFS and blockchain anchoring."""

@@ -1309,9 +1309,6 @@ class NodeService(HierarchyMixin):
             self._hydrate_anchor_bootstrap()
 
         merge_config = MergeConfig(
-            window_size=self.inter_cluster_config.get("window_size", 10),
-            alpha=self.inter_cluster_config.get("alpha", 0.5),
-            base_gamma=self.inter_cluster_config.get("base_gamma", 0.2),
             max_neighbors=self.inter_cluster_config.get("max_neighbors"),
         )
 
