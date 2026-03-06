@@ -3,6 +3,7 @@
 import argparse
 import copy
 import json
+import math
 import os
 import re
 import socket
@@ -364,6 +365,7 @@ class NodeService(HierarchyMixin):
         self._last_model_hash: Optional[str] = None
         self._last_model_data_id: Optional[str] = None
         self._sap_retry_counts: Dict[int, int] = defaultdict(int)
+        self._dropout_stage_plan: Dict[int, Optional[DropoutStage]] = {}
         self.central_metadata = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
         self._bootstrap_anchors: List[
@@ -439,17 +441,26 @@ class NodeService(HierarchyMixin):
             self._sap_dropout_seed,
         )
 
+    def _planned_dropout_stage(self, round_idx: int) -> Optional[DropoutStage]:
+        if round_idx not in self._dropout_stage_plan and self._sap_dropout_manager:
+            stage = self._sap_dropout_manager.stage_for(self.node_id, round_idx)
+            self._dropout_stage_plan[round_idx] = stage
+            if stage:
+                logger.info(
+                    "Preplanned SAP dropout for round %d: %s",
+                    round_idx + 1,
+                    stage.value,
+                )
+        return self._dropout_stage_plan.get(round_idx)
+
     def _dropout_decision_for_round(self, round_idx: int) -> Optional[DropoutStage]:
-        if not self._sap_dropout_manager:
+        if self._sap_retry_counts.get(round_idx, 0) > 0:
             return None
-        attempts = self._sap_retry_counts.get(round_idx, 0)
-        if attempts > 0:
-            return None
-        return self._sap_dropout_manager.stage_for(self.node_id, round_idx)
+        return self._planned_dropout_stage(round_idx)
 
     def _resolve_sap_timeout(self) -> float:
         """Determine the unified SAP timeout (RPC calls and aggregator round wait)."""
-        default_timeout = 30.0
+        default_timeout = 60.0
         timeout_value: Any = self.secagg_config.get("timeout_seconds", default_timeout)
         if self.system_config and isinstance(self.system_config, dict):
             system_secagg_cfg = self.system_config.get("secure_agg")
@@ -467,6 +478,23 @@ class NodeService(HierarchyMixin):
                 default_timeout,
             )
             return default_timeout
+
+    def _apply_clique_threshold(self) -> None:
+        if not self.clique_members:
+            return
+        clique_size = len(self.clique_members)
+        if clique_size <= 0:
+            return
+        target = max(2, math.ceil((2 * clique_size) / 3))
+        target = min(target, clique_size)
+        if target != self.threshold:
+            logger.info(
+                "Adjusting SAP threshold for clique size %d: %d -> %d",
+                clique_size,
+                self.threshold,
+                target,
+            )
+            self.threshold = target
 
     def _initialize_port_guards(self) -> None:
         """Reserve aggregator/bridge ports so the OS never assigns them to ephemeral sockets."""
@@ -735,6 +763,7 @@ class NodeService(HierarchyMixin):
                     # Use clique threshold if provided, otherwise fall back to config
                     if self.clique_threshold > 0:
                         self.threshold = self.clique_threshold
+                    self._apply_clique_threshold()
 
                 logger.info(
                     f"Registered with TTP: clique={self.clique_id}, "
@@ -2199,6 +2228,15 @@ class NodeService(HierarchyMixin):
 
         # Wait until we receive at least the threshold number of advertisements.
         required_participants = max(self.threshold, 1)
+
+        def _log_round0_progress(keys: Sequence[secureagg_pb2.KeyAdvertisement]) -> None:
+            ids = sorted({adv.node_id for adv in keys})
+            if ids:
+                logger.info("SAP-Round 0 progress: received %d participants -> %s", len(ids), ", ".join(ids))
+            else:
+                logger.info("SAP-Round 0 progress: no participants yet")
+
+        _log_round0_progress(response.all_keys)
         while len(response.all_keys) < required_participants:
             self._abort_if_global_stop()
             time.sleep(1)
@@ -2225,7 +2263,7 @@ class NodeService(HierarchyMixin):
                 if "finalized" in (response.message or "").lower():
                     return self._handle_passive_sync("round0_poll", self.current_round, self.current_round, 0)
 
-            logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
+            _log_round0_progress(response.all_keys)
 
         # Record Round 0 timing
         if self.prom_metrics:
@@ -2364,6 +2402,12 @@ class NodeService(HierarchyMixin):
         sync_result2 = self._check_sync_or_abort(response2, "round2")
         if sync_result2 is not None:
             return sync_result2
+        def _log_round2_survivors(ids: Sequence[str]) -> None:
+            if not ids:
+                logger.info("SAP-Round 2 progress: waiting for survivors list")
+                return
+            logger.info("SAP-Round 2 progress: %d participant(s) -> %s", len(ids), ", ".join(sorted(ids)))
+        _log_round2_survivors(response2.survivors)
         # Use actual Round 0 participant count, not full clique size, because
         # some clique members may have been excluded during Round 0 timeout.
         expected_survivors = max(len(ordered_participants), self.threshold)
@@ -2404,6 +2448,7 @@ class NodeService(HierarchyMixin):
                     response2.timed_out,
                     list(response2.survivors),
                 )
+                _log_round2_survivors(response2.survivors)
             except grpc.RpcError as exc:
                 logger.error("SAP-Round 2 polling RPC failed: %s", exc)
                 raise
@@ -2597,6 +2642,8 @@ class NodeService(HierarchyMixin):
             if self._process_high_level_rounds():
                 continue
             round_idx = self.current_round
+            if self._sap_dropout_manager:
+                self._planned_dropout_stage(round_idx)
             comm_round_idx = round_idx
             comm_round_shifted = False
             round_start_time = time.monotonic()
@@ -2949,6 +2996,7 @@ class NodeService(HierarchyMixin):
 
             time.sleep(5)
             self._sap_retry_counts.pop(round_idx, None)
+            self._dropout_stage_plan.pop(round_idx, None)
             self.current_round += 1
 
         self._log_final_model_status()

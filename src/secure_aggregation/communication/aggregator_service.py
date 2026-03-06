@@ -121,10 +121,12 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round_snapshots: Dict[int, secureagg_pb2.ModelResponse] = {}
         self._committed_adverts: List[AdvertiseMessage] = []
         self._round0_finalized: bool = False
+        self._round0_broadcast_keys: List[secureagg_pb2.KeyAdvertisement] = []
         self._round2_finalized: bool = False
         self._round2_survivors: List[str] = []
         self._round2_waiting_on_aggregator: bool = False
         self._round2_timed_out: bool = False
+        self._round2_failed: bool = False
         self._active_threshold = max(1, min(self.threshold, len(self.participant_ids)))
         self._timeout_seconds = max(0.0, timeout_seconds)
         self._round0_opened_at = time.monotonic()
@@ -221,10 +223,36 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             self.threshold,
         )
 
+    def _abort_round2_shortfall_locked(self, masked_count: int) -> None:
+        if self._round2_failed:
+            return
+        self._round2_finalized = True
+        self._round2_failed = True
+        self._round2_survivors = []
+        self._round2_waiting_on_aggregator = False
+        logger.warning(
+            "SAP-Round 2 aborted after %.1fs (masked_inputs=%d, threshold=%d)",
+            time.monotonic() - self._round2_opened_at,
+            masked_count,
+            self._active_threshold,
+        )
+
     def _round2_timeout_elapsed(self) -> bool:
         if self._timeout_seconds <= 0:
             return False
         return (time.monotonic() - self._round2_opened_at) >= self._timeout_seconds
+
+    def _encoded_current_adverts(self) -> List[secureagg_pb2.KeyAdvertisement]:
+        adverts = sorted(self._adverts.values(), key=lambda adv: adv.node_id)
+        return [
+            secureagg_pb2.KeyAdvertisement(
+                node_id=adv.node_id,
+                c_public_key=adv.c_public,
+                s_public_key=adv.s_public,
+                signature=adv.signature,
+            )
+            for adv in adverts
+        ]
 
     def _finalize_round0_if_ready_locked(self) -> None:
         if self._round0_finalized:
@@ -233,7 +261,11 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         total = len(self.all_participant_ids)
         if committed >= total and total > 0:
             self._round0_finalized = True
-            self._committed_adverts = self.aggregator.broadcast_advertisements()
+            self._committed_adverts = sorted(
+                self.aggregator.broadcast_advertisements(),
+                key=lambda adv: adv.node_id,
+            )
+            self._round0_broadcast_keys = self._encoded_committed_adverts()
             logger.info("SAP-Round 0 finalized after accepting all %d participants", total)
             self._activate_committed_participants_locked()
             return
@@ -248,7 +280,11 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     self._timeout_seconds,
                     elapsed,
                 )
-                self._committed_adverts = self.aggregator.broadcast_advertisements()
+                self._committed_adverts = sorted(
+                    self.aggregator.broadcast_advertisements(),
+                    key=lambda adv: adv.node_id,
+                )
+                self._round0_broadcast_keys = self._encoded_committed_adverts()
                 self._activate_committed_participants_locked()
             else:
                 self._abort_round0_shortfall_locked(committed)
@@ -389,19 +425,18 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                         server_round=server_round,
                         sync_code=secureagg_pb2.ROUND_SYNC_AHEAD,
                     )
-                self._committed_adverts = self.aggregator.broadcast_advertisements()
-                response_keys = self._encoded_committed_adverts()
+                response_keys = list(self._round0_broadcast_keys)
                 response_message = "SAP-Round 0 OK"
             else:
-                response_keys = []
+                response_keys = self._encoded_current_adverts()
                 response_message = "Waiting for more participants"
-            if self._round0_finalized and node_id not in self._adverts:
+            if self._round0_finalized and node_id not in self._adverts and not self._round0_failed:
                 return secureagg_pb2.KeyAdvertisementAck(
-                    accepted=False,
-                    message="Round 0 finalized",
-                    all_keys=response_keys,
+                    accepted=True,
+                    message="SAP-Round 0 OK",
+                    all_keys=list(self._round0_broadcast_keys),
                     server_round=server_round,
-                    sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
+                    sync_code=secureagg_pb2.ROUND_SYNC_OK,
                 )
 
         return secureagg_pb2.KeyAdvertisementAck(
@@ -503,6 +538,15 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
             try:
                 if self._round2_finalized:
                     survivors = list(self._round2_survivors)
+                    if self._round2_failed:
+                        return secureagg_pb2.MaskedInputAck(
+                            accepted=False,
+                            message="Round 2 aborted due to insufficient participants",
+                            survivors=[],
+                            timed_out=True,
+                            server_round=server_round,
+                            sync_code=secureagg_pb2.ROUND_SYNC_AHEAD,
+                        )
                     if node_id in self.aggregator.masked_inputs:
                         return secureagg_pb2.MaskedInputAck(
                             accepted=True,
@@ -536,6 +580,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 threshold_met = masked_count >= self._active_threshold
                 aggregator_submitted = self.node_id in self.aggregator.masked_inputs
                 total_expected = len(self.participant_ids)
+                current_masked = sorted(self.aggregator.masked_inputs.keys())
                 if threshold_met and not aggregator_submitted:
                     if not self._round2_waiting_on_aggregator:
                         logger.info(
@@ -547,7 +592,7 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                     return secureagg_pb2.MaskedInputAck(
                         accepted=True,
                         message="Waiting for aggregator masked input",
-                        survivors=[],
+                        survivors=current_masked,
                         timed_out=False,
                         server_round=server_round,
                         sync_code=secureagg_pb2.ROUND_SYNC_OK,
@@ -587,10 +632,20 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                         server_round=server_round,
                         sync_code=secureagg_pb2.ROUND_SYNC_OK,
                     )
+                if self._round2_timeout_elapsed() and masked_count < self._active_threshold:
+                    self._abort_round2_shortfall_locked(masked_count)
+                    return secureagg_pb2.MaskedInputAck(
+                        accepted=False,
+                        message="Round 2 aborted due to insufficient participants",
+                        survivors=[],
+                        timed_out=True,
+                        server_round=server_round,
+                        sync_code=secureagg_pb2.ROUND_SYNC_AHEAD,
+                    )
                 return secureagg_pb2.MaskedInputAck(
                     accepted=True,
                     message="Waiting for more participants",
-                    survivors=[],
+                    survivors=current_masked,
                     timed_out=False,
                     server_round=server_round,
                     sync_code=secureagg_pb2.ROUND_SYNC_OK,
@@ -638,6 +693,13 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
             )
 
+        if self._round2_failed:
+            return secureagg_pb2.ConsistencyAck(
+                accepted=False,
+                message="Round 2 aborted due to insufficient participants",
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_AHEAD,
+            )
         if self._round2_finalized and node_id not in self.aggregator.survivors:
             logger.warning("Rejected signature from %s: not a survivor", node_id)
             return secureagg_pb2.ConsistencyAck(
@@ -712,16 +774,6 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
             )
 
-        if self._round2_finalized and node_id not in self.aggregator.survivors:
-            logger.warning("Rejected unmask shares from %s: not a survivor", node_id)
-            return secureagg_pb2.UnmaskAck(
-                accepted=False,
-                message="Node not a survivor",
-                aggregation_complete=False,
-                server_round=server_round,
-                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
-            )
-
         # Fast-path for polling nodes: background computation already finished.
         if self.aggregated_result is not None:
             return secureagg_pb2.UnmaskAck(
@@ -730,6 +782,23 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
                 aggregation_complete=True,
                 server_round=server_round,
                 sync_code=secureagg_pb2.ROUND_SYNC_OK,
+            )
+        if self._round2_failed:
+            return secureagg_pb2.UnmaskAck(
+                accepted=False,
+                message="Round 2 aborted due to insufficient participants",
+                aggregation_complete=False,
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_AHEAD,
+            )
+        if self._round2_finalized and node_id not in self.aggregator.survivors:
+            logger.warning("Rejected unmask shares from %s: not a survivor", node_id)
+            return secureagg_pb2.UnmaskAck(
+                accepted=False,
+                message="Node not a survivor",
+                aggregation_complete=False,
+                server_round=server_round,
+                sync_code=secureagg_pb2.ROUND_SYNC_FINALIZED,
             )
 
         try:
@@ -1097,6 +1166,8 @@ class AggregatorServicer(secureagg_pb2_grpc.AggregatorServiceServicer):
         self._round0_opened_at = time.monotonic()
         self._round4_computing = False
         self._round0_failed = False
+        self._round0_broadcast_keys = []
+        self._round2_failed = False
         self.current_round = round_idx
         self._plaintext_updates.clear()
         self._plaintext_vector_length = None

@@ -543,6 +543,8 @@ make start NODES_MAP=config/nodes-map.json CLIQUE_SIZE=3 DROP_OUT_NODES=3
 
 All nodes share the same deterministic schedule (controlled via optional `DROP_OUT_SEED`), so every process agrees on who drops each round. Aggregators always remain active coordinators; if a round selects an aggregator they participate normally to keep the clique running, but other selected nodes will drop either before Round 0 or prior to submitting the masked vector in Round 2.
 
+Every clique enforces a quorum of `ceil(2/3 * clique_size)` survivors (never less than 2) before SAP can finish, so dropouts reduce throughput but cannot halt the cluster entirely.
+
 ## Troubleshooting
 
 ### Port Conflicts
