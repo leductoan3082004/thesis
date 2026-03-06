@@ -460,7 +460,7 @@ class NodeService(HierarchyMixin):
 
     def _resolve_sap_timeout(self) -> float:
         """Determine the unified SAP timeout (RPC calls and aggregator round wait)."""
-        default_timeout = 60.0
+        default_timeout = 30.0
         timeout_value: Any = self.secagg_config.get("timeout_seconds", default_timeout)
         if self.system_config and isinstance(self.system_config, dict):
             system_secagg_cfg = self.system_config.get("secure_agg")
@@ -2227,7 +2227,8 @@ class NodeService(HierarchyMixin):
             raise RuntimeError(f"Round 0 failed: {response.message}")
 
         # Wait until we receive at least the threshold number of advertisements.
-        required_participants = max(self.threshold, 1)
+        clique_size = len(self.clique_members) if self.clique_members else 0
+        required_participants = max(self.threshold, clique_size, 1)
 
         def _log_round0_progress(keys: Sequence[secureagg_pb2.KeyAdvertisement]) -> None:
             ids = sorted({adv.node_id for adv in keys})
@@ -2271,6 +2272,13 @@ class NodeService(HierarchyMixin):
 
         # Pass received advertisements to client
         ordered_participants = [p.node_id for p in response.all_keys]
+        if not self.is_aggregator:
+            roster_preview = ", ".join(ordered_participants)
+            logger.info(
+                "SAP-Round 0 finalized roster (%d participants): %s",
+                len(ordered_participants),
+                roster_preview,
+            )
         adverts = [
             AdvertiseMessage(
                 node_id=p.node_id,
@@ -2467,6 +2475,15 @@ class NodeService(HierarchyMixin):
             )
         else:
             logger.info(f"SAP-Round 2 complete: {survivor_count} survivors")
+
+        if not self.is_aggregator:
+            survivor_preview = ", ".join(sorted(response2.survivors))
+            logger.info(
+                "SAP-Round 2 survivors for round %d (%d participants): %s",
+                self.current_round + 1,
+                survivor_count,
+                survivor_preview or "none",
+            )
 
         # Record Round 2 timing
         if self.prom_metrics:
