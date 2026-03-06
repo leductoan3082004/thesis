@@ -2422,7 +2422,11 @@ class NodeService(HierarchyMixin):
         def _survivor_goal_met(resp: secureagg_pb2.MaskedInputAck) -> bool:
             if not resp.survivors:
                 return False
-            return len(resp.survivors) >= expected_survivors
+            if len(resp.survivors) >= expected_survivors:
+                return True
+            if resp.timed_out and len(resp.survivors) >= self.threshold:
+                return True
+            return False
 
         # Wait for survivors list
         while not _survivor_goal_met(response2):
@@ -2462,19 +2466,14 @@ class NodeService(HierarchyMixin):
         survivor_count = len(response2.survivors)
         if not masked_input_accepted:
             logger.warning("SAP-Round 2 masked input may not have been accepted by aggregator")
-        if survivor_count < expected_survivors:
+        if response2.timed_out or survivor_count < expected_survivors:
             survivor_list = ", ".join(sorted(response2.survivors))
             logger.warning(
-                "SAP-Round 2 incomplete survivors (expected %d, got %d): %s",
-                expected_survivors,
-                survivor_count,
+                "SAP-Round 2 proceeding after timeout with survivors: %s",
                 survivor_list,
             )
-            raise AggregatorUnavailable(
-                f"Aggregator {self.aggregator_id} finalized Round 2 with insufficient survivors "
-                f"({survivor_count}/{expected_survivors})"
-            )
-        logger.info(f"SAP-Round 2 complete: {survivor_count} survivors")
+        else:
+            logger.info(f"SAP-Round 2 complete: {survivor_count} survivors")
 
         if not self.is_aggregator:
             survivor_preview = ", ".join(sorted(response2.survivors))
