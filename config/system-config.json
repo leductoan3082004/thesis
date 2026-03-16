@@ -9,6 +9,11 @@
     "patience": 3,
     "signal_timeout": 30.0
   },
+  "cluster_stale_detection": {
+    "round_gap": 5,
+    "seconds": 300,
+    "retry_count": 5
+  },
   "hierarchy_defaults": {
     "collection_timeout_seconds": 60.0,
     "digest_timeout_seconds": 5.0,

@@ -7,6 +7,7 @@ import math
 import os
 import re
 import socket
+import threading
 import time
 from collections import deque, defaultdict
 from pathlib import Path
@@ -45,7 +46,15 @@ from secure_aggregation.config.system import load_system_config
 from secure_aggregation.crypto.sign import SigningKeyPair
 from secure_aggregation.data import dirichlet_partition
 from secure_aggregation.data.datasets import get_labels, load_dataset
-from secure_aggregation.node import ECM, ECMBuffer, NodeEngine, NodeRuntimeConfig, ReliabilityScore
+from secure_aggregation.node import (
+    DropoutManager,
+    DropoutStage,
+    ECM,
+    ECMBuffer,
+    NodeEngine,
+    NodeRuntimeConfig,
+    ReliabilityScore,
+)
 from secure_aggregation.protocol import MergeConfig, SecureAggregationNode
 from secure_aggregation.protocol.core import AdvertiseMessage, Round1Ciphertext, SHARE_BYTES, _int_to_bytes
 from secure_aggregation.state import HierarchyLevelConfig, StateAggregator
@@ -198,6 +207,9 @@ class NodeService(HierarchyMixin):
         self.aggregator_port_offset = self._resolve_port_offset("aggregator_port_offset", 1000)
         self.bridge_port_offset = self._resolve_port_offset("bridge_port_offset", 2000)
         self._aggregator_port_guard: Optional[socket.socket] = None
+        self._sap_dropout_count = self._resolve_sap_dropout_count()
+        self._sap_dropout_seed = self._resolve_sap_dropout_seed()
+        self._sap_dropout_manager: Optional[DropoutManager] = None
         self._bridge_port_guard: Optional[socket.socket] = None
         self._port_guard_notices: Set[str] = set()
         self._initialize_port_guards()
@@ -216,6 +228,19 @@ class NodeService(HierarchyMixin):
         self.sap_timeout_seconds = self._resolve_sap_timeout()
         self.threshold = self.secagg_config["threshold"]
         self.scale = self.secagg_config["scale"]
+        secagg_enabled = bool(self.secagg_config.get("enabled", True))
+        env_no_sap = os.getenv("NO_SAP")
+        if env_no_sap is not None:
+            env_flag = env_no_sap.strip().lower()
+            if env_flag in ("1", "true", "yes", "on"):
+                secagg_enabled = False
+            elif env_flag in ("0", "false", "no", "off"):
+                secagg_enabled = True
+        self.secure_aggregation_enabled = bool(secagg_enabled)
+        if not self.secure_aggregation_enabled:
+            logger.warning(
+                "Secure aggregation disabled via configuration/NO_SAP — running plaintext aggregation rounds"
+            )
         env_rounds = os.getenv("MAX_TRAINING_ROUNDS")
         default_round_cap = 200
         system_training_cfg = (self.system_config or {}).get("training") if self.system_config else None
@@ -285,6 +310,14 @@ class NodeService(HierarchyMixin):
         self.ipfs: Optional[IPFSInterface] = None
         self.blockchain: Optional[BlockchainInterface] = None
         self.ecm_forward_wait = float(self.inter_cluster_config.get("ecm_forward_wait_seconds", 5.0))
+        stale_cfg = self.system_config.get("cluster_stale_detection") or {}
+        self.cluster_stale_round_gap = max(1, int(stale_cfg.get("round_gap", 5)))
+        self.cluster_stale_seconds = max(0.0, float(stale_cfg.get("seconds", 300.0)))
+        self.cluster_stale_retry_limit = max(1, int(stale_cfg.get("retry_count", 5)))
+        self._last_cluster_round: int = -1
+        self._last_cluster_publish_ts: float = 0.0
+        self._neighbor_cluster_rounds: Dict[str, Tuple[int, float]] = {}
+        self._neighbor_round_lock = threading.Lock()
 
         # State-level aggregation (hierarchy) state
         (
@@ -340,6 +373,8 @@ class NodeService(HierarchyMixin):
         self._last_model_cid: Optional[str] = None
         self._last_model_hash: Optional[str] = None
         self._last_model_data_id: Optional[str] = None
+        self._sap_retry_counts: Dict[int, int] = defaultdict(int)
+        self._dropout_stage_plan: Dict[int, Optional[DropoutStage]] = {}
         self.central_metadata = None
         self.aggregator_servicer: Optional[AggregatorServicer] = None
         self._bootstrap_anchors: List[
@@ -375,9 +410,66 @@ class NodeService(HierarchyMixin):
             return default
         return offset
 
+    def _resolve_sap_dropout_count(self) -> int:
+        raw_value = os.environ.get("DROP_OUT_NODES")
+        if raw_value is None or str(raw_value).strip() == "":
+            return 0
+        try:
+            parsed = int(str(raw_value).strip())
+        except ValueError:
+            logger.warning("Ignoring invalid DROP_OUT_NODES=%r (expected integer)", raw_value)
+            return 0
+        return max(0, parsed)
+
+    def _resolve_sap_dropout_seed(self) -> int:
+        raw_value = os.environ.get("DROP_OUT_SEED")
+        if raw_value is None or str(raw_value).strip() == "":
+            return 0
+        try:
+            return int(str(raw_value).strip())
+        except ValueError:
+            logger.warning("Invalid DROP_OUT_SEED=%r; defaulting to 0", raw_value)
+            return 0
+
+    def _initialize_dropout_manager(self) -> None:
+        """Instantiate dropout manager once the full roster is known."""
+        if self._sap_dropout_manager or self._sap_dropout_count <= 0:
+            return
+        participants = sorted(self.participant_map.keys())
+        if not participants:
+            return
+        self._sap_dropout_manager = DropoutManager(
+            participants=participants,
+            per_round=self._sap_dropout_count,
+            seed=self._sap_dropout_seed,
+        )
+        logger.info(
+            "SAP dropout simulation enabled: per_round=%d (participants=%d, seed=%d)",
+            self._sap_dropout_count,
+            len(participants),
+            self._sap_dropout_seed,
+        )
+
+    def _planned_dropout_stage(self, round_idx: int) -> Optional[DropoutStage]:
+        if round_idx not in self._dropout_stage_plan and self._sap_dropout_manager:
+            stage = self._sap_dropout_manager.stage_for(self.node_id, round_idx)
+            self._dropout_stage_plan[round_idx] = stage
+            if stage:
+                logger.info(
+                    "Preplanned SAP dropout for round %d: %s",
+                    round_idx + 1,
+                    stage.value,
+                )
+        return self._dropout_stage_plan.get(round_idx)
+
+    def _dropout_decision_for_round(self, round_idx: int) -> Optional[DropoutStage]:
+        if self._sap_retry_counts.get(round_idx, 0) > 0:
+            return None
+        return self._planned_dropout_stage(round_idx)
+
     def _resolve_sap_timeout(self) -> float:
         """Determine the unified SAP timeout (RPC calls and aggregator round wait)."""
-        default_timeout = 30.0
+        default_timeout = 60.0
         timeout_value: Any = self.secagg_config.get("timeout_seconds", default_timeout)
         if self.system_config and isinstance(self.system_config, dict):
             system_secagg_cfg = self.system_config.get("secure_agg")
@@ -395,6 +487,23 @@ class NodeService(HierarchyMixin):
                 default_timeout,
             )
             return default_timeout
+
+    def _apply_clique_threshold(self) -> None:
+        if not self.clique_members:
+            return
+        clique_size = len(self.clique_members)
+        if clique_size <= 0:
+            return
+        target = max(2, math.ceil((2 * clique_size) / 3))
+        target = min(target, clique_size)
+        if target != self.threshold:
+            logger.info(
+                "Adjusting SAP threshold for clique size %d: %d -> %d",
+                clique_size,
+                self.threshold,
+                target,
+            )
+            self.threshold = target
 
     def _initialize_port_guards(self) -> None:
         """Reserve aggregator/bridge ports so the OS never assigns them to ephemeral sockets."""
@@ -544,6 +653,117 @@ class NodeService(HierarchyMixin):
             return None
         return np.array(flatten_params(self.model), dtype=np.float32)
 
+    def _cluster_scope_id(self) -> Optional[str]:
+        """Return this node's cluster identifier in hierarchy scope terms."""
+        clique_id = getattr(self, "clique_id", None)
+        if clique_id in (None, "", -1):
+            return None
+        return f"cluster_{clique_id}"
+
+    def _mark_cluster_publish(self, round_idx: int, cid: Optional[str]) -> None:
+        """Record bookkeeping for the most recent cluster artifact."""
+        if not cid:
+            return
+        self._last_cluster_round = max(self._last_cluster_round, round_idx)
+        self._last_cluster_publish_ts = time.time()
+
+    def _record_neighbor_cluster_round(self, source_cluster: str, round_idx: int, received_at: float) -> None:
+        """Store observed neighbor cluster rounds for stale detection."""
+        if round_idx < 0:
+            return
+        with self._neighbor_round_lock:
+            current = self._neighbor_cluster_rounds.get(source_cluster)
+            if current is None or round_idx > current[0]:
+                self._neighbor_cluster_rounds[source_cluster] = (round_idx, received_at)
+            expiry_cutoff = time.time() - max(self.cluster_stale_seconds * 2, 600.0)
+            stale_keys = [
+                key for key, (_, ts) in self._neighbor_cluster_rounds.items() if ts < expiry_cutoff
+            ]
+            for key in stale_keys:
+                self._neighbor_cluster_rounds.pop(key, None)
+
+    def _max_neighbor_cluster_round(self) -> Optional[int]:
+        """Return the maximum round observed among neighbor clusters."""
+        with self._neighbor_round_lock:
+            if not self._neighbor_cluster_rounds:
+                return None
+            return max(round_idx for round_idx, _ in self._neighbor_cluster_rounds.values())
+
+    def _maybe_record_neighbor_round(self, ecm: ECM) -> None:
+        """Track neighbor cluster progress from ECM gossip."""
+        source = ecm.source_cluster or ""
+        if not source or "::" in source or not source.startswith("cluster_"):
+            return
+        cluster_id = self._cluster_scope_id()
+        if cluster_id and source == cluster_id:
+            return
+        self._record_neighbor_cluster_round(source, ecm.round_idx, ecm.received_at)
+
+    def _cluster_payload_is_stale(self) -> bool:
+        """Determine if the last cluster CID is stale relative to neighbors/time."""
+        if not self.inter_cluster_enabled:
+            return False
+        if not self._last_model_cid:
+            return True
+        neighbor_round = self._max_neighbor_cluster_round()
+        last_round = self._last_cluster_round
+        if neighbor_round is not None:
+            if last_round < 0 or (neighbor_round - last_round) >= self.cluster_stale_round_gap:
+                return True
+        if self.cluster_stale_seconds > 0 and self._last_cluster_publish_ts > 0:
+            if (time.time() - self._last_cluster_publish_ts) >= self.cluster_stale_seconds:
+                return True
+        retry_count = self._sap_retry_counts.get(self.current_round, 0)
+        if retry_count >= self.cluster_stale_retry_limit:
+            return True
+        return False
+
+    def _publish_local_cluster_model(self, round_idx: int) -> Tuple[Optional[str], Optional[str]]:
+        """Publish the latest local model snapshot as a fallback cluster artifact."""
+        if not self.inter_cluster_enabled or not self.inter_cluster_aggregator:
+            logger.warning(
+                "Cannot publish fallback cluster model: inter-cluster storage disabled"
+            )
+            return None, None
+        local_tensor = self._export_local_model_vector()
+        if local_tensor is None:
+            logger.warning("Cannot publish fallback cluster model: local model unavailable")
+            return None, None
+        try:
+            cid, model_hash = self.inter_cluster_aggregator.publish_model(local_tensor, round_idx)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to publish fallback cluster model for round %d: %s", round_idx, exc)
+            return None, None
+        data_id = getattr(self.inter_cluster_aggregator, "last_data_id", None)
+        if cid:
+            self._last_model_cid = cid
+            self._last_model_hash = model_hash
+            self._last_model_data_id = data_id
+            self._mark_cluster_publish(round_idx, cid)
+            cluster_id = self._cluster_scope_id()
+            if data_id and cluster_id and self.blockchain:
+                self.blockchain.remember_anchor(
+                    cluster_id=cluster_id,
+                    round_num=round_idx,
+                    data_id=data_id,
+                    cid=cid,
+                    hash_val=model_hash,
+                )
+        return cid, model_hash
+
+    def _fanout_payload_for_child_scope(self, child_scope: str) -> Tuple[Optional[str], Optional[str]]:
+        """Override mixin hook so cluster fan-out can fall back to local weights when stale."""
+        if child_scope == "cluster":
+            if self._cluster_payload_is_stale():
+                logger.warning(
+                    "Cluster artifact stale (round=%d); publishing local fallback snapshot",
+                    self.current_round,
+                )
+                cid, model_hash = self._publish_local_cluster_model(self.current_round)
+                return cid, model_hash
+            return self._last_model_cid, self._last_model_hash
+        return super()._fanout_payload_for_child_scope(child_scope)
+
     def _log_final_model_status(self) -> None:
         """Log the final model accuracy and identifiers before stopping."""
         accuracy = self.evaluate()
@@ -663,6 +883,7 @@ class NodeService(HierarchyMixin):
                     # Use clique threshold if provided, otherwise fall back to config
                     if self.clique_threshold > 0:
                         self.threshold = self.clique_threshold
+                    self._apply_clique_threshold()
 
                 logger.info(
                     f"Registered with TTP: clique={self.clique_id}, "
@@ -1150,6 +1371,7 @@ class NodeService(HierarchyMixin):
                 ecm_buffer=self.ecm_buffer if self.inter_cluster_enabled else None,
                 convergence_signal_handler=convergence_handler,
                 timeout_seconds=self.sap_timeout_seconds,
+                plaintext_mode=not self.secure_aggregation_enabled,
             )
         except PortBindingError:
             logger.error(
@@ -1439,6 +1661,8 @@ class NodeService(HierarchyMixin):
             runtime = self.scope_runtime
         if runtime and runtime.ecm_buffer is not None:
             runtime.ecm_buffer.add(ecm)
+        if not ecm.is_signal:
+            self._maybe_record_neighbor_round(ecm)
 
     def stop_bridge_server(self) -> None:
         """Stop bridge server."""
@@ -1936,8 +2160,92 @@ class NodeService(HierarchyMixin):
         # PASSIVE_WAIT (STALE / FINALIZED): node is genuinely behind.
         return self._handle_passive_sync(stage, self.current_round, server_round, sync_code)
 
-    def run_secure_aggregation_round(self) -> "SapResult":
+    def _run_plaintext_aggregation_round(self) -> "SapResult":
+        """Aggregate quantized models without secure masking."""
+        self._abort_if_global_stop()
+        logger.info(f"Starting plaintext aggregation round {self.current_round}")
+        agg_addr = self._aggregator_rpc_address()
+        if not agg_addr:
+            raise AggregatorUnavailable("Aggregator address unavailable")
+
+        channel = self._create_aggregator_channel(agg_addr)
+        stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
+        try:
+            self.comm_tracker.set_phase("plaintext_submit")
+            model_vec = flatten_params(self.model)
+            quantized = quantize_vector(model_vec, self.scale)
+            update_request = secureagg_pb2.PlaintextUpdate(
+                node_id=self.node_id,
+                round=self.current_round,
+                model_weights=[float(v) for v in quantized],
+            )
+            response = self._invoke_tracked_rpc(
+                "SubmitPlaintextUpdate",
+                stub.SubmitPlaintextUpdate,
+                update_request,
+                timeout=self.sap_timeout_seconds,
+                target_node_id=self.aggregator_id,
+                package_type="plaintext",
+                round_override=self.current_round,
+            )
+            sync_result = self._check_sync_or_abort(response, "plaintext_submit")
+            if sync_result is not None:
+                return sync_result
+
+            aggregated: List[float] = []
+            if self.is_aggregator:
+                aggregated = self._wait_for_plaintext_model(stub)
+            return SapResult(aggregated_weights=aggregated)
+        except grpc.RpcError as exc:
+            code = exc.code().name if hasattr(exc, "code") else "UNKNOWN"
+            raise AggregatorUnavailable(
+                f"Plaintext aggregation RPC failed (stage=submit, code={code})"
+            ) from exc
+        finally:
+            channel.close()
+
+    def _wait_for_plaintext_model(self, stub) -> List[float]:
+        """Poll the aggregator until the unmasked aggregate is published."""
+        self.comm_tracker.set_phase("plaintext_wait")
+        delay = 2
+        attempts = 0
+        while True:
+            self._abort_if_global_stop()
+            try:
+                response = self._invoke_tracked_rpc(
+                    "GetGlobalModel",
+                    stub.GetGlobalModel,
+                    secureagg_pb2.ModelRequest(round=self.current_round),
+                    timeout=self.sap_timeout_seconds,
+                    target_node_id=self.aggregator_id,
+                    package_type="sap_model",
+                    round_override=self.current_round,
+                )
+            except grpc.RpcError as exc:
+                code = exc.code().name if hasattr(exc, "code") else "UNKNOWN"
+                raise AggregatorUnavailable(
+                    f"Aggregator {self.aggregator_id} unreachable during plaintext model fetch "
+                    f"(attempt {attempts + 1}, code={code})"
+                ) from exc
+
+            if response.model_weights:
+                logger.info("Plaintext aggregation complete with %d parameters", len(response.model_weights))
+                return list(response.model_weights)
+
+            attempts += 1
+            if attempts % 5 == 0:
+                logger.info(
+                    "Aggregator %s still finalizing plaintext model (attempt %d); waiting %ds",
+                    self.aggregator_id,
+                    attempts,
+                    delay,
+                )
+            time.sleep(delay)
+
+    def run_secure_aggregation_round(self, dropout_stage: Optional[DropoutStage] = None) -> "SapResult":
         """Run one round of secure aggregation protocol."""
+        if not self.secure_aggregation_enabled:
+            return self._run_plaintext_aggregation_round()
         self._abort_if_global_stop()
         logger.info(f"Starting secure aggregation round {self.current_round}")
 
@@ -1948,11 +2256,11 @@ class NodeService(HierarchyMixin):
 
         channel = self._create_aggregator_channel(agg_addr)
         try:
-            return self._run_sap_rounds(channel, agg_addr)
+            return self._run_sap_rounds(channel, agg_addr, dropout_stage=dropout_stage)
         finally:
             channel.close()
 
-    def _run_sap_rounds(self, channel, agg_addr: str) -> "SapResult":
+    def _run_sap_rounds(self, channel, agg_addr: str, dropout_stage: Optional[DropoutStage] = None) -> "SapResult":
         """Execute SAP Rounds 0-4 on an already-opened gRPC channel."""
         stub = secureagg_pb2_grpc.AggregatorServiceStub(channel)
 
@@ -1962,6 +2270,14 @@ class NodeService(HierarchyMixin):
             signing_private=self.signing_keypair.private_key if self.signing_keypair else None,
             signing_public=self.signing_keypair.public_key if self.signing_keypair else None,
         )
+
+        if dropout_stage == DropoutStage.BEFORE_ROUND0:
+            logger.info(
+                "SAP dropout: %s skipping entire protocol before Round 0 for round %d",
+                self.node_id,
+                self.current_round + 1,
+            )
+            return SapResult()
 
         # SAP Round 0: Advertise keys
         logger.info("SAP-Round 0: Advertising keys")
@@ -2032,8 +2348,36 @@ class NodeService(HierarchyMixin):
                 return self._handle_passive_sync("round0", self.current_round, self.current_round, 0)
             raise RuntimeError(f"Round 0 failed: {response.message}")
 
-        # Wait until we receive at least the threshold number of advertisements.
-        required_participants = max(self.threshold, 1)
+        # Wait until we receive at least the full clique roster (or whatever the
+        # aggregator finalized after a timeout).  This prevents nodes from
+        # entering Round 1 with an incomplete participant list, which would break
+        # pairwise key derivation.
+        clique_size = len(self.clique_members) if self.clique_members else len(self.participant_map)
+        required_participants = max(clique_size, self.threshold, 1)
+
+        def _log_round0_progress(keys: Sequence[secureagg_pb2.KeyAdvertisement]) -> None:
+            ids = sorted({adv.node_id for adv in keys})
+            if ids:
+                logger.info("SAP-Round 0 progress: received %d participants -> %s", len(ids), ", ".join(ids))
+            else:
+                logger.info("SAP-Round 0 progress: no participants yet")
+
+        def _round0_finalized(resp: secureagg_pb2.KeyAdvertisementAck) -> bool:
+            message = (resp.message or "").lower()
+            if not message:
+                return False
+            tokens = (
+                "sap-round 0 ok",
+                "sap-round 0 finalized",
+                "round 0 finalized",
+                "sap-round 0 aborted",
+                "round 0 aborted",
+            )
+            return any(token in message for token in tokens)
+
+        _log_round0_progress(response.all_keys)
+        if _round0_finalized(response):
+            required_participants = max(1, len(response.all_keys))
         while len(response.all_keys) < required_participants:
             self._abort_if_global_stop()
             time.sleep(1)
@@ -2060,7 +2404,10 @@ class NodeService(HierarchyMixin):
                 if "finalized" in (response.message or "").lower():
                     return self._handle_passive_sync("round0_poll", self.current_round, self.current_round, 0)
 
-            logger.info(f"SAP-Round 0 complete: received {len(response.all_keys)} participants")
+            _log_round0_progress(response.all_keys)
+            if _round0_finalized(response):
+                required_participants = max(1, len(response.all_keys))
+                break
 
         # Record Round 0 timing
         if self.prom_metrics:
@@ -2068,6 +2415,19 @@ class NodeService(HierarchyMixin):
 
         # Pass received advertisements to client
         ordered_participants = [p.node_id for p in response.all_keys]
+        if len(ordered_participants) < clique_size:
+            logger.warning(
+                "SAP-Round 0 finalized after timeout with %d/%d participants: %s",
+                len(ordered_participants),
+                clique_size,
+                ", ".join(ordered_participants),
+            )
+        else:
+            logger.info(
+                "SAP-Round 0 finalized roster (%d participants): %s",
+                len(ordered_participants),
+                ", ".join(ordered_participants),
+            )
         adverts = [
             AdvertiseMessage(
                 node_id=p.node_id,
@@ -2156,6 +2516,14 @@ class NodeService(HierarchyMixin):
         if self.prom_metrics:
             self.prom_metrics.observe_sap_phase("round1", time.monotonic() - sap_r1_start)
 
+        if dropout_stage == DropoutStage.BEFORE_MASKED_INPUT:
+            logger.info(
+                "SAP dropout: %s skipping masked input submission for round %d",
+                self.node_id,
+                self.current_round + 1,
+            )
+            return SapResult()
+
         # SAP Round 2: Send masked input
         logger.info("SAP-Round 2: Sending masked model")
         sap_r2_start = time.monotonic()
@@ -2191,9 +2559,14 @@ class NodeService(HierarchyMixin):
         sync_result2 = self._check_sync_or_abort(response2, "round2")
         if sync_result2 is not None:
             return sync_result2
-        # Use actual Round 0 participant count, not full clique size, because
-        # some clique members may have been excluded during Round 0 timeout.
-        expected_survivors = max(len(ordered_participants), self.threshold)
+        def _log_round2_survivors(ids: Sequence[str]) -> None:
+            if not ids:
+                logger.info("SAP-Round 2 progress: waiting for survivors list")
+                return
+            logger.info("SAP-Round 2 progress: %d participant(s) -> %s", len(ids), ", ".join(sorted(ids)))
+        _log_round2_survivors(response2.survivors)
+        # Require the same roster that completed Round 0 to appear in the survivor list.
+        expected_survivors = len(ordered_participants)
 
         def _survivor_goal_met(resp: secureagg_pb2.MaskedInputAck) -> bool:
             if not resp.survivors:
@@ -2231,6 +2604,7 @@ class NodeService(HierarchyMixin):
                     response2.timed_out,
                     list(response2.survivors),
                 )
+                _log_round2_survivors(response2.survivors)
             except grpc.RpcError as exc:
                 logger.error("SAP-Round 2 polling RPC failed: %s", exc)
                 raise
@@ -2250,12 +2624,25 @@ class NodeService(HierarchyMixin):
         else:
             logger.info(f"SAP-Round 2 complete: {survivor_count} survivors")
 
+        if not self.is_aggregator:
+            survivor_preview = ", ".join(sorted(response2.survivors))
+            logger.info(
+                "SAP-Round 2 survivors for round %d (%d participants): %s",
+                self.current_round + 1,
+                survivor_count,
+                survivor_preview or "none",
+            )
+
         # Record Round 2 timing
         if self.prom_metrics:
             self.prom_metrics.observe_sap_phase("round2", time.monotonic() - sap_r2_start)
 
         survived_round2 = self.node_id in response2.survivors
         if not survived_round2:
+            if self.is_aggregator:
+                raise AggregatorUnavailable(
+                    f"Aggregator {self.node_id} excluded from survivor list; restarting round"
+                )
             logger.warning("SAP-Round 2 dropout detected; skipping rounds 3/4 and awaiting aggregation result")
             response3 = None
             response4 = secureagg_pb2.UnmaskAck(accepted=False, message="Node not a survivor", aggregation_complete=False)
@@ -2424,6 +2811,8 @@ class NodeService(HierarchyMixin):
             if self._process_high_level_rounds():
                 continue
             round_idx = self.current_round
+            if self._sap_dropout_manager:
+                self._planned_dropout_stage(round_idx)
             comm_round_idx = round_idx
             comm_round_shifted = False
             round_start_time = time.monotonic()
@@ -2477,9 +2866,22 @@ class NodeService(HierarchyMixin):
 
                 # Phase 2: Secure aggregation
                 logger.info("Phase 2: Secure aggregation")
+                dropout_stage = self._dropout_decision_for_round(round_idx)
+                if dropout_stage and self.is_aggregator:
+                    logger.info(
+                        "Dropout stage %s selected for aggregator; forcing participation to keep round active",
+                        dropout_stage.value,
+                    )
+                    dropout_stage = None
+                if dropout_stage:
+                    logger.warning(
+                        "Simulating SAP dropout (%s) for round %d",
+                        dropout_stage.value,
+                        round_idx + 1,
+                    )
                 sap_start = time.monotonic()
                 try:
-                    sap_result = self.run_secure_aggregation_round()
+                    sap_result = self.run_secure_aggregation_round(dropout_stage=dropout_stage)
                 except GlobalStopRequested:
                     raise
                 finally:
@@ -2596,6 +2998,7 @@ class NodeService(HierarchyMixin):
                     self._last_model_cid = final_cid
                     self._last_model_hash = final_hash
                     self._last_model_data_id = final_data_id
+                    self._mark_cluster_publish(round_idx, final_cid)
 
                 if not self.is_aggregator:
                     wait_for_model_ref = self.is_bridge_node and self.inter_cluster_enabled
@@ -2622,6 +3025,7 @@ class NodeService(HierarchyMixin):
                     self._last_model_cid = response_cid or None
                     self._last_model_hash = response_hash or None
                     self._last_model_data_id = response_data_id or None
+                    self._mark_cluster_publish(round_idx, response_cid or None)
 
                     quantized_final = [int(w) for w in model_response.model_weights]
                     dequantized = dequantize_vector(quantized_final, self.scale)
@@ -2718,6 +3122,7 @@ class NodeService(HierarchyMixin):
 
             if round_failed:
                 retry_delay = 5
+                self._sap_retry_counts[round_idx] = self._sap_retry_counts.get(round_idx, 0) + 1
                 logger.warning(
                     "Round %d failed. Retrying after %ds once aggregator %s is reachable.",
                     round_idx + 1,
@@ -2761,6 +3166,8 @@ class NodeService(HierarchyMixin):
             self._process_high_level_rounds()
 
             time.sleep(5)
+            self._sap_retry_counts.pop(round_idx, None)
+            self._dropout_stage_plan.pop(round_idx, None)
             self.current_round += 1
 
         self._log_final_model_status()
@@ -2947,6 +3354,7 @@ class NodeService(HierarchyMixin):
                 self.register_with_ttp()
             logger.info(f"All {len(self.participants)} nodes are ready. Starting training...")
 
+        self._initialize_dropout_manager()
         self._log_scope_aggregator_candidates()
 
         if inter_edges:

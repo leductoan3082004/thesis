@@ -1,4 +1,5 @@
 from .ecm_buffer import ECM, ECMBuffer
+from .dropout import DropoutManager, DropoutPlan, DropoutStage
 from .engine import (
     GossipCache,
     ModelSnapshot,
@@ -8,6 +9,9 @@ from .engine import (
 )
 
 __all__ = [
+    "DropoutManager",
+    "DropoutPlan",
+    "DropoutStage",
     "ECM",
     "ECMBuffer",
     "GossipCache",

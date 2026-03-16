@@ -36,7 +36,8 @@
    - `scope_index`, `scope_name`, `scope_id`  
    - `interval_seconds` (replaces `rounds_per_scope` for high-levels)  
    - Waiting policy knobs (`wait_seconds`, retry count) that nodes honor when pausing for high-level models  
-   - Merge policy fields (`apply_policy`, `apply_alpha`, etc.) so nodes know how to assimilate each scope’s model when fetched directly.
+   - Merge policy fields (`apply_policy`, `apply_alpha`, etc.) so nodes know how to assimilate each scope’s model when fetched directly.  
+   - `cluster_stale_detection` (top-level) so fan-out candidates can detect when the most recent cluster CID falls behind neighbors (by rounds, elapsed seconds, or repeated SAP retries) and publish their latest local weights instead of forwarding a stale CID.
 
 ## 3. Level Inventory
 Current deployments use three scopes:
