@@ -7,6 +7,7 @@ import math
 import os
 import re
 import socket
+import threading
 import time
 from collections import deque, defaultdict
 from pathlib import Path
@@ -309,6 +310,14 @@ class NodeService(HierarchyMixin):
         self.ipfs: Optional[IPFSInterface] = None
         self.blockchain: Optional[BlockchainInterface] = None
         self.ecm_forward_wait = float(self.inter_cluster_config.get("ecm_forward_wait_seconds", 5.0))
+        stale_cfg = self.system_config.get("cluster_stale_detection") or {}
+        self.cluster_stale_round_gap = max(1, int(stale_cfg.get("round_gap", 5)))
+        self.cluster_stale_seconds = max(0.0, float(stale_cfg.get("seconds", 300.0)))
+        self.cluster_stale_retry_limit = max(1, int(stale_cfg.get("retry_count", 5)))
+        self._last_cluster_round: int = -1
+        self._last_cluster_publish_ts: float = 0.0
+        self._neighbor_cluster_rounds: Dict[str, Tuple[int, float]] = {}
+        self._neighbor_round_lock = threading.Lock()
 
         # State-level aggregation (hierarchy) state
         (
@@ -460,7 +469,7 @@ class NodeService(HierarchyMixin):
 
     def _resolve_sap_timeout(self) -> float:
         """Determine the unified SAP timeout (RPC calls and aggregator round wait)."""
-        default_timeout = 30.0
+        default_timeout = 60.0
         timeout_value: Any = self.secagg_config.get("timeout_seconds", default_timeout)
         if self.system_config and isinstance(self.system_config, dict):
             system_secagg_cfg = self.system_config.get("secure_agg")
@@ -643,6 +652,117 @@ class NodeService(HierarchyMixin):
         if not self.model:
             return None
         return np.array(flatten_params(self.model), dtype=np.float32)
+
+    def _cluster_scope_id(self) -> Optional[str]:
+        """Return this node's cluster identifier in hierarchy scope terms."""
+        clique_id = getattr(self, "clique_id", None)
+        if clique_id in (None, "", -1):
+            return None
+        return f"cluster_{clique_id}"
+
+    def _mark_cluster_publish(self, round_idx: int, cid: Optional[str]) -> None:
+        """Record bookkeeping for the most recent cluster artifact."""
+        if not cid:
+            return
+        self._last_cluster_round = max(self._last_cluster_round, round_idx)
+        self._last_cluster_publish_ts = time.time()
+
+    def _record_neighbor_cluster_round(self, source_cluster: str, round_idx: int, received_at: float) -> None:
+        """Store observed neighbor cluster rounds for stale detection."""
+        if round_idx < 0:
+            return
+        with self._neighbor_round_lock:
+            current = self._neighbor_cluster_rounds.get(source_cluster)
+            if current is None or round_idx > current[0]:
+                self._neighbor_cluster_rounds[source_cluster] = (round_idx, received_at)
+            expiry_cutoff = time.time() - max(self.cluster_stale_seconds * 2, 600.0)
+            stale_keys = [
+                key for key, (_, ts) in self._neighbor_cluster_rounds.items() if ts < expiry_cutoff
+            ]
+            for key in stale_keys:
+                self._neighbor_cluster_rounds.pop(key, None)
+
+    def _max_neighbor_cluster_round(self) -> Optional[int]:
+        """Return the maximum round observed among neighbor clusters."""
+        with self._neighbor_round_lock:
+            if not self._neighbor_cluster_rounds:
+                return None
+            return max(round_idx for round_idx, _ in self._neighbor_cluster_rounds.values())
+
+    def _maybe_record_neighbor_round(self, ecm: ECM) -> None:
+        """Track neighbor cluster progress from ECM gossip."""
+        source = ecm.source_cluster or ""
+        if not source or "::" in source or not source.startswith("cluster_"):
+            return
+        cluster_id = self._cluster_scope_id()
+        if cluster_id and source == cluster_id:
+            return
+        self._record_neighbor_cluster_round(source, ecm.round_idx, ecm.received_at)
+
+    def _cluster_payload_is_stale(self) -> bool:
+        """Determine if the last cluster CID is stale relative to neighbors/time."""
+        if not self.inter_cluster_enabled:
+            return False
+        if not self._last_model_cid:
+            return True
+        neighbor_round = self._max_neighbor_cluster_round()
+        last_round = self._last_cluster_round
+        if neighbor_round is not None:
+            if last_round < 0 or (neighbor_round - last_round) >= self.cluster_stale_round_gap:
+                return True
+        if self.cluster_stale_seconds > 0 and self._last_cluster_publish_ts > 0:
+            if (time.time() - self._last_cluster_publish_ts) >= self.cluster_stale_seconds:
+                return True
+        retry_count = self._sap_retry_counts.get(self.current_round, 0)
+        if retry_count >= self.cluster_stale_retry_limit:
+            return True
+        return False
+
+    def _publish_local_cluster_model(self, round_idx: int) -> Tuple[Optional[str], Optional[str]]:
+        """Publish the latest local model snapshot as a fallback cluster artifact."""
+        if not self.inter_cluster_enabled or not self.inter_cluster_aggregator:
+            logger.warning(
+                "Cannot publish fallback cluster model: inter-cluster storage disabled"
+            )
+            return None, None
+        local_tensor = self._export_local_model_vector()
+        if local_tensor is None:
+            logger.warning("Cannot publish fallback cluster model: local model unavailable")
+            return None, None
+        try:
+            cid, model_hash = self.inter_cluster_aggregator.publish_model(local_tensor, round_idx)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to publish fallback cluster model for round %d: %s", round_idx, exc)
+            return None, None
+        data_id = getattr(self.inter_cluster_aggregator, "last_data_id", None)
+        if cid:
+            self._last_model_cid = cid
+            self._last_model_hash = model_hash
+            self._last_model_data_id = data_id
+            self._mark_cluster_publish(round_idx, cid)
+            cluster_id = self._cluster_scope_id()
+            if data_id and cluster_id and self.blockchain:
+                self.blockchain.remember_anchor(
+                    cluster_id=cluster_id,
+                    round_num=round_idx,
+                    data_id=data_id,
+                    cid=cid,
+                    hash_val=model_hash,
+                )
+        return cid, model_hash
+
+    def _fanout_payload_for_child_scope(self, child_scope: str) -> Tuple[Optional[str], Optional[str]]:
+        """Override mixin hook so cluster fan-out can fall back to local weights when stale."""
+        if child_scope == "cluster":
+            if self._cluster_payload_is_stale():
+                logger.warning(
+                    "Cluster artifact stale (round=%d); publishing local fallback snapshot",
+                    self.current_round,
+                )
+                cid, model_hash = self._publish_local_cluster_model(self.current_round)
+                return cid, model_hash
+            return self._last_model_cid, self._last_model_hash
+        return super()._fanout_payload_for_child_scope(child_scope)
 
     def _log_final_model_status(self) -> None:
         """Log the final model accuracy and identifiers before stopping."""
@@ -1541,6 +1661,8 @@ class NodeService(HierarchyMixin):
             runtime = self.scope_runtime
         if runtime and runtime.ecm_buffer is not None:
             runtime.ecm_buffer.add(ecm)
+        if not ecm.is_signal:
+            self._maybe_record_neighbor_round(ecm)
 
     def stop_bridge_server(self) -> None:
         """Stop bridge server."""
@@ -2876,6 +2998,7 @@ class NodeService(HierarchyMixin):
                     self._last_model_cid = final_cid
                     self._last_model_hash = final_hash
                     self._last_model_data_id = final_data_id
+                    self._mark_cluster_publish(round_idx, final_cid)
 
                 if not self.is_aggregator:
                     wait_for_model_ref = self.is_bridge_node and self.inter_cluster_enabled
@@ -2902,6 +3025,7 @@ class NodeService(HierarchyMixin):
                     self._last_model_cid = response_cid or None
                     self._last_model_hash = response_hash or None
                     self._last_model_data_id = response_data_id or None
+                    self._mark_cluster_publish(round_idx, response_cid or None)
 
                     quantized_final = [int(w) for w in model_response.model_weights]
                     dequantized = dequantize_vector(quantized_final, self.scale)

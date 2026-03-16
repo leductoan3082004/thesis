@@ -460,6 +460,7 @@ Copy `config/system-config.sample.json` to `config/system-config.json` to config
 - **Fleet size**: `number_of_nodes` (used when `--nodes` is omitted)
 - **Hierarchy levels**: state/nation scope identifiers, timer intervals, merge policies
 - **Cluster defaults**: `training.max_rounds` sets the cluster-level round cap (overridden by `MAX_TRAINING_ROUNDS` env or per-node config)
+- **Cluster stale detection**: `cluster_stale_detection` controls when a clique stops fanning out an old CID (gap in rounds, idle seconds, SAP retry count) and instead publishes its latest local weights for higher scopes.
 
 ### Hierarchy Rosters
 
