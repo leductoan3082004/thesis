@@ -1,0 +1,5 @@
+Our experiments benchmark convergence across topologies and algorithmic variants to quantify how the proposed decentralized framework mitigates label-skew. We train on CIFAR-10 (50k train, 10k test across 10 classes) using $N=24$ simulated nodes that exchange messages exactly as deployed.
+
+Data is partitioned via a Dirichlet sampler (small concentration $\alpha$) so each node receives a highly non-IID shard, forcing the system to solve a challenging consensus problem. Every node trains a lightweight 3-layer ConvNet with SGD (learning rate 0.01, batch size 64), striking a balance between realism and simulation speed.
+
+For each setting we report test accuracy statistics (min/mean/max across nodes) versus training epochs and contrast the results with an idealized fully-connected baseline of equal size. The baseline samples uniformly from the global distribution, removing label skew and serving as an upper bound on achievable performance.

@@ -1,0 +1,15 @@
+\subsection{System Architecture}
+\label{sec:system-architecture}
+
+Figure~\ref{fig:system-architecture} depicts how SHDFL’s components cooperate:
+\begin{itemize}
+    \item \textbf{Cluster layer.} Trainers execute SAP so only quorum-protected updates exit the clique. This preserves privacy even when the aggregator or bridge is merely semi-trusted.
+    \item \textbf{Bridge node.} A designated bridge disseminates the External Cluster Model laterally (dotted arrows), ensuring neighboring clusters receive the latest checkpoint for inter-cluster coordination.
+    \item \textbf{Fan-out node.} Each cluster also elects a fan-out node (green) that forwards the final ECM toward the state scope, acting as the source of truth for higher-level rounds.
+    \item \textbf{State/Nation aggregation.} When a timer fires, the elected aggregator (blue icon) collects fan-out payloads from its child clusters or states, merges them, and produces a scope checkpoint.
+    \item \textbf{IPFS + Blockchain.} The merged tensor is stored on IPFS while its CID and metadata are anchored on the blockchain, making the commit auditable and tamper evident.
+    \item \textbf{Downstream application.} All nodes pull the anchored checkpoint, verify the hash, and apply the defined policy (replace or interpolate) before resuming optimization.
+\end{itemize}
+This loop yields a clean flow: SAP protects privacy, bridge nodes handle lateral gossip, fan-out nodes deliver artifacts upward, and the IPFS/ledger pair propagates the official scope model to every participant.
+
+The remainder of this section unpacks the key building blocks. ~\nameref{sec:system-architecture-dclique} explains how we construct label-balanced clusters and assign membership; ~\nameref{sec:secure-aggregation-sap} details the SAP pipeline that enforces quorum privacy inside each cluster; and ~\nameref{subsubsec:system-architecture-hierarchy} describes how state and nation scopes orchestrate timer-driven aggregation on top of those clusters.

@@ -1,0 +1,1737 @@
+Practical Secure Aggregation
+for Privacy-Preserving Machine Learning
+Keith Bonawitz
+bonawitz@google.com
+Google
+1600 Amphitheatre Parkway
+Mountain View, California 94043Vladimir Ivanov
+vlivan@google.com
+Google
+1600 Amphitheatre Parkway
+Mountain View, California 94043Ben Kreuter
+benkreuter@google.com
+Google
+1600 Amphitheatre Parkway
+Mountain View, California 94043
+Antonio Marcedone†
+marcedone@cs.cornell.edu
+Cornell Tech
+2 West Loop Rd.
+New York, NY 10044H. Brendan McMahan
+mcmahan@google.com
+Google
+1600 Amphitheatre Parkway
+Mountain View, California 94043Sarvar Patel
+sarvar@google.com
+Google
+1600 Amphitheatre Parkway
+Mountain View, California 94043
+Daniel Ramage
+dramage@google.com
+Google
+1600 Amphitheatre Parkway
+Mountain View, California 94043Aaron Segal
+asegal@google.com
+Google
+1600 Amphitheatre Parkway
+Mountain View, California 94043Karn Seth
+karn@google.com
+Google
+1600 Amphitheatre Parkway
+Mountain View, California 94043
+ABSTRACT
+We design a novel, communication-efficient, failure-robust proto-
+col for secure aggregation of high-dimensional data. Our protocol
+allows a server to compute the sum of large, user-held data vec-
+tors from mobile devices in a secure manner (i.e. without learning
+each user’s individual contribution), and can be used, for example,
+in a federated learning setting, to aggregate user-provided model
+updates for a deep neural network. We prove the security of our
+protocol in the honest-but-curious and active adversary settings,
+and show that security is maintained even if an arbitrarily chosen
+subset of users drop out at any time. We evaluate the efficiency
+of our protocol and show, by complexity analysis and a concrete
+implementation, that its runtime and communication overhead re-
+main low even on large data sets and client pools. For 16-bit input
+values, our protocol offers 1.73×communication expansion for 210
+users and 220-dimensional vectors, and 1.98×expansion for 214
+users and 224-dimensional vectors over sending data in the clear.
+CCS CONCEPTS
+•Security and privacy →Privacy-preserving protocols;
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+CCS ’17, October 30-November 3, 2017, Dallas, TX, USA
+©2017 Copyright held by the owner/author(s). Publication rights licensed to Associa-
+tion for Computing Machinery.
+ACM ISBN 978-1-4503-4946-8/17/10. . . $15.00
+https://doi.org/10.1145/3133956.3133982KEYWORDS
+privacy-preserving protocols, secure aggregation, machine learning,
+federated learning
+1 INTRODUCTION
+Machine learning models trained on sensitive real-world data promise
+improvements to everything from medical screening [ 46] to dis-
+ease outbreak discovery [ 37]. And the widespread use of mobile
+devices means even richer—and more sensitive—data is becoming
+available [35].
+However, large-scale collection of sensitive data entails risks. A
+particularly high-profile example of the consequences of mishan-
+dling sensitive data occurred in 1988, when the video rental history
+of a nominee for the US Supreme Court was published without his
+consent [ 4]. The law passed in response to that incident remains
+relevant today, limiting how online video streaming services can
+use their user data [42].
+This work outlines an approach to advancing privacy-preserving
+machine learning by leveraging secure multiparty computation
+(MPC) to compute sums of model parameter updates from individ-
+ual users’ devices in a secure manner. The problem of computing
+a multiparty sum where no party reveals its update in the clear—
+even to the aggregator—is referred to as Secure Aggregation. As
+described in Section 2, the secure aggregation primitive can be used
+to privately combine the outputs of local machine learning on user
+devices, in order to update a global model. Training models in this
+way offers tangible benefits—a user’s device can share an update
+knowing that the service provider will only see that update after it
+has been averaged with those of other users.
+The secure aggregation problem has been a rich area of re-
+search: different approaches include works based on generic secure
+†Research performed during an internship at Google.
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1175
+
+multi-party computation protocols, works based on DC-nets, works
+based on partially- or fully-homomorphic threshold encryption, and
+works based on pairwise masking. We discuss these existing works
+in more detail in Section 9, and compare them to our approach.
+We are particularly focused on the setting of mobile devices,
+where communication is extremely expensive, and dropouts are
+common. Given these constraints, we would like our protocol to
+incur no more than twice as much communication as sending the
+data vector to be aggregated in the clear, and would also like the
+protocol to be fully robust to users dropping at any point. We believe
+that previous works do not address this mixture of constraints,
+which is what motivates our work.
+1.1 Our Results
+We present a protocol for securely computing sums of vectors,
+which has a constant number of rounds, low communication over-
+head, robustness to failures, and which requires only one server
+with limited trust. In our design the server has two roles: it routes
+messages between the other parties, and it computes the final re-
+sult. We present two variants of the protocol: one is more efficient
+and can be proven secure against honest but curious adversaries,
+in the plain model. The other guarantees privacy against active
+adversaries (including an actively adversarial server), but requires
+an extra round, and is proven secure in the random oracle model. In
+both cases, we can show formally that the server only learns users’
+inputs in aggregate, using a simulation-based proof as is standard
+for MPC protocols. Both variants we present are practical and we
+present benchmark results from our prototype implementation.
+1.2 Organization
+In Section 2 we describe the machine learning application that
+motivates this work. In Section 3 we review the cryptographic
+primitives we use in our protocol. We then proceed to give a high-
+level overview of our protocol design in Section 4, followed by a
+formal protocol description in Section 5. In Section 6 we prove se-
+curity against honest-but-curious (passive) adversaries and include
+a high-level discussion of privacy against active adversaries.In Sec-
+tion 7, we give performance numbers based both on theoretical
+analysis as well as on a prototype implementation. Finally, we dis-
+cuss some issues surrounding practical deployments and future
+work in Section 8 and conclude with a discussion of related work
+in Section 9.
+2 SECURE AGGREGATION FOR FEDERATED
+LEARNING
+Consider training a deep neural network to predict the next word
+that a user will type as she composes a text message. Such models
+are commonly used to to improve typing efficacy for a phone’s on-
+screen keyboard [ 30]. A modeler may wish to train such a model
+on all text messages across a large population of users. However,
+text messages frequently contain sensitive information; users may
+be reluctant to upload a copy of them to the modeler’s servers.
+Instead, we consider training such a model in a Federated Learning
+setting, wherein each user maintains a private database of her text
+messages securely on her own mobile device, and a shared global
+model is trained under the coordination of a central server basedupon highly processed, minimally scoped, ephemeral updates from
+users [43, 50].
+These updates are high-dimensional vectors based on informa-
+tion from the user’s private database. Training a neural net is typi-
+cally done by repeatedly iterating over these updates using a variant
+of a mini-batch stochastic gradient descent rule [ 15,29]. (See Ap-
+pendix B for details.)
+Although each update is ephemeral and contains no more (and
+typically significantly less) information than the user’s private
+database, a user might still be concerned about what information
+remains. In some circumstances, it is possible to learn invididual
+words that a user has typed by inspecting that user’s most recent
+update. However, in the Federated Learning setting, the server
+does not need to access any individual user’s update in order to
+perform stochastic gradient descent; it requires only the element-
+wise weighted averages of the update vectors, taken over a random
+subset of users. Using a Secure Aggregation protocol to compute
+these weighted averages1would ensure that the server may learn
+only that one or more users in this randomly selected subset wrote
+a given word, but not which users.
+Federated Learning systems face several practical challenges.
+Mobile devices have only sporadic access to power and network
+connectivity, so the set of users participating in each update step
+is unpredictable and the system must be robust to users dropping
+out. Because the neural network may be parameterized by mil-
+lions of values, updates may be large, representing a direct cost
+to users on metered network plans. Mobile devices also generally
+cannot establish direct communications channels with other mobile
+devices (relying on a server or service provider to mediate such
+communication) nor can they natively authenticate other mobile
+devices.
+Thus, Federated Learning motivates a need for a Secure Aggre-
+gation protocol that:
+(1) operates on high-dimensional vectors
+(2)is highly communication efficient, even with a novel set of
+users on each instantiation
+(3) is robust to users dropping out
+(4)provides the strongest possible security under the con-
+straints of a server-mediated, unauthenticated network
+model
+3 CRYPTOGRAPHIC PRIMITIVES
+In this section, we discuss the cryptographic primitives and assump-
+tions needed for our construction.
+3.1 Secret Sharing
+We rely on Shamir’s t-out-of- nSecret Sharing [ 48], which allows a
+user to split a secret sintonshares, such that any tshares can be
+used to reconstruct s, but any set of at most t−1shares gives no
+information about s.
+The scheme is parameterized over a finite field Fof size at least
+l>2k(where kis the security parameter of the scheme), e.g.
+F=Zpfor some large public prime p. We note that such a large
+field size is needed because our scheme requires clients to secret
+1Computing a secure weighted average given a secure sum operation is straightfoward;
+for detail, see Appendix B.
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1176
+Cloud-Hosted Mobile Intelligence
+Federated Learning
+Federated Learning with Secure Aggregation
+Figure 1: Left: In the cloud-centric approach to machine intelligence, user devices interact with cloud-hosted models, generat-
+ing logs that can be used as training examples. The logs from many users are combined and used to improve the model, which
+is then used to serve future user requests. Middle: In Federated Learning, machine intelligence models are shipped to users’
+devices where they are both evaluated and trained locally. Summaries of improved models are shared with the server, where
+they are aggregated into a new model and deployed to user devices. Right: When Secure Aggregation is added to Federated
+Learning, the aggregation of model updates is logically performed by the virtual, incorruptible third party induced by the
+secure multiparty communication, so that the cloud provider learns only the aggregated model update.
+share their secret keys (whose length must be proportional to the
+security parameter for the security proof to go through). We also
+assume that integers 1,. . . , n(which will be used to denote users
+in the protocol) can be identified with distinct field elements in F.
+Given these parameters, the scheme consists of two algorithms. The
+sharing algorithm SS.share (s,t,U)→{(u,su)}u∈Utakes as input
+a secret s, a setUofnfield elements representing user IDs, and a
+threshold t≤|U| ; it produces a set of shares su, each of which is
+associated with a different u∈U. The reconstruction algorithm
+SS.recon ({(u,su)}u∈V,t)→stakes as input the threshold tand
+the shares corresponding to a subset V⊆U such that|V|≥ t, and
+outputs a field element s.
+Correctness requires that ∀s∈F,∀t,nwith 1≤t≤n,∀U⊆ F
+where|U|=n, if{(u,su)}u∈U←SS.share (s,t,U),V ⊆U and
+|V|≥ t, then SS.recon ({(u,su)}u∈V,t) =s. Security requires that
+∀s,s′∈Fand anyV⊆U such that|V|<t:
+{{(u,su)}u∈U←SS.share( s,t,U) :{(u,su)}u∈V}≡
+{{(u,su)}u∈U←SS.share( s′,t,U) :{(u,su)}u∈V}
+where “≡” denotes that the two distributions are identical.
+3.2 Key Agreement
+Key Agreement consists of a tuple of algorithms
+(KA.param, KA.gen, KA.agree ). The algorithm KA.param (k)→
+ppproduces some public parameters (over which our scheme will
+be parameterized). KA.gen (pp)→(sSKu,sPKu)allows any party u
+to generate a private-public key pair. KA.agree (sSKu,sPKv)→su,v
+allows any user uto combine their private key sSKuwith the public
+keysPKvfor anyv(generated using the same pp), to obtain a private
+shared key su,vbetween uandv.
+The specific Key Agreement scheme we will use is Diffie-Hellman
+key agreement [ 19], composed with a hash function. More specifi-
+cally, KA.param (k)→(G′,д,q,H)samples group G′of prime or-
+derq, along with a generator д, and a hash function H2;KA.gen (G′,
+д,q,H)→(x,дx)samples a random x←Zqas the secret key sSKu,
+andдxas the public key sPKu; and KA.agree (xu,дxv)→su,vout-
+puts su,v=H((дxv)xu).
+2In practice, one can use SHA-256.Correctness requires that, for any key pairs generated by users u
+andv(using KA.gen and the same parameters pp),KA.agree (sSKu,
+sPKv) =KA.agree (sSKv,sPKu). For security, in the honest but curious
+model, we want that for any adversary who is given two honestly
+generated public keys sPKuandsPKv(but neither of the correspond-
+ing secret keys sSKuorsSKv), the shared secret su,vcomputed from
+those keys is indistinguishable from a uniformly random string.
+This exactly mirrors the Decisional Diffie-Hellman (DDH) assump-
+tion, which we recall below:
+Definition 3.1 (Decisional Diffie-Hellman assumption). LetG(k)→
+(G′,д,q,H)be an efficient algorithm which samples a group G′of
+order qwith generator д, as well as a function H:{0,1}∗→{0,1}k.
+Consider the following probabilistic experiment, parameterized by
+a PPT adversary M, a bit band a security parameter k.
+DDH-Expb
+G,M(k):
+(1)(G′,д,q,H)←G (k)
+(2)a←Zq;A←дa
+(3)b←Zq;B←дb
+(4) if b= 1,s←H(дab), else s$←{0,1}k
+(5)M(G′,д,q,H,A,B,s)→b′
+(6) Output 1 if b=b′, 0 o/w.
+The advantage of the adversary is defined as
+AdvDDH
+G,M(k) :=|Pr[DDH-Exp1
+G,M(k) = 1]−
+Pr[DDH-Exp0
+G,M(k) = 1]|
+We say that the Decisional Diffie-Hellman assumption holds for
+Gif for all PPT adversaries M, there exists a negligible function ϵ
+such that AdvDDH
+G,M(k)≤ϵ(k).
+Note that, traditionally, the Diffie-Hellman assumption does not
+directly involve a hash function H(i.e. line step 4 is substituted with
+“ifb= 1,s←дab, else s$←G′”), and therefore to get from a random
+element of the group G′to a uniformly random string (which is
+necessary to be used as the seed for a PRG , or to sample secret
+keys for other primitives), one has to compose дabwith a secure
+randomness extractor (which composes well with this specific key
+agreement operation). For simplicity, we choose to incorporate such
+an extractor function Hin the assumption.
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1177
+In order to prove security against active adversaries (Theorem
+6.5), we need a somewhat stronger security guarantee for Key
+Agreement, namely that an adversary who is given two honestly
+generated public keys sPKuandsPKv, and also the ability to learn
+KA.agree (sSKu,sPK)andKA.agree (sSKv,sPK)for any sPKs of its
+choice (but different from sPKuandsPKv), still cannot distinguish
+su,vfrom a random string. In order to get this stronger property,
+we need to rely on a slight variant of the Oracle Diffie-Hellman
+assumption (ODH) [ 2], which we call Two Oracle Diffie-Hellman
+assumption (2ODH):
+Definition 3.2 (Two Oracle Diffie-Hellman assumption (2ODH)).
+LetG(k)→(G′,д,q,H)be an efficient algorithm which samples
+a group G′of order qwith generator д, as well as a function
+H:{0,1}∗→{0,1}k. Consider the following probabilistic experi-
+ment, parameterized by a PPT adversary M, a bit band a security
+parameter k.
+2ODH-Expb
+G,M(k):
+(1)(G′,д,q,H)←G (k)
+(2)a←Zq;A←дa
+(3)b←Zq;B←дb
+(4) if b= 1,s←H(дab), else s$←{0,1}k
+(5)MOa(·),Ob(·)(G′,д,q,H,A,B,s)→b′
+(6) Output 1 if b=b′, 0 o/w.
+whereOa(X)returns H(Xa)on any X̸=B(and an error on input B)
+and similarlyOb(X)returns H(Xb)on any X̸=A. The advantage
+of the adversary is defined as
+Adv2ODH
+G,M(k) :=|Pr[2ODH-Exp1
+G,M(k) = 1]−
+Pr[2ODH-Exp0
+G,M(k) = 1]|
+We say that the Two Oracle Diffie-Hellman assumption holds for
+Gif for all PPT adversaries M, there exists a negligible function ϵ
+such that Adv2ODH
+G,M(k)≤ϵ(k).
+This assumption can be directly used to prove the security prop-
+erty we need for Key Agreement: the two oracles Oa(·),Ob(·)for-
+malize the ability of the adversary Mto learn KA.agree (sSKu,sPK)
+andKA.agree (sSKv,sPK)for different sPK, and the negligible ad-
+vantage of Min the above game corresponds to an inability to
+distinguish between s=su,v←H(дab), and s$←{0,1}k.
+3.3 Authenticated Encryption
+(Symmetric) Authenticated Encryption combines confidentiality
+and integrity guarantees for messages exchanged between two
+parties. It consists of a key generation algorithm that outputs a
+private key3, an encryption algorithm AE.enc that takes as input
+a key and a message and outputs a ciphertext, and a decryption
+algorithm AE.dec that takes as input a ciphertext and a key and
+outputs either the original plaintext, or a special error symbol ⊥.
+For correctness, we require that for all keys c∈ {0,1}kand all
+messages x,AE.dec (c,AE.enc (c,x)) =x. For security, we require
+indistinguishability under a chosen plaintext attack (IND-CPA) and
+ciphertext integrity (IND-CTXT) as defined in [ 7]. Informally, the
+3Without loss of generality, we make the simplifying assumption that the key genera-
+tion algorithm samples keys as uniformly random strings.guarantee is that for any adversary Mthat is given encryptions of
+messages of its choice under a randomly sampled key c(where cis
+unknown to M),Mcannot distinguish between fresh encryptions
+under cof two different messages, nor can Mcreate new valid
+ciphertexts (different from the ones it received) with respect to c
+with better than negligible advantage.
+3.4 Pseudorandom Generator
+We require a secure Pseudorandom Generator [ 9,54]PRG that
+takes in a uniformly random seed of some fixed length, and whose
+output space is [0,R)m(i.e. the input space for the protocol). Security
+for a Pseudorandom Generator guarantees that its output on a
+uniformly random seed is computationally indistinguishable from
+a uniformly sampled element of the output space, as long as the
+seed is hidden from the distinguisher.
+3.5 Signature Scheme
+The protocol relies on a standard UF-CMA secure signature scheme
+(SIG.gen, SIG.sign, SIG.ver). The key generation algorithm
+SIG.gen (k)→(dPK,dSK)takes as input the security parameter
+and outputs a secret key dSKand a public key dPK; the signing
+algorithm SIG.sign (dSK,m)→σtakes as input the secret key and
+a message and outputs a signature σ; the verification algorithm
+SIG.ver (dPK,m,σ)→{0,1}takes as input a public key, a message
+and a signature, and returns a bit indicating whether the signature
+should be considered valid. For correctness, we require that ∀m,
+Pr[(dPK,dSK)←SIG.gen( k),σ←SIG.sign( dSK,m) :
+SIG.ver( dPK,m,σ) = 1] = 1
+Security demands that no PPT adversary, given a fresh honestly
+generated public key and access to an oracle producing signatures
+on arbitrary messages, should be able to produce a valid signature
+on a message on which the oracle was queried on with more than
+negligible probability.
+3.6 Public Key Infrastructure
+To prevent the server from simulating an arbitrary number of clients
+(in the active-adversary model), we require the support of a public
+key infrastructure that allows clients to register identities, and sign
+messages using their identity, such that other clients can verify this
+signature, but cannot impersonate them. In this model, each party
+uwill register
+u,dPKu
+to a public bulletin board during the setup
+phase. The bulletin board will only allow parties to register keys
+for themselves, so it will not be possible for the attacking parties to
+impersonate honest parties.
+4 TECHNICAL INTUITION
+We note that our protocol is quite similar to the work of Ács and
+Castelluccia [ 3], and we give a detailed comparison between our
+approaches in Section 9. As in their protocol, we divide the parties
+into two classes: a single server Sthat aggregates inputs from n
+client partiesU. Each user4u∈U holds a private vector xuof
+dimension m; for simplicity we assume that the elements of xu
+andP
+u∈Uxuare in ZRfor some R. The goal of the protocol is to
+4We use the terms user and client interchangeably.
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1178
+computeP
+u∈Uxuin a secure fashion: at a high level, we guarantee
+that the server only learns a sum of the clients’ inputs containing
+contributions from at least a large fraction of the users and that the
+users learn nothing.
+4.0.1 Masking with One-Time Pads. The first observation is thatP
+u∈Uxucan be computed with perfect secrecy if xuis masked in
+a particular way. Assume a total order on users, and suppose each
+pair of users (u,v),u<vagree on some random vector su,v. Ifu
+adds this to xuandvsubtracts it from xv, then the mask will be
+canceled when their vectors are added, but their actual inputs will
+not be revealed. In other words, each user ucomputes:
+yu=xu+X
+v∈U:u<vsu,v−X
+v∈U:u>vsv,u(mod R)
+and sendsyuto the server, and the server computes:
+z=X
+u∈Uyu
+=X
+u∈U*.
+,xu+X
+v∈U:u<vsu,v−X
+v∈U:u>vsv,u+/
+-
+=X
+u∈Uxu(mod R)
+There are two shortcomings to this approach. The first is that
+the users must exchange the random vectors su,v, which, if done
+naively, would require quadratic communication overhead (|U|×| x|).
+The second is that there is no tolerance for a party failing to com-
+plete the protocol: if a user udrops out after exchanging vectors
+with other users, but before submitting yuto the server, the vector
+masks associated with uwould not be canceled in the sum z.
+4.0.2 Efficient Communication and Handling Dropped Users. We
+notice that we can reduce the communication by having the parties
+agree on common seeds for a pseudorandom generator (PRG) rather
+than on the entire mask su,v. These shared seeds will be computed
+by having the parties broadcast Diffie-Hellman public keys and
+engaging in a key agreement.
+One approach to handling dropped-out users would be to notify
+the surviving users of the drop-out, and to have them each reply
+with the common seed they computed with the dropped user. This
+approach still has a problem: additional users may drop out in the
+recovery phase before replying with the seeds, which would thus
+require an additional recovery phase for the newly dropped users’
+seeds to be reported, and so on, leading the number of rounds up
+to at most the number of users.
+We resolve this problem by using a threshold secret sharing
+scheme and having each user send shares of their Diffie-Hellman
+secret to all other users. This allows pairwise seeds to be recovered
+even if additional parties drop out during the recovery, as long as
+some minimum number of parties (equal to the threshold) remain
+alive and respond with the shares of the dropped users’ keys.
+This approach solves the problem of unbounded recovery rounds,
+but still has an issue: there is a possibility that a user’s data might
+accidentally be leaked to the server. Consider a scenario where a
+user uis too slow in sending her yuto the server. The server as-
+sumes that the user has dropped, and asks all other users to reveal
+Generate DH keypairs <c u  ,cu  > and <s u  ,su  >User Server
+Round 0:
+Advertise Keys
+Round 1:
+Share Keys
+Round 2:
+Masked Input
+Collection
+Round 3 :
+Consistency
+ChecksSend signed  public keys <c u,  su , σu>PK PK
+Broadcast list of received public keys to all users in u1
+Validate signatures , generate b u and compute  s u,v 
+Compute t-out-of-n secret shares for b u and s u
+Send encrypted shares of b u and s u
+Forward received encrypted shares
+Compute masked input y u 
+Send y u
+Wait for enough users u3⊆ u2
+Send a list of at least t survived users: u3 ⊆ u2
+Collect signaturesSKPK SK
+SK
+Sign u3 and reply with a signature σuPK SK
+Round 4:
+UnmaskingSend a list {v, σv}of survived users from u4 ⊆ u3  
+Compute x (the final aggregated value)Reconstruct secretsAbort if | u4| < t, validate signatures
+PKSend shares of b u for alive users and s u  for droppedAbort if |u3| < t
+'
+'Wait for enough users u1⊆ u
+Wait for enough users u2⊆ u1Figure 2: High-level view of our protocol. Red,
+underlined parts arerequired toguarantee security in
+the active-adversary model (and not necessary inthe
+honest-but-curious one).
+their shares of u’s secret key, in order to remove u’s uncancelled
+masks from z. However, just after receiving these shares and com-
+puting each of the su,vvalues, the server may receive the delayed
+yufrom u. The server is now able to remove all the masks from
+yu, and learn xuin the clear, breaking security for u. Moreover, an
+adversarial server in the active model can similarly learn xusimply
+by lying about whether user uhas dropped out.
+4.0.3 Double-Masking to Protect Security. To resolve this new
+security problem, we introduce a double-masking structure that
+protects xueven when the server can reconstruct u’s masks.
+First, each user usamples an additional random seed buduring
+the same round as the generation of the su,vvalues. During the
+secret sharing round, the user also generates and distributes shares
+ofbuto each of the other users. When generating yu, users also
+add this secondary mask:
+yu=xu+PRG (bu)
++X
+v∈U:u<vPRG su,v
+−X
+v∈U:u>vPRG sv,u(mod R)
+During the recovery round, the server must make an explicit
+choice with respect to each user u: from each surviving member
+v, the server can request either a share of the common secret su,v
+associated with uora share of the buforu; an honest user vwill
+never reveal both kinds of shares for the same user. After gathering
+at least tshares of su,vfor all dropped users and tshares of bufor
+all surviving users, the server can subtract off the remaining masks
+to reveal the sum.
+4.0.4 Putting it all Together. We summarize our protocol in Fig-
+ure 2 and its asymptotic costs in Figure 3. The computational cost
+is quadratic for the users, and cubic for the server. As the size of the
+data vector gets large, the communication and storage overhead for
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1179
+User Server5
+computation O(n2+mn) O(mn2)
+communication O(n+m)O(n2+mn)
+storage O(n+m) O(n2+m)
+Figure 3: Cost summary for the protocol.
+each of the clients and the server using our protocol approaches a
+multiplicative constant over sending the data in the clear.
+5 A PRACTICAL SECURE AGGREGATION
+PROTOCOL
+The protocol is run (in a synchronous network) between a server
+and a set of nusers, and consists of four rounds. Each user uholds
+as input a vector xu(of equal length m) consisting of elements from
+ZRfor some R. The server has no input, but can communicate with
+the users through secure (private and authenticated) channels. At
+any point, users can drop out of the protocol (in which case they
+stop sending messages completely), and the server will be able to
+produce a correct output as long as tof them survive until the
+last round. To simplify the notation we assume that each user u
+is assigned a unique “logical identity” (also denoted with u) in the
+form of an integer between 1andn, so that no two honest users
+share the same index6.
+A complete description is provided in Figure 4. We stress that, in
+the figure, when we say that the server “collects messages from at
+least tusers”, we mean that the server receives the messages from
+all users that have not dropped out/aborted in that round (recall
+that we prove our results in the synchronous setting), and aborts
+if the number of messages received is less than t. In a practical
+implementation, the server would wait until a specified timeout
+(considering all users who did not respond in time to have dropped
+out), and abort itself if not enough messages are received before
+such timeout.
+To prove security in the active adversary model, we also assume
+the existence of a Public Key Infrastructure, which for simplicity
+we abstract away by assuming all clients receive as input (from a
+trusted third party) public signing keys for all other clients.
+Overall, the protocol is parameterized over a security parameter
+k, which can be adjusted to bound the success probability of any
+attacker. In all theorems, we implicitly assume that the number
+of clients nis polynomially bounded in the security parameter.
+Moreover, some of the primitives also require additional global
+parameters.
+We note that Figure 4 presents both variants of the protocol:
+in the honest but curious case, since all parties are following the
+protocol honestly, we can avoid the use of signatures and the need
+for a PKI (which, most notably, allows us to avoid the Consisten-
+cyCheck round entirely).
+6 SECURITY ANALYSIS
+In our security arguments, we will make use of the following tech-
+nical lemma. It says that if users’ values have uniformly random
+5The server can reconstruct nsecrets from aligned (t,n)-Shamir shares in O(t2+nt)
+by caching Lagrange coefficients; see section 7.2 for details.
+6These identities will be bound to the users’ keys by a PKI. We rely on this in the
+active-adversary setting.pairwise masks added to them, then the resulting values look uni-
+formly random, conditioned on their sum being equal to the sum
+of the users’ values. In other words, the pairwise masks hide all
+information about users’ individual inputs, except for their sum.
+Lemma 6.1. Fixn,m,R,Uwith|U|=n, and{xu}u∈Uwhere
+∀u∈U,xu∈Zm
+R. Then,
+{{pu,v$←Zm
+R}u<v, pu,v:=−pv,u∀u>v
+:{xu+X
+v∈U\{ u}pu,v(mod R)}u∈U}
+≡
+{{wu$←Zm
+R}u∈Us.t.X
+u∈Uwu=X
+u∈Uxu(mod R)
+:{wu}u∈U}
+where “≡” denotes that the distributions are identical.
+We omit the proof, noting that it can be proved easily by induc-
+tion on n.
+6.1 Honest but Curious Security
+Here, we argue that our protocol is a secure multiparty computation
+in the honest but curious setting, regardless of how and when par-
+ties abort. In particular, we prove that when executing the protocol
+with threshold t, the joint view of the server and any set of less
+than t(honest) users does not leak any information about the other
+users’ inputs, besides what can be inferred from the output of the
+computation. Before formally stating our result, we introduce some
+notation.
+We will consider executions of our secure aggregation protocol
+where the underlying cryptographic primitives are instantiated
+with security parameter k, a server Sinteracts with a set Uofn
+users (denoted with logical identities 1,. . . , n) and the threshold is
+set to t. In such executions, users might abort at any point during
+the execution, and we denote with Uithe subset of the users that
+correctly sent their message to the server at round i−1, such that
+U⊇U 1⊇U 2⊇U 3⊇U 4⊇U 5. For example, users in U2\U 3
+are exactly those that abort before sending the message to the server
+in Round 2, but after sending the message of Round 1. If Round
+ConsistencyCheck has been omitted, define U4:=U3.
+Denote the input of each user uwithxu, and with xU′={xu}u∈U′
+the inputs of any subset of users U′⊆U .
+In such a protocol execution, the view of a party consists of its
+internal state (including its input and randomness) and all messages
+this party received from other parties (the messages sent by this
+party do not need to be part of the view because they can be deter-
+mined using the other elements of its view). Moreover, if the party
+aborts, it stops receiving messages and the view is not extended
+past the last message received.
+Given any subset C ⊆ U ∪ { S}of the parties, let
+REALU,t,k
+C(xU,U1,U2,U3,U4,U5)be a random variable repre-
+senting the combined views of all parties in Cin the above protocol
+execution, where the randomness is over the internal randomness
+of all parties, and the randomness in the setup phase.
+Our first theorem shows that the joint view of any subset of
+honest users (excluding the server) can be simulated given only the
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1180
+Secure Aggregation Protocol
+•Setup:
+–All parties are given the security parameter k, the number of users nand a threshold value t, honestly generated pp←KA.gen (k), parameters
+mandRsuch that Zm
+Ris the space from which inputs are sampled, and a field Fto be used for secret sharing. All users also have a private
+authenticated channel with the server.
+–Allusers ureceive their signing keydSKufrom thetrusted third party, together with verification keys dPKvbound toeach user identityv.
+•Round 0(AdvertiseKeys):
+Useru:
+–Generate key pairs (cPKu,cSKu)←KA.gen( pp),(sPKu,sSKu)←KA.gen( pp),andgenerateσu←SIG.sign( dSKu,cPKu||sPKu).
+–Send (cPKu||sPKu||σu)to the server (through the private authenticated channel) and move to next round.
+Server :
+–Collect at least tmessages from individual users in the previous round (denote with U1this set of users). Otherwise, abort.
+–Broadcast to all users in U1the list{(v,cPKv,sPKv,σv)}v∈U1and move to next round.
+•Round 1(ShareKeys):
+Useru:
+–Receive the list{(v,cPKv,sPKv,σv)}v∈U1broadcasted by the server. Assert that |U1|≥t, that all the public key pairs are different, andthat
+∀v∈U 1,SIG.ver( dPKv,cPKv||sPKv,σu) = 1.
+–Sample a random element bu←F(to be used as a seed for a PRG).
+–Generate t-out-of-|U1|shares of sSKu:{(v,sSKu,v)}v∈U1←SS.share( sSKu,t,U1)
+–Generate t-out-of-|U1|shares of bu:{(v,bu,v)}v∈U1←SS.share( bu,t,U1)
+–For each other user v∈U 1\{u}, compute eu,v←AE.enc(KA.agree( cSKu,cPKv),u||v||sSKu,v||bu,v)
+–If any of the above operations (assertion, signature verification, key agreement, encryption) fails, abort.
+–Send all the ciphertexts eu,vto the server (each implicitly containing addressing information u,vas metadata).
+–Store all messages received and values generated in this round, and move to the next round.
+Server :
+–Collect lists of ciphertexts from at least tusers (denote with U2⊆U 1this set of users).
+–Sends to each user u∈U 2all ciphertexts encrypted for it: {eu,v}v∈U2and move to the next round.
+•Round 2(MaskedInputCollection):
+Useru:
+–Receive (and store) from the server the list of ciphertexts {eu,v}v∈U2(and infer the set U2). If the list is of size < t, abort.
+–For each other user v∈ U 2\{u}, compute su,v←KA.agree (sSKu,sPKv)and expand this value using a PRG into a random vector
+pu,v= ∆u,v·PRG (su,v), where ∆u,v= 1when u>v, and ∆u,v=−1when u<v(note that pu,v+pv,u= 0∀u̸=v). Additionally, define
+pu,u= 0.
+–Compute the user’s own private mask vector pu=PRG (bu). Then, Compute the masked input vector yu←xu+pu+P
+v∈U2pu,v(mod R)
+–If any of the above operations (key agreement, PRG) fails, abort. Otherwise, Send yuto the server and move to the next round.
+Server :
+–Collect yufrom at least tusers (denote with U3⊆U 2this set of users). Send to each user in U3the listU3.
+•Round 3(ConsistencyCheck):
+Useru:
+–Receive from theserver alistU3⊆U 2consisting ofatleast tusers (including itself). IfU3issmaller than t,abort.
+–Send totheserverσ′u←SIG.sign( dSKu,U3).
+Server :
+–Collectσ′ufrom atleast tusers (denote withU4⊆U 3thissetofusers). Send toeach user inU4theset{v,σ′v}v∈U4.
+•Round 4(Unmasking):
+Useru:
+–Receive from the server a list {v,σ′v}v∈U4. Verify thatU4⊆U 3, that|U4|≥tandthatSIG.ver( dPK,U3,σ′v) = 1 forallv∈U 4(otherwise
+abort).
+–For each other user vinU2\{u}, decrypt the ciphertext v′||u′||sSKv,u||bv,u←AE.dec (KA.agree (cSKu,cPKv),ev,u)received in the Masked-
+InputCollection round and assert that u=u′∧v=v′.
+–If any of the decryption operations fail (in particular, the ciphertext does not correctly authenticate), abort.
+–Send a list of shares to the server, which consists of sSKv,ufor usersv∈U 2\U 3andbv,ufor users in v∈U 3.
+Server (generating the output):
+–Collect responses from at least tusers (denote with U5this set of users).
+–For each user in u∈ U 2\U 3, reconstruct sSKu←SS.recon ({sSKu,v}v∈U5,t)and use it (together with the public keys received in the
+AdvertiseKeys round) to recompute pv,ufor allv∈U 3using the PRG.
+–For each user u∈U 3, reconstruct bu←SS.recon({bu,v}v∈U5,t)and then recompute puusing the PRG.
+–Compute and output z=P
+u∈U3xuasP
+u∈U3xu=P
+u∈U3yu−P
+u∈U3pu+P
+u∈U3,v∈U2\U3pv,u
+Figure 4: Detailed description of the Secure Aggregation protocol. Red, underlined parts arerequired toguarantee security in
+theactive-adversary model (and notnecessary inthehonest-but-curious one).
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1181
+knowledge of the inputs of those users. Intuitively, this means that
+those users learn “nothing more” than their own inputs.
+Theorem 6.2 (Honest But Curious Security, against clients
+only). There exists a PPT simulator SIM such that for all k,t,U
+with t≤ |U| ,xU,U1,U2,U3,U4,U5andCsuch thatC ⊆ U ,
+U ⊇U 1⊇U 2⊇U 3⊇U 4⊇U 5, the output of SIMis perfectly
+indistinguishable from the output of REALU,t,k
+C:
+REALU,t,k
+C(xU,U1,U2,U3,U4,U5)
+≡
+SIMU,t,k
+C(xC,U1,U2,U3,U4,U5)
+Proof. Note that, since the view of the server is omitted, the
+joint view of the parties in Cdoes not depend (in an information the-
+oretic sense) on the inputs of the parties not in C. The simulator can
+therefore produce a perfect simulation by running the honest but
+curious users on their true inputs, and all other users on a dummy
+input (for example, a vector of 0s), and outputting the simulated
+view of the users in C. In more detail, the only value sent by the
+honest parties which depend on their input is yu(sent to the server
+in round MaskedInputCollection ). One can easily note that the
+response sent by the server to the users in round MaskedInput-
+Collection just contains a list of user identities which depends
+on which users responded on the previous round, but not on the
+specificyuvalues of the responses. This means that the simula-
+tor can use dummy values for the inputs of all honest parties not
+inC, and the joint view of users in Cwill be identical to that in
+REALU,t,k. □
+In our next theorem, we consider security against an honest-
+but-curious server, who can additionally combine knowledge with
+some honest-but-curious clients. We show that any such group
+of honest-but-curious parties can be simulated given the inputs
+of the clients in that group, and only the sum of the values of the
+remaining clients. Intuitively, this means that those clients and
+the server learn “nothing more” than their own inputs, and the
+sum of the inputs of the other clients. Additionally, if too many
+clients abort before Round Unmasking , then we show that we
+can simulate the view of the honest-but-curious parties given no
+information about the remaining clients’ values. Thus, in this case,
+the honest-but-curious parties learn nothing about the remaining
+clients’ values.
+Importantly, the view to be simulated must contain fewer than t
+honest-but-curious clients, or else we cannot guarantee security.
+Theorem 6.3 (Honest But Curious Security, with curi-
+ous server). There exists a PPT simulator SIM such that for all
+t,U,xU,U1,U2,U3,U4, andCsuch thatC⊆U∪{ S},|C\{S}|<t,
+U⊇U 1⊇U 2⊇U 3⊇U 4⊇U 5, the output of SIMis computa-
+tionally indistinguishable from the output of REALU,t,k
+C:
+REALU,t,k
+C(xU,U1,U2,U3,U4,U5)
+≈cSIMU,t,k
+C(xC,z,U1,U2,U3,U4,U5)
+where
+z=P
+u∈U 3\Cxu if|U3|≥t
+⊥ otherwise.Proof. We prove the theorem by a standard hybrid argument.
+We will define a simulator SIMthrough a series of (polynomially
+many) subsequent modifications to the random variable REAL , so
+that any two subsequent random variables are computationally
+indistinguishable.
+Hyb0This random variable is distributed exactly as REAL ,
+the joint view of the parties Cin a real execution of the
+protocol.
+Hyb1In this hybrid, we change the behavior of simulated
+honest parties in the set U2\C, so that instead of using
+KA.agree (cSKu,cPKv)to encrypt and decrypt messages to
+other users vin the same set, they use a uniformly random
+encryption key cu,vchosen by the simulator. The Deci-
+sional Diffie-Hellman assumption (as recalled in Definition
+3.1) guarantees that this hybrid is indistinguishable from
+the previous one.
+Hyb2In this hybrid, we substitute all ciphertexts encrypted
+by honest parties in the set U2\Cand sent to other honest
+parties with encryptions of 0(padded to the appropriate
+length) instead of shares of sSKuandbu. However, the hon-
+est clients in that set continue to respond with the correct
+shares of sSKuandbuin Round Unmasking . Since only
+the contents of the ciphertexts have changed, IND-CPA
+security of the encryption scheme guarantees that this
+hybrid is indistinguishable from the previous one.
+Hyb3Define:
+U∗=U2\C ifz=⊥
+U2\U 3\C otherwise.
+This hybrid is distributed exactly as the previous one, but
+here we substitute all shares of bugenerated by parties
+u∈ U∗and given to the corrupted parties in Round
+ShareKeys with shares of 0(using a different sharing of
+0for every u∈U∗). Note that, in this hybrid and the pre-
+vious one, the adversary does not receive any additional
+shares of bufor users uin the setU∗in Round Unmask-
+ing, either because the honest clients do not reveal shares
+ofbufor such u, or because all honest clients abort (when
+|U3|<t, which happens exactly when z=⊥). Thus, MC’s
+joint view contains only |C|<tshares of each bu. The
+properties of Shamir’s secret sharing thus guarantee that
+the distribution of any |C|shares of 0is identical to the
+distribution of an equivalent number of shares of any given
+secret bu, making this hybrid identically distributed to the
+previous one.
+Hyb4In this hybrid, for all parties u∈U∗, instead of com-
+puting pu←PRG (bu), we set it to be a uniformly random
+vector (of the appropriate size).
+Note that, in the previous hybrid, since buis chosen
+uniformly at random and its shares given to the adversary
+are substituted with shares of 0, the output of the random
+variable does not depend on the seed of the PRG except
+through the PRG ’s output. Therefore, the only change in
+this hybrid boils down to substituting the output of a PRG
+(on a randomly generated seed otherwise independent from
+the joint view of parties in C) with a uniformly random
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1182
+value. Therefore, leveraging the security of the PRG , we
+can argue that this hybrid is indistinguishable from the
+previous one.
+Hyb5For all parties u∈U∗, in Round MaskedInputCol-
+lection, instead of sending:
+yu←xu+pu+X
+v∈U 2pu,v
+we send:
+yu←pu+X
+v∈U 2pu,v
+Since puwas changed in the previous hybrid to be uni-
+formly random and independent of any other values,
+xu+puis also uniformly random, and so this hybrid and
+the previous hybrid are identically distributed. Further, this
+hybrid and all subsequent hybrids do not depend on the
+values xuforu∈U∗.
+Note: Ifz=⊥, then we can ignore the further hybrids,
+and let SIMbe as described in Hyb5, since SIMcan already
+simulate REAL without knowing xufor any u/∈C. There-
+fore in the following hybrids we assume z̸=⊥.
+Hyb6This random variable is distributed exactly as the previ-
+ous one, but here we substitute all shares of sSKugenerated
+by parties u∈U 3\Cand given to the corrupted parties
+in Round ShareKeys with shares of 0(using a different
+sharing of 0for every u∈U 3\C). Following an analogous
+argument to that for Hyb3, the properties of Shamir’s secret
+sharing guarantee that this hybrid is identically distributed
+to the previous one.
+Hyb7We fix a specific user u′∈ U 3\C. For this user,
+and each other user u∈ U 3\C, in order to compute
+the valueyusent to the server, we substitute the joint
+noise key (which would be computed by u′anduas
+su′,u=su,u′←KA.agree (sSK
+u′,sPKu)) with a uniformly
+random value (which will used by both parties as a PRG
+seed).
+In more detail, for each user u∈U 3\C\{ u′}, a value
+s′
+u′,uis sampled uniformly at random and, instead of send-
+ing
+yu←xu+pu+X
+v∈U 2pu,v
+SIMsends
+y′
+u←xu+pu+X
+v∈U 2\{u′}pu,v+ ∆u,u′·PRG( s′
+u′,u)
+and accordingly
+y′
+u′←xu′+pu′+X
+v∈U 2∆u′,v·PRG( s′
+u′,v)
+where ∆u,v= 1when u>vand∆u,v=−1when u<v.
+It is easy to see that the Decisional Diffie-Hellman As-
+sumption (Definition 3.1) guarantees that this hybrid is
+indistinguishable from the previous one7.
+7It is important to note here that, in the previous hybrids, we removed all shares of
+sSK
+uforu∈U 3\Cfrom the joint view of parties in C. Without doing so, we could
+not reduce to the security of DH Key Agreement.Hyb8In this hybrid, for the same party u′chosen in the pre-
+vious hybrid and all other parties v∈ U 3\C, instead
+of computing pu′,v←∆u′,v·PRG (s′
+u′,v), we compute it
+using fresh randomness ru′,v(of the appropriate size) as
+pu′,v←∆u′,v·ru′,v.
+Note that, in the previous hybrid, since s′
+u′,vis chosen
+uniformly at random (and independently from the Diffie-
+Hellman keys), the output of the random variable does not
+depend on the seed of the PRG except through the PRG ’s
+output. Therefore, the only change in this hybrid boils
+down to substituting the output of a PRG (on an randomly
+generated seed otherwise independent from the joint view
+of parties inC) with a uniformly random value. Therefore,
+leveraging the security of the PRG , we can argue that this
+hybrid is indistinguishable from the previous one.
+Hyb9In this hybrid, for all users u∈ U 3\C, in round
+MaskedInputCollection instead of sending:
+yu←xu+pu+X
+v∈U 2pu,v
+=xu+pu+X
+v∈U 3\Cpu,v+X
+v∈U 2\U3\Cpu,v
+we send:
+yu←wu+pu+X
+v∈U 2\U3\Cpu,v
+Where{wu}u∈U 3\Care uniformly random, subject toP
+U3\Cwu=P
+U3\Cxu=z. Invoking Lemma 6.1 with
+n=|U3\C|, we have that this hybrid is identically dis-
+tributed to the previous one. Moreover, note that to sample
+from the random variable described by this hybrid, knowl-
+edge of the individual xuforu∈U 3\Cis not needed, and
+their sum zis sufficient.
+We can thus define a PPT simulator SIMthat samples from the distri-
+bution described in the last hybrid. The argument above proves that
+the output of the simulator is computationally indistinguishable
+from the output of REAL, completing the proof. □
+6.2 Privacy against Active Adversaries
+In this section we discuss our argument for security against active
+adversaries (detailed proofs can be found the in full version of this
+paper). By active adversaries, we mean parties (clients or the server)
+that deviate from the protocol, sending incorrect and/or arbitrarily
+chosen messages to honest users, aborting, omitting messages, and
+sharing their entire view of the protocol with each other, and also
+with the server (if the server is also an active adversary).
+We note that we only show input privacy for honest users: it is
+much harder to additionally guarantee correctness andavailability
+for the protocol when some users are actively adversarial. Such
+users can distort the output of the protocol by setting their input val-
+uesxuto be out of range8, by sending inconsistent Shamir shares to
+other users in Round ShareKeys , or by reporting incorrect shares
+8Typically, each element of xuis expected to be from a range [0,RU)⊂[0,R),
+such that the sum of all xuis in [0,R). However, an actively adversarial user could
+choose xuoutside the expected range, i.e. on [RU,R), allowing the adversarial user
+disproportionate impact on protocol’s result, thus undermining correctness.
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1183
+to the server in Round Unmasking . Making such deviations effi-
+cient to detect and possibly recover from is left to future work.
+We note some key differences between the argument for honest-
+but-curious security, and the argument for privacy against active
+adversaries.
+The first key difference is that, for the proof against active adver-
+saries, we assume that there exists a public-key infrastructure (PKI),
+which guarantees to users that messages they receive came from
+other users (and not the server). Without this assumption, the server
+can perform a Sybil attack on the users in Round ShareKeys , by
+simulating for a specific user uall other users vin the protocol and
+thus receiving all u’s key shares and recovering that users’ input.
+Alternatively, we can require the server to act honestly in its first
+message (in Round ShareKeys ). Specifically, the server must hon-
+estly forward the Diffie-Hellman public keys it receives to all other
+users, allowing them to set up pairwise private and authenticated
+channels amongst themselves.
+However, if we assume a PKI, then we observe that the server’s
+power in the remainder of the protocol is reduced to lying to users
+about which other users have dropped out: since all user-to-user
+messages (sent in round ShareKeys ) are authenticated through an
+authenticated encryption scheme, the server cannot add, modify
+or substitute messages, but rather, can only fail to deliver them.
+Note, importantly, that the server can try to give a different view
+to each user of which other users have dropped out of the protocol.
+In the worst case, this could allow the server to learn a different
+set of shares from each user in Round Unmasking, allowing it to
+potentially reconstruct more secrets than it should be allowed to.
+TheConsistencyCheck round is included in the protocol to deal
+with this issue. The inclusion of the ConsistencyCheck round is
+the second key difference with the honest-but-curious proof.
+The final key difference is that we need the proof to be in the
+random oracle (RO) model. To see why, notice that honestly acting
+users are essentially “commited” to their secrets and input by the
+end of the MaskedInputCollection round. However, the server
+can adaptively choose which users drop after the MaskedInput-
+Collection round. This causes problems for a simulation proof,
+because the simulator doesn’t know honest users’ real inputs, and
+must use dummy information in the earlier rounds, thus “commit-
+ting” itself to wrong values that are potentially easily detectable.
+The random oracle adds a trapdoor for the simulator to equivo-
+cate, so that even if it commits to dummy values in early rounds,
+it can reprogram the random oracle to make the dummy values
+indistinguishable from honest users’ values. A full proof of security
+appears in the full version of this paper.
+6.3 Interpretation of Results
+We summarize our system for the different security models we
+consider in Figure 5.
+6.3.1 Security against only clients. In each of Theorems 6.2 and
+6.4, we see that the joint view of any subset of clients, honest or
+adversarial, can be simulated given no information about the values
+of the remaining clients. This means, no matter how we set our t
+parameter, clients on their own learn nothing about other clients.
+Theorem 6.4 (Privacy against actively adversarial users,
+with honest server). There exists a PPT simulator SIMsuch thatThreat model Minimum
+thresholdMinimum
+inputs in sum
+Client-only adversary 1 t
+Server-only adversary ⌊n
+2⌋+ 1 t
+Clients-Server collusion ⌊2n
+3⌋+ 1 t−nC
+Figure 5: Parameterization for different threat models. “Min-
+imum threshold” denotes the minimum value of trequired
+for security in the given threat model. “Minimum inputs in
+the sum” denotes a lower bound on the number of users’ val-
+ues that are included in the sum learned by the server. nde-
+notes the total number of users, while nCis the number of
+corrupt users.
+for all PPT adversaries MC, allk,t,U,xU\C,C⊆U , the output of
+SIMis perfectly indistinguishable from the output of REALU,t,k
+C:
+REALU,t,k
+C(MC,xU\C)≡SIMU,t,k
+C(MC)
+Proof. See full version of this paper. □
+6.3.2 Security against only the server. From Theorems 6.3 and
+6.5, we see that if we set nC= 0, that is, there are no clients who
+cheat or collaborate with the server, then setting t≥ ⌊n
+2⌋+ 1
+guarantees that the sum learned by the server contains the values
+of at least t>n
+2clients, and the protocol can deal with up to ⌈n
+2⌉−1
+dropouts.
+Theorem 6.5 (Privacy against active adversaries, includ-
+ing the server). There exists a PPT simulator SIMsuch that for all
+k,t,U,C⊆U∪{ S}andxU\C , letting n=|U|andnC=|C∩U| ,
+if2t>n+nC, then the output of SIMis computationally indistin-
+guishable from the output of REALU,t,k:
+REALU,t,k
+C(MC,xU\C)≈cSIMU,t,k,Idealδ
+{xu}u∈U\C
+C(MC)
+whereδ=t−nC.
+Proof. See full version of this paper. □
+6.3.3 Security against a server colluding with clients. From The-
+orems 6.3 and 6.5, we see that we can allow a server (honest or
+adversarial) to collaborate with up to nC=⌈n
+3⌉−1users (honest or
+adversarial), if we set t≥⌊2n
+3⌋+ 1, at the same time guaranteeing
+that the sum learned by the server contains the values of at leastn
+3
+clients. Additionally, the protocol is robust to up to ⌈n
+3⌉−1users
+dropping out.
+For all the results above, we reiterate that if we want security
+against servers that are allowed to actively deviate from the protocol
+(whether or not they collaborate with clients), we must use include
+the protocol features highlighted in Figure 4.
+7 EVALUATION
+We summarize the protocol’s performance in Table 3. All calcula-
+tions below assume a single server and nusers, where each user
+holds a data vector of size m. We evaluate the honest-but-curious
+version of the protocol, and ignore the cost of the PKI, all signatures,
+and Round ConsistencyCheck . We note that including their cost
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1184
+does not change any of the asymptotics, and only slightly increases
+the computation and communication costs.
+7.1 Performance Analysis of Client
+Computation cost: O(n2+mn).Each user u’s computation cost
+can be broken up as (1) Performing the 2nkey agreements, which
+take O(n)time, (2) Creating t-out-of- nShamir secret shares of sSKu
+andbu, which is O(n2)and (3) Generating values puandpu,vfor
+every other user vfor each entry in the input vector by stretching
+onePRG seed each, which takes O(mn)time in total. Overall, each
+user’s computation is O(n2+mn).
+Communication cost: O(n+m).The communication costs of
+each user can be broken up into 4 parts: (1) Exchanging keys with
+each other user by sending 2and receiving 2(n−1)public keys, (2)
+Sending 2(n−1)and receiving 2(n−1)encrypted secret shares, (3)
+Sending a masked data vector of size mlog2Rto the server, and
+(4) Sending the server nsecret shares, for an overall communication
+cost of 2naK+ (5n−4)aS+mlog2R, where aKandaSare the
+number of bits in a key exchange public key and the number of bits
+in a secret share, respectively. Overall, the user’s communication
+complexity is O(n+m). Assuming inputs for each user are on the
+same range [0,RU−1], we require R=n(RU−1) + 1 to avoid
+overflow. A user could transmit its raw data using mlog2RUbits.
+Taking aK=aS= 256 bits implies a communication expansion
+factor of256(7 n−4)+m⌈log2R⌉
+m⌈log2RU⌉. For RU= 216(i.e. 16-bit input values),
+m= 220elements, and n= 210users, the expansion factor is 1.73×;
+forn= 214users, it is 3.62×. For m= 224elements and n= 214
+users, the expansion factor is 1.98×.
+Storage cost: O(n+m). The user must store the keys and secret-
+shares sent by each other user, which are O(n)in total, and the data
+vector (which it can mask in-place), which has size O(m).
+7.2 Performance Analysis of Server
+Computation cost: O(mn2).The server’s computation cost can be
+broken down as (1) Reconstructing n t-out-of- nShamir secrets (one
+for each user), which takes total time O(n2), and (2) generating and
+removing the appropriate pu,vandpuvalues from the sum of the
+yuvalues received, which takes time O(mn2)in the worst case.
+We note that reconstructing nsecrets in the Shamir scheme
+takes O(n3)time in the general case: each secret reconstruction
+SS.recon ({(u,su)}u∈U′,t)→samounts to interpolating a polyno-
+mial Lover the points encoded by the shares and then evaluating
+at 0, which can be accomplished via Lagrange polynomials:
+s=L(0) =X
+u∈U′suY
+v∈U′\{u}v
+v−u(mod p)
+Each reconstruction requires O(n2)computation and we must
+perform nreconstructions, implying O(n3)total time. However,
+in our setting, we can perform all of the reconstructions in O(n2)
+time by observing that all of our secrets will be reconstructed from
+identically-indexed sets of secret shares – that is, U′is fixed across
+all secrets, because in round Unmasking , each user that is still
+alive sends a share of every secret that needs to be reconstructed.Therefore, we can precompute the Lagrange basis polynomials
+ℓu=Y
+v∈U′\{u}v
+v−u(mod p)
+inO(n2)time and O(n)space, then reconstruct each of nsecrets
+inO(n)time as L(0) =P
+u∈U′suℓu(mod p)resulting in a total
+computational cost of O(n2)to reconstruct all the secrets.
+We also note that the O(mn2)term can be broken into O(m(n−
+d)+md(n−d)), where dis the number of users that dropped from the
+protocol. In practice, dmay be significantly smaller than n, which
+would also reduce the server’s computation cost.
+Communication cost: O(n2+mn).The server’s communication
+cost is dominated by its mediation of all pairwise communications
+between users, which is O(n2), and also for receiving masked data
+vectors from each user, which is O(mn)in total.
+Storage cost: O(n2+m).The server must store tshares for each
+user, which is O(n2)in total, along with an m-element buffer in
+which to maintain a running sum of yuas they arrive.
+7.3 Prototype Performance
+In order to measure performance, we implemented a prototype in
+Java, with the following cryptographic primitives:
+•For Key Agreement, we used Elliptic-Curve Diffie-Hellman
+over the NIST P-256 curve, composed with a SHA-256 hash.
+•For Secret Sharing, we used standard t-out-of- nShamir
+Sharing.
+•For Authenticated Encryption, we used AES-GCM with
+128-bit keys.
+•For the Pseudorandom Number Generator, we used AES
+in counter mode.
+We assume an honest-but-curious setting, and thus omitted the
+portions of Figure 4 special to active clients from our simulations.
+We note that these omissions would not change the overall shape
+of our results in practice, since, as we discuss below, the bulk of the
+costs involve masking, storing and sending the large data vector.
+Additionally, we assume that when clients drop out of the pro-
+tocol, that they drop after sending their shares to all other clients,
+but before sending their masked input to the server. This is essen-
+tially the “worst case” dropout, since all other clients have already
+incorporated the dropped clients’ masks, and the server must per-
+form an expensive recovery computation to remove them. We also
+assumed that client’s data vectors had entries such that at most
+3 bytes are required to store the sum of up to all clients’ values
+without overflow.
+We ran single-threaded simulations on a Linux workstation with
+an Intel Xeon CPU E5-1650 v3 (3.50 GHz), with 32 GB of RAM. Wall-
+clock running times and communication costs for clients are plotted
+in Figure 6. Wall clock running times for the server are plotted in
+Figure 7, with different lines representing different percentages of
+clients dropping out. Figure 8 shows wall-clock times per round
+for both the client and the server. We omit data transfer plots for
+the server, as they are essentially identical to those for the client,
+except higher by a factor of n. This is because the incoming data
+of the server is exactly the total outgoing data of all clients, and
+vice versa. We also do not plot bandwidth numbers for different
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1185
+(a) Wall-clock running time per client, as the number of clients in-
+creases. The data vector size is fixed to 100K entries.
+(b) Wall-clock running time per client, as the size of the data vector
+increases. The number of clients is fixed to 500.
+(c) Total data transfer per client, as the number of clients increases.
+Different lines show different data vector sizes. Assumes no dropouts.
+(d) Total data expansion factor per client, as compared to sending the
+raw data vector to the server. Different lines represent different values
+ofn. Assumes no dropouts.
+Figure 6: Client Running Time and Data Transfer Costs. All wall-clock running times are for a single-threaded client imple-
+mented in Java, and ignore communication latency. Plotted points represent averages over 10 end-to-end iterations, and error
+bars represent 95% confidence intervals. (Error bars are omitted where measured standard deviation was less than 1%).
+numbers of dropouts, as the number of dropouts does not have a
+significant impact on this metric.
+In our simulations, for both the client and the server, almost all
+of the computation cost comes from expanding the various PRG
+seeds to mask the data vector. Compared to this, the computational
+costs of key agreement, secret sharing and reconstruction, and
+encrypting and decrypting messages between clients, are essentially
+negligible, especially for large choices of nand data vector size. This
+suggests that using an optimized PRG implementation would yield
+a significant running-time improvement over our prototype.
+As seen in Figures 6a and 6b, the running time of each client
+increases linearly with both the total number of clients and the
+number of data vector entries, but does not change significantly
+when more clients drop out. In Figure 6c, the communication expan-
+sion factor for each client increases as the total number of clients
+increases, but this increase is relatively small compared to the im-
+pact of increasing the size of the data vector. This is also reflected
+in Figure 6d, where the communication expansion factor for each
+client increases as the total number of clients increases, but fallsquickly as the size of the data vector increases. This shows that the
+cost of messages between clients amortizes well as the size of the
+data vector increases.
+In the case of the server, Figures 7a and 7b show that the run-
+ning time of the server increases significantly with the fraction of
+dropouts. This is because, for each dropped client u, the server must
+remove that client’s pairwise masks pu,vfrom each other surviving
+clientv, which requires (n−d)PRG expansions, where dis the
+number of dropped users. In contrast, each undropped user entails
+only a single PRG expansion, to remove its self-mask. The high
+cost of dealing with dropped users is also reflected in the server
+running times in Figure 8.
+In Figure 9, we show the results of running the protocol over a
+Wide Area Network (WAN). The server and clients were run on
+geographically seperated datacenters, with contention for CPU and
+network. We give the standard deviations of the running times,
+which reflects this contention, and occasional machine failures
+(<1% of clients per execution). We observe that the clients have
+a somewhat shorter runtime than the server: this is because the
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1186
+(a) Wall-clock running time for the server, as the number of clients
+increases. The data vector size is fixed to 100K entries.
+(b) Wall-clock running time for the server, as the size of the data vector
+increases. The number of clients is fixed to 500.
+Figure 7: Server Running Time and Data Transfer Costs. All wall-clock running times are for a single-threaded server imple-
+mented in Java, and ignore communication latency. Plotted points represent averages over 10 end-to-end iterations. Error bars
+are omitted where measured standard deviations are less than 1%.
+Num. Clients Dropouts AdvertiseKeys ShareKeys MaskedInputColl. Unmasking Total
+Client 500 0% 1ms 154ms 694ms 1ms 849ms
+Server 500 0% 1 ms 26 ms 723 ms 1268 ms 2018 ms
+Server 500 10% 1 ms 29 ms 623 ms 61586 ms 62239 ms
+Server 500 30% 1 ms 28 ms 514 ms 142847 ms 143389 ms
+Client 1000 0% 1ms 336ms 1357 ms 5ms 1699 ms
+Server 1000 0% 6 ms 148 ms 1481 ms 3253 ms 4887 ms
+Server 1000 10% 6 ms 143 ms 1406 ms 179320 ms 180875 ms
+Server 1000 30% 8 ms 143 ms 1169 ms 412446 ms 413767 ms
+Figure 8: CPU wall clock times per round. All wall-clock running times are for a single-threaded servers and clients imple-
+mented in Java, and ignore communication latency. Each entry represents the average over 10 iterations. The data vector size
+is fixed to 100K entries with 24 bit entries.
+Num. Clients Total Runtime Per-Client StdDev Server Total Runtime StdDev Total Communication Per Client
+500 13159 ms 6443 ms 14670 ms 6574 ms 0.95 MB
+1000 23497 ms 6271 ms 27855 ms 6874 ms 1.15 MB
+Figure 9: End-to-End running time for the protocol, executed over a wide-area-network. All running times are for a single-
+threaded servers and clients running in geographically separated datacenters, and include computation time, network latency,
+and time spent waiting for other participants. Each entry represents the average over 15 iterations, with iterations more than
+3 standard deviations from the mean discarded. The data vector size is fixed to 100K entries with 62 bits per entry, and there
+are no induced dropouts (beyond <1% that occurred naturally).
+server has to run the additional (expensive) unmasking step after
+all clients have completed.
+8 DISCUSSION AND FUTURE WORK
+Identifying and Recovering from Abuse The security proof in
+Theorem 6.5 guarantees that when users’ inputs are learned by the
+server, they are always in aggregate with the values of other users.
+However, we do not protect against actively adversarial clients that
+try to prevent the server from learning anysum at all. For example,
+an attacker-controlled client could send malformed messages to
+other clients, causing enough of them to abort that the protocolfails before the server can compute its output. Ideally, we would
+like such abuse by corrupt clients to be efficiently identifiable, and
+the protocol to gracefully recover from it. However, the problem of
+assigning blame for abuse is subtle, and often adds several rounds
+to protocols. We leave this problem to future work.
+Enforcing Well-formed Inputs Our protocol also does not
+verify that users’ inputs are well-formed or within any particular
+bounds, so actively adversarial users could send arbitrary values of
+their choice, that can cause the output learned by the server to also
+be ill-formed. For our specific machine learning application, we
+will be able to detect obviously malformed outputs and can simply
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1187
+run the protocol again with a different set of clients. However, an
+adversarial client may be able to supply “slightly” malformed input
+values that are hard to detect, such as double its real values.
+A possible solution is to use zero-knowledge proofs that the
+client inputs are in the correct range. Unfortunately, even using the
+best-known garbled circuit techniques [ 34], even one such proof
+would be more costly than the entire protocol. We leave the problem
+of guaranteeing well-formed inputs from the clients to future work.
+Reducing Communication Further In the protocol we de-
+scribe, all clients exchange pairwise masks with all other clients.
+However, it may be sufficient to have the clients exchange masks
+with only a subset of other clients, as long as these subsets of clients
+do not form disjoint clusters. In fact, previous works (notably, Ács
+et al. [ 3]) use this approach already. However, in our setting, this
+requires extra care because the server facilitates the communica-
+tion among clients, and an actively adversarial server can choose
+dropouts based on its knowledge of which pairs of clients exchanged
+masks with each other. We leave this improvement to future work.
+9 RELATED WORK
+As noted in Section 2, we emphasize that our focus is on mobile
+devices, where bandwidth is expensive, and dropouts are common,
+and in our setting there is a single service provider. Consequently,
+our main goal is to minimize communication while guaranteeing
+robustness to dropouts. Computational cost is an important, but
+secondary, concern. These constraints will motivate our discussion
+of, and comparison with, existing works.
+Works based on Multiple non-Colluding Servers: To over-
+come the constraints of client devices, some previous work has
+suggested that clients distribute their trust across multiple non-
+colluding servers, and this has been deployed in real-world ap-
+plications [ 10]. The recently presented Prio system of Gibbs and
+Boneh [ 16] is, from the perspective of the client devices, non-
+interactive, and the computation among the servers is very light-
+weight. Prio also allows client inputs to be validated, something
+our current system cannot do, by relying on multiple servers.
+Araki et al. recently presented a generic three-party computation
+protocol that achieves very high throughput [ 5]. This protocol could
+also be used in a setting where non-colluding servers are available,
+with the clients sending shares to each server that will be combined
+online.
+Works based on Generic Secure Multiparty Computation:
+As noted in Section 1, there is a long line of work showing how
+multiple parties can securely compute any function using generic
+secure MPC [ 8,18,27,40,41]. These works generally fall into two
+categories: those based on Yao’s garbled circuits, and those based
+on homomorphic encryption or secret sharing. The protocols based
+on Yao’s garbled circuits are better suited to 2- or 3-party secure
+computation and do not directly extend to hundreds of users.
+MPC protocols based on secret sharing, however, can extend
+to hundreds of users. In addition, these protocols have become
+relatively computationally efficient, and can be made robust against
+dropouts. Boyle et al. studied generic MPC at such scale, relying on
+a particular ORAM construction to help localize the computation
+and avoid broadcasts [ 11]. Some works, notably [ 12], optimize thesegeneric techniques for the specific task of secure summation, and
+have publicly available implementations.
+However, the weakness of generic MPC protocols based on secret-
+sharing is communication cost. In all such protocols, each user
+sends a secret-share of its entire data vector to some subset of the
+other users. To guarantee robustness, this subset of users must be
+relatively large: robustness is essentially proportional to the size
+of the subset. Additionally, each secret share is as long as the size
+of the entire data vector. In our setting the constraints on total
+communication make these approaches unworkable.
+Works based on Dining Cryptographers Networks: Dining
+cryptographers networks, or DC-nets, are a type of communication
+network which provide anonymity by using pairwise blinding of
+inputs [ 14,28], similarly to our secure aggregation protocol. The
+basic version of DC-nets, in which a single participant at a time
+sends an anonymous message, can be viewed as the restricted case
+of secure aggregation in which all users except for one have an
+input of 0.
+Recent research has examined increasing the efficiency of DC-
+nets protocols and allowing them to operate in the presence of
+active adversaries [ 17]. But previous DC-nets constructions share
+the flaw that, if even one user aborts the protocol before sending
+its message, the protocol must be restarted from scratch, which can
+be very expensive [36].
+Works based on Pairwise Additive Masking: Pairwise blind-
+ing using additive stream ciphers has been explored in previous
+work [ 3,24,31,33], presenting different approaches to dealing with
+client failures.
+The work of Ács and Castelluccia [ 3], and the modification sug-
+gested by [ 31], are the most closely related to our scheme, and have
+an explicit recovery round to deal with failures. Their protocols
+operate very similarly to ours: pairs of clients use Diffie-Hellman
+key exchange to agree on pairwise masks, and send the server their
+data vectors, summed with each of their pairwise masks and also
+a “self-mask”. In the recovery step, the server tells the remaining
+clients which other clients dropped out, and each remaining client
+responds with the sum of their (uncancelled) pairwise masks with
+the dropped users, added to their “self-mask”. The server subtracts
+these "recovery" values from the masked vectors received earlier,
+and correctly learns the sum of the undropped users’ data.
+However, their recovery phase is brittle: if additional users drop
+out during the recovery phase, the protocol cannot continue. Sim-
+ply repeating the recovery round is not sufficient, since this has
+the potential to leak the “self-masks” of the surviving users, which
+in turn can leak their data vectors. Moreover, since the entire sum
+of the masks is sent, this round requires almost as much commu-
+nication as the rest of the protocol, making further client failures
+during this step likely.
+Schemes based on (Threshold) Homomorphic Encryption
+Schemes based on threshold additively-homomorphic cryptosys-
+tems (e.g. the Paillier cryptosystem [ 38,47]) can handle client
+dropouts, but are either computationally expensive or require ad-
+ditional trust assumptions. For example, Paillier-based schemes
+require an expensive-to-generate set of threshold decryption keys,
+that must either be generated and distributed by a trusted third
+party or generated online with an expensive protocol. Similarly the
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1188
+pairing-based scheme of Leontiadis et al. [ 39] calls for a trusted
+dealer to set up the keys.
+The schemes of Shi et al. [ 49] and Chan et al. [ 13] use an approach
+similar to ours, but in the exponent in some group (the latter scheme
+extends the former to provide robustness against client dropouts).
+They also consider the need for differential privacy and give a
+rigorous analysis of distributed noise generation. Unfortunately,
+the size of the group elements is too large for our setting, and their
+schemes also call for a trusted dealer.
+Halevi, Lindell and Pinkas [ 32] present a protocol that uses ho-
+momorphic encryption to securely compute the sum in just one
+round of interaction between the server and each of the clients
+(assuming a PKI is already in place). Their protocol has the advan-
+tage that all parties do not need to be online simultaneously for
+the protocol to execute. However, the protocol also requires the
+communication to be carried out sequentially between the clients
+and the server. More importantly for our setting, their protocol
+does not deal with clients dropping out: all clients included in the
+protocol must respond before the server can learn the decrypted
+sum.
+10 CONCLUSION
+We have presented a practical protocol for securely aggregating
+data while ensuring that clients’ inputs are only learned by the
+server in aggregate. The overhead of our protocol is very low, and
+it can tolerate large numbers of failing devices, making it ideal for
+mobile applications. We require only one service provider, which
+simplifies deployment. Our protocol has immediate applications
+to real-world federated learning, and we expect to deploy a full
+application in the near future.
+REFERENCES
+[1] Martín Abadi, Andy Chu, Ian Goodfellow, H Brendan McMahan, Ilya Mironov,
+Kunal Talwar, and Li Zhang. 2016. Deep learning with differential privacy. In
+Proceedings of the 2016 ACM SIGSAC Conference on Computer and Communications
+Security. ACM, 308–318.
+[2]Michel Abdalla, Mihir Bellare, and Phillip Rogaway. 2001. The oracle Diffie-
+Hellman assumptions and an analysis of DHIES. In Cryptographers’ Track at the
+RSA Conference. Springer, 143–158.
+[3] Gergely Ács and Claude Castelluccia. 2011. I have a DREAM! (DiffeRentially pri-
+vatE smArt Metering). In International Workshop on Information Hiding. Springer,
+118–132.
+[4] Stephen Advokat. 1987. Publication Of Bork’s Video Rentals Raises Privacy Issue.
+Chicago Tribune (1987).
+[5] Toshinori Araki, Jun Furukawa, Yehuda Lindell, Ariel Nof, and Kazuma Ohara.
+2016. High-Throughput Semi-Honest Secure Three-Party Computation with an
+Honest Majority. In Proceedings of the 2016 ACM SIGSAC Conference on Computer
+and Communications Security (CCS ’16). ACM, New York, NY, USA, 805–817.
+https://doi.org/10.1145/2976749.2978331
+[6] Michael Barbaro, Tom Zeller, and Saul Hansell. 2006. A face is exposed for AOL
+searcher no. 4417749. New York Times 9, 2008 (2006).
+[7]Mihir Bellare and Chanathip Namprempre. 2000. Authenticated encryption:
+Relations among notions and analysis of the generic composition paradigm.
+InInternational Conference on the Theory and Application of Cryptology and
+Information Security. Springer, 531–545.
+[8]Michael Ben-Or, Shafi Goldwasser, and Avi Wigderson. 1988. Completeness
+theorems for non-cryptographic fault-tolerant distributed computation. In Pro-
+ceedings of the twentieth annual ACM symposium on Theory of computing. ACM,
+1–10.
+[9] Manuel Blum and Silvio Micali. 1984. How to generate cryptographically strong
+sequences of pseudorandom bits. SIAM journal on Computing 13, 4 (1984), 850–
+864.
+[10] Peter Bogetoft, Dan Lund Christensen, Ivan Damgård, Martin Geisler, Thomas
+Jakobsen, Mikkel Krøigaard, Janus Dam Nielsen, Jesper Buus Nielsen, Kurt
+Nielsen, Jakob Pagter, et al .2009. Secure multiparty computation goes live. InInternational Conference on Financial Cryptography and Data Security. Springer,
+325–343.
+[11] Elette Boyle, Kai-Min Chung, and Rafael Pass. 2015. Large-Scale Secure Computa-
+tion: Multi-party Computation for (Parallel) RAM Programs. Springer Berlin Hei-
+delberg, Berlin, Heidelberg, 742–762. https://doi.org/10.1007/978-3-662-48000-7_
+36
+[12] Martin Burkhart, Mario Strasser, Dilip Many, and Xenofontas Dimitropoulos.
+2010. SEPIA: Privacy-preserving aggregation of multi-domain network events
+and statistics. Network 1 (2010), 101101.
+[13] T-H Hubert Chan, Elaine Shi, and Dawn Song. 2012. Privacy-preserving stream
+aggregation with fault tolerance. In International Conference on Financial Cryp-
+tography and Data Security. Springer, 200–214.
+[14] David Chaum. 1988. The dining cryptographers problem: unconditional sender
+and recipient untraceability. Journal of Cryptology 1, 1 (1988), 65–75.
+[15] Jianmin Chen, Rajat Monga, Samy Bengio, and Rafal Jozefowicz. 2016. Revisiting
+Distributed Synchronous SGD. In ICLR Workshop Track. https://arxiv.org/abs/
+1604.00981
+[16] Henry Corrigan-Gibbs and Dan Boneh. 2017. Prio: Private, Robust, and Scalable
+Computation of Aggregate Statistics. In 14th USENIX Symposium on Networked
+Systems Design and Implementation (NSDI 17). USENIX Association, Boston,
+MA, 259–282. https://www.usenix.org/conference/nsdi17/technical-sessions/
+presentation/corrigan-gibbs
+[17] Henry Corrigan-Gibbs, David Isaac Wolinsky, and Bryan Ford. 2013. Proactively
+Accountable Anonymous Messaging in Verdict.. In USENIX Security. 147–162.
+[18] Ivan Damgård, Valerio Pastro, Nigel Smart, and Sarah Zakarias. 2012. Multi-
+party computation from somewhat homomorphic encryption. In Advances in
+Cryptology–CRYPTO 2012. Springer, 643–662.
+[19] Whitfield Diffie and Martin Hellman. 1976. New directions in cryptography.
+IEEE transactions on Information Theory 22, 6 (1976), 644–654.
+[20] John C Duchi, Michael I Jordan, and Martin J Wainwright. 2013. Local privacy
+and statistical minimax rates. In Foundations of Computer Science (FOCS), 2013
+IEEE 54th Annual Symposium on. IEEE, 429–438.
+[21] Cynthia Dwork. 2006. Differential Privacy, In 33rd International Colloquium
+on Automata, Languages and Programming, part II (ICALP 2006). 4052, 1–12.
+https://www.microsoft.com/en-us/research/publication/differential-privacy/
+[22] Cynthia Dwork, Krishnaram Kenthapadi, Frank McSherry, Ilya Mironov, and
+Moni Naor. 2006. Our Data, Ourselves: Privacy Via Distributed Noise Generation..
+InEurocrypt, Vol. 4004. Springer, 486–503.
+[23] Cynthia Dwork and Aaron Roth. 2014. The algorithmic foundations of differential
+privacy. Foundations and Trends® in Theoretical Computer Science 9, 3–4 (2014),
+211–407.
+[24] Tariq Elahi, George Danezis, and Ian Goldberg. 2014. Privex: Private collection
+of traffic statistics for anonymous communication networks. In Proceedings of
+the 2014 ACM SIGSAC Conference on Computer and Communications Security.
+ACM, 1068–1079.
+[25] Úlfar Erlingsson, Vasyl Pihur, and Aleksandra Korolova. 2014. Rappor: Ran-
+domized aggregatable privacy-preserving ordinal response. In Proceedings of the
+2014 ACM SIGSAC conference on computer and communications security. ACM,
+1054–1067.
+[26] Matt Fredrikson, Somesh Jha, and Thomas Ristenpart. 2015. Model inversion
+attacks that exploit confidence information and basic countermeasures. In Pro-
+ceedings of the 22nd ACM SIGSAC Conference on Computer and Communications
+Security. ACM, 1322–1333.
+[27] Oded Goldreich, Silvio Micali, and Avi Wigderson. 1987. How to play any mental
+game. In Proceedings of the nineteenth annual ACM symposium on Theory of
+computing. ACM, 218–229.
+[28] Philippe Golle and Ari Juels. 2004. Dining cryptographers revisited. In Interna-
+tional Conference on the Theory and Applications of Cryptographic Techniques.
+Springer, 456–473.
+[29] Ian Goodfellow, Yoshua Bengio, and Aaron Courville. 2016. Deep Learning.
+(2016). Book in preparation for MIT Press.
+[30] Joshua Goodman, Gina Venolia, Keith Steury, and Chauncey Parker. 2002. Lan-
+guage modeling for soft keyboards. In Proceedings of the 7th international confer-
+ence on Intelligent user interfaces. ACM, 194–195.
+[31] Slawomir Goryczka and Li Xiong. 2015. A comprehensive comparison of multi-
+party secure additions with differential privacy. IEEE Transactions on Dependable
+and Secure Computing (2015).
+[32] Shai Halevi, Yehuda Lindell, and Benny Pinkas. 2011. Secure computation on
+the web: Computing without simultaneous interaction. In Annual Cryptology
+Conference. Springer, 132–150.
+[33] Rob Jansen and Aaron Johnson. 2016. Safely Measuring Tor. In Proceedings of the
+2016 ACM SIGSAC Conference on Computer and Communications Security. ACM,
+1553–1567.
+[34] Marek Jawurek, Florian Kerschbaum, and Claudio Orlandi. 2013. Zero-knowledge
+using garbled circuits: how to prove non-algebraic statements efficiently. In
+Proceedings of the 2013 ACM SIGSAC conference on Computer & communications
+security. ACM, 955–966.
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1189
+[35] Jakub Konečn `y, H Brendan McMahan, Felix X Yu, Peter Richtárik,
+Ananda Theertha Suresh, and Dave Bacon. 2016. Federated learning: Strategies
+for improving communication efficiency. arXiv preprint arXiv:1610.05492 (2016).
+[36] Young Hyun Kwon. 2015. Riffle: An efficient communication system with strong
+anonymity. Ph.D. Dissertation. Massachusetts Institute of Technology.
+[37] Vasileios Lampos, Andrew C Miller, Steve Crossan, and Christian Stefansen.
+2015. Advances in nowcasting influenza-like illness rates using search query
+logs. Scientific reports 5 (2015), 12760.
+[38] Iraklis Leontiadis, Kaoutar Elkhiyaoui, and Refik Molva. 2014. Private and Dy-
+namic Time-Series Data Aggregation with Trust Relaxation. Springer International
+Publishing, Cham, 305–320. https://doi.org/10.1007/978-3-319-12280-9_20
+[39] Iraklis Leontiadis, Kaoutar Elkhiyaoui, Melek Önen, and Refik Molva. 2015.
+PUDA – Privacy and Unforgeability for Data Aggregation. Springer International
+Publishing, Cham, 3–18. https://doi.org/10.1007/978-3-319-26823-1_1
+[40] Yehuda Lindell, Eli Oxman, and Benny Pinkas. 2011. The IPS Compiler: Opti-
+mizations, Variants and Concrete Efficiency. Advances in Cryptology–CRYPTO
+2011 (2011), 259–276.
+[41] Yehuda Lindell, Benny Pinkas, Nigel P Smart, and Avishay Yanai. 2015. Efficient
+constant round multi-party computation combining BMR and SPDZ. In Annual
+Cryptology Conference. Springer, 319–338.
+[42] Kathryn Elizabeth McCabe. 2012. Just You and Me and Netflix Makes Three:
+Implications for Allowing Frictionless Sharing of Personally Identifiable Infor-
+mation under the Video Privacy Protection Act. J. Intell. Prop. L. 20 (2012),
+413.
+[43] H Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, et al .2016.
+Communication-Efficient Learning of Deep Networks from Decentralized Data.
+arXiv preprint arXiv:1602.05629 (2016).
+[44] Ilya Mironov, Omkant Pandey, Omer Reingold, and Salil Vadhan. 2009. Compu-
+tational differential privacy. In Advances in Cryptology-CRYPTO 2009. Springer,
+126–142.
+[45] Arvind Narayanan and Vitaly Shmatikov. 2008. Robust de-anonymization of
+large sparse datasets. In 2008 IEEE Symposium on Security and Privacy (sp 2008).
+IEEE, 111–125.
+[46] John Paparrizos, Ryen W White, and Eric Horvitz. 2016. Screening for pancreatic
+adenocarcinoma using signals from web search logs: Feasibility study and results.
+Journal of Oncology Practice 12, 8 (2016), 737–744.
+[47] Vibhor Rastogi and Suman Nath. 2010. Differentially private aggregation of
+distributed time-series with transformation and encryption. In Proceedings of
+the 2010 ACM SIGMOD International Conference on Management of data. ACM,
+735–746.
+[48] Adi Shamir. 1979. How to share a secret. Commun. ACM 22, 11 (1979), 612–613.
+[49] Elaine Shi, HTH Chan, Eleanor Rieffel, Richard Chow, and Dawn Song. 2011.
+Privacy-preserving aggregation of time-series data. In Annual Network & Dis-
+tributed System Security Symposium (NDSS). Internet Society.
+[50] Reza Shokri and Vitaly Shmatikov. 2015. Privacy-preserving deep learning. In Pro-
+ceedings of the 22nd ACM SIGSAC Conference on Computer and Communications
+Security. ACM, 1310–1321.
+[51] Reza Shokri, Marco Stronati, and Vitaly Shmatikov. 2016. Membership Inference
+Attacks against Machine Learning Models. arXiv preprint arXiv:1610.05820 (2016).
+[52] Latanya Sweeney and Ji Su Yoo. 2015. De-anonymizing South Korean Resident
+Registration Numbers Shared in Prescription Data. Technology Science (2015).
+[53] Martin J Wainwright, Michael I Jordan, and John C Duchi. 2012. Privacy aware
+learning. In Advances in Neural Information Processing Systems. 1430–1438.
+[54] Andrew C Yao. 1982. Theory and application of trapdoor functions. In Foun-
+dations of Computer Science, 1982. SFCS’08. 23rd Annual Symposium on. IEEE,
+80–91.A DIFFERENTIAL PRIVACY AND SECURE
+AGGREGATION
+While secure aggregation alone may suffice for some applications,
+for other applications stronger guarantees may be needed, as indi-
+cated by the failures of ad-hoc anonymization techniques [ 6,45,52],
+and by the demonstrated capability to extract information about
+individual training data from fully-trained models (which are es-
+sentially aggregates) [26, 50, 51].
+In such cases, secure aggregation composes well with differential
+privacy [21]. This is particularly advantageous in the local privacy
+setting [ 20], which offers provable guarantees for the protection of
+individual training examples [ 1,3] even when the data aggregator
+is not assumed to be trusted [ 25,53]. For example, when computing
+averages, partial averages over subgroups of users may be com-
+puted and privacy-preserving noise may be incorporated [ 22,31]
+before revealing the results to the data aggregator. Under some pri-
+vatization schemes, for a fixed total number of users and for secure
+aggregation subgroups of size n, the same amount of (computa-
+tional [ 44]) differential privacy may be offered to each user while
+reducing the standard deviation of the effective noise added to the
+estimated average across all users by a factor of√nrelative to pro-
+viding local differential privacy without secure aggregation. Thus,
+secure aggregation over just 1024-user subgroups holds the promise
+of a32×improvement in differentially private estimate precision.
+We anticipate that these utility gains will be crucial as methods
+for differentially private deep learning in the trusted-aggregator
+setting [ 1] are adapted to support untrusted aggregators, though
+a detailed study of the integration of differential privacy, secure
+aggregation, and deep learning is beyond the scope of the current
+work.
+Suppose that each of Uusers has a vector xiwith an ℓ2-norm
+bounded by∆
+2, such that the ℓ2-sensitivity ofP
+ixiis bounded by ∆.
+Forϵ∈(0,1), we can achieve (ϵ,δ)-differential privacy for the sum
+via the Gaussian mechanism [ 23], by adding zero-mean multivariate
+Gaussian noise drawn from N(0,σ2I), whereσ=∆
+ϵq
+2 ln(1.25
+δ).
+In the local privacy setting, users distrust the aggregator, and so
+before any user submits her value to the aggregator, she adds noise
+zi∼N (0,σ2I), achieving (ϵ,δ)-differential privacy for her own data
+in isolation. Summing contributions at the server yieldsPU
+i=1xi+PU
+i=1zi. Observe that the mean of knormally distributed random
+variables zi∼N (0,σ2I)is¯z∼N (0,σ2
+kI); it follows that the server
+can form an unbiased estimator of ¯xfrom the user contributions as
+ˆxLDP=1
+U*.
+,UX
+i=1xi+UX
+i=1zi+/
+-∼N (¯x,σ2
+UI).
+Now consider a setting wherein a trusted third party is available
+that can aggregate and privatize batches of nuser inputs; for sim-
+plicity, assume that Uis a multiple of n. The users deliver raw inputs
+xito the third party, who producesU
+nbatch-sums, each with (ϵ,δ)-
+differential privacy for users in the batch, by adding zj∼N (0,σ2I)
+noise to the batch-sum jbefore releasing it. Summing the released
+batch-sums at the server yieldsPU
+i=1xi+PU
+n
+j=1zj. The server can
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1190
+once again form an unbiased estimator of ¯xas
+ˆxTTP=1
+U*..
+,UX
+i=1xi+U
+nX
+j=1zj+//
+-∼N (¯x,σ2
+nUI).
+Observe that the standard deviation of ˆxTTPis a factor of1√n
+smaller than that of ˆxLDP. The secure aggregation protocol can be
+used in lieu of a trusted third party while retaining these gains by
+moving to a computational variant of differential privacy [44].
+B NEURAL NETWORKS AND FEDERATED
+LEARNING UPDATES
+A neural network represents a function f(x,Θ) =ymapping
+an input xto an output y, where fis parameterized by a high-
+dimensional vector Θ∈Rm. For modeling text message com-
+position, xmight encode the words entered so far and ya
+probability distribution over the next word. A training exam-
+ple is an observed pair ⟨x,y⟩and a training set is a collection
+D=⟨xi,yi⟩;i= 1,. . . , m	. A loss is defined on a training set
+Lf(D,Θ) =1
+|D|P
+⟨xi,yi⟩∈DLf(xi,yi,Θ), whereLf(x,y,Θ) =
+ℓ(y,f(x,Θ))for a loss function ℓ, e.g., ℓ(y,ˆy) =||y−ˆy||2.
+Training a neural net consists of finding parameters Θthat
+achieve smallLf(D,Θ), typically by iterating a variant of a mini-
+batch stochastic gradient descent rule [15, 29]:
+Θt+1←Θt−η∇Lf(Dt,Θt)
+where Θtare the parameters after iteration t,Dt⊆D is a ran-
+domly selected subset of the training examples, and ηis a learning
+rate parameter.
+In the Federated Learning setting, each user u∈ U holds a
+private setDuof training examples with D=S
+u∈UDu. To run
+stochastic gradient descent, for each update we select a random
+subset of usersUt⊆U (in practice we might have say |Ut|= 104
+while|U|= 107) and for each user u∈Utwe select a random
+subset of that user’s data Dtu⊆ D u. We then form a (virtual)
+minibatchDt=S
+u∈UtDtu.The minibatch loss gradient ∇Lf(Dt,Θt)can be rewritten as a
+weighted average across users:
+∇Lf(Dt,Θt) =1
+|Dt|X
+u∈Utδt
+u
+whereδtu=|Dtu|∇L f(Dtu,Θt). A user can thus share just the
+concatenated vectorf
+|Dtu|g
+∥δtuwith the server, from which the
+server can compute the desired weighted average and a gradient
+descent step:
+Θt+1←Θt−ηP
+u∈UtδtuP
+u∈Ut|Dtu|
+may be taken.
+There is evidence that a trained neural network’s parameters
+sometimes allow reconstruction of training examples [ 1,26,50,51];
+it is possible that the parameter updates be subject to similar attacks.
+For example, if the input xis a one-hot vocabulary-length vector
+encoding the most recently typed word, common neural network
+architectures will contain at least one parameter θwinΘfor each
+word wsuch that∂Lf
+∂θwis non-zero only when xencodes w. Thus, the
+set of recently typed words in Dtuwould be revealed by inspecting
+the non-zero entries of δtu.
+Session E5:  Privacy-Preserving Analytics
+CCS’17, October 30-November 3, 2017, Dallas, TX, USA
+1191

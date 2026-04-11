@@ -1,0 +1,18 @@
+\subsubsection{Overall Execution Flow}
+\label{sec:system-flow-overall}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{figures/workflow-overall.png}
+  \caption{Overall workflow of system. It consists of the end-to-end flow across stakeholders, trainers, IPFS, and the blockchain.}
+  \label{fig:workflow-overall}
+\end{figure}
+
+Figure.~\ref{fig:workflow-overall} shows the overview flows of SHDFL across actors. The blocks denote:
+\begin{enumerate}[labelindent=1cm, label=\arabic*., leftmargin=*]
+  \item[Block 1.] \textbf{System bootstrap.} Stakeholders finalize the dataset/model configuration, authorize trainers, and publish initial whitelists plus scenario metadata to IPFS/blockchain so every component runs from a common specification.
+  \item[Block 2.] \textbf{Construct balanced clusters.} The control tier executes the D-cliques algorithm, assigns bridge and fan-out roles, and persists the topology record so trainers know their cluster membership before training begins.
+  \item[Block 3.] \textbf{Run local training \& cluster SAP.} Trainers repeatedly pull the latest cluster model, perform local SGD, and participate in secure aggregation; the resulting cluster model and its CID/hash are recorded on IPFS and the ledger.
+  \item[Block 4.] \textbf{Participate in state/nation rounds.} When higher-level timers fire, fan-out nodes forward their cluster checkpoints to the elected state/nation aggregator, which merges and anchors the new scope model so all trainers can verify and apply it.
+\end{enumerate}
+\end{enumerate}

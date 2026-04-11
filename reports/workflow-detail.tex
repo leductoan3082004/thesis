@@ -1,0 +1,12 @@
+% Detailed system flow description for thesis reporting.
+
+\subsubsection{System Flow in Detail}
+\label{sec:system-flow-detail}
+
+\paragraph{System bootstrap (Actions 1.1--1.3).} The stakeholder first selects the dataset and reference model (1.1), then fixes the full training configuration (1.2) so that nodes later inherit identical hyperparameters and convergence rules. With those inputs defined, the stakeholder registers the authorized trainers on-chain (1.3), producing an immutable whitelist that records which organizations may contribute gradients during the experiment.
+
+\paragraph{Run D-cliques algorithm (Actions 2.1--2.5).} The system elects pre-aggregators (2.1) and fetches the necessary node metadata, including the per-node data distribution (2.2). Using this context, it forms cliques that minimize label skew (2.3) and assigns bridge nodes plus inter-clique edges to guarantee communication reachability (2.4). Finally, it commits the resulting topology artifacts (2.5) to IPFS/blockchain so participants and auditors reference the same clique plan.
+
+\paragraph{Local training \& cluster aggregation round (Actions 3.1--3.9).} At the start of each round, trainers pull the latest baseline from storage (3.1) and execute local optimization on their data shards (3.2). They quantize and send model parameters under the secure aggregation protocol (3.3), after which the elected aggregator produces the intra-cluster model (3.4), merges in neighbor cluster checkpoints provided via bridge nodes (3.6), and commits the resulting cluster model (3.7). Throughout the round, bridge nodes disseminate CID/hash pairs to neighboring clusters (3.8) and cache inbound artifacts for the next round (3.9); they also forward collected metadata to the aggregator (3.5) so it has a complete view before publishing.
+
+\paragraph{State/Nation rounds (Actions 4.1--4.4).} Fan-out nodes deliver the freshest cluster or state models to the higher-level aggregator (4.1), which aggregates the received artifacts (4.2--4.3) according to the configured policy. Once the new scope model is finalized, the aggregator anchors it on IPFS/blockchain (4.4), enabling every node to detect completion, apply the policy (replace/interpolate), and resume the next training cycle with a consistent global baseline.

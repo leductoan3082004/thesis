@@ -1,0 +1,6 @@
+\subsection{Dropout Scenario Experiment}
+\label{sec:dropout-scenario}
+
+To measure quorum-failure impact, we ran an experiment where every cluster round randomly drops three trainers (re-sampled each round, possibly within the same clique). If a clique falls below threshold, the round aborts, SAP restarts, and prior dropouts rejoin so the clique eventually regains quorum. The experiment purposely excludes permanent failures—we focus on repeated but recoverable SAP aborts rather than irreversibly stuck cliques.
+
+Despite the repeated aborts, every clique eventually regained quorum and the system completed the 100-round schedule. Accuracy even surpassed the ideal ``no-dropout'' baseline because of the \emph{Round Amplification} effect (Section~\ref{def:round-amplification}): each restart adds extra local SGD before SAP succeeds. The telemetry chart captures this through the \texttt{retry\_epoch} counter, so a round with $k$ aborts contributes $k$ additional epochs beyond the nominal plan. This boost therefore reflects extra computation rather than a fundamental improvement, underscoring that quorum enforcement preserves privacy at the cost of more local work whenever failures occur.

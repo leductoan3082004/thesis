@@ -61,7 +61,7 @@ config/keys/
 docker/docker-compose.auto.yml
 nodes/
 
-pr-not-push.md
-reports/
+# pr-not-push.md
+# reports/
 
 exp-result/

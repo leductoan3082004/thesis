@@ -1,0 +1,4 @@
+\subsection{No-SAP Ablation}
+\label{sec:no-sap-ablation}
+
+We also ran an ablation where the cluster layer disables SAP so trainers send plaintext updates to the aggregator while every other component remains unchanged. Accuracy after 100 rounds matches the SAP-enabled baseline, confirming that SAP does not change the learning trajectory—it purely safeguards privacy. Communication metrics diverge: compared with the SAP-enabled system (and even more so versus a fully connected topology), the total packet \emph{count} is lower because clusters reduce fan-out, yet the total transmitted \emph{data} is higher whenever SAP is active due to the $17\times$ expansion from mask vectors. Only the ablation run achieves both fewer packets and less data than the fully connected baseline. This underscores the trade-off: SAP preserves formal privacy guarantees at the cost of inflating payloads, whereas the ablated variant saves bandwidth but exposes individual updates.

@@ -1,0 +1,28 @@
+Goal: draw an alternative figure (no equations) inspired by the provided reference image—central spine with wide fan-out arrows—while emphasizing the hierarchy described in \texttt{system\_architecture.tex}.
+
+1. Overall layout (landscape)
+   - Place a stylized cloud/registry block near the top center to represent the TTP + storage backends.
+   - From this block, emit gentle green arrows down to three “cluster bubbles” arranged horizontally (similar to devices in the sample figure). Each bubble encloses 4–5 small circles to depict clique members, with a highlighted node tagged “Aggregator”.
+   - Beneath each bubble, place an icon for the device category (tablet/phone/laptop) plus a mini-database cylinder to echo local data presence, matching the playful iconography of the sample figure.
+
+2. Cluster-to-state transition
+   - Under the three clusters, draw a wide upward-curving blue arrow that sweeps toward a large rectangle labeled “State Level (timer-driven merge)”. This arrow replaces the numbered step (3) in the reference and conveys that cluster results flow into the state scope.
+   - Inside the state block, show a single big neural-network glyph or stacked disks to represent the aggregated state checkpoint.
+
+3. State-to-nation transition
+   - From the state block, draw two green arrows feeding a second block on the right labeled “Nation Level”. Include a small clock icon near each block to remind viewers about the interval-based triggers mentioned in the text.
+   - Add a bridge icon or double-headed arrow between the state and nation blocks to hint at the redundant fan-out path.
+
+4. Storage and dissemination
+   - Next to the top cloud, place icons labeled “IPFS” and “Blockchain/Registry”. Use dashed arrows from both the state and nation blocks back to these icons to show anchoring of higher-level checkpoints.
+   - From the blockchain icon, draw dotted arrows back down to the cluster bubbles to emphasize asynchronous polling (nodes pull new anchors rather than receiving pushes).
+
+5. Text callouts
+   - A short caption near each cluster arrow: “Secure aggregation → bridge fan-out”.
+   - A caption near the state block: “Single committer per scope”.
+   - A caption near the dotted return arrows: “Nodes apply scope policy (replace/interpolate) after polling”.
+
+6. Palette and style
+   - Reuse the soft greens/blues of the reference image for arrows.
+   - Keep line weights moderate so that the hierarchy layers are clear without equations.
+   - Ensure icons follow the informal, semi-cartoonish feel of the sample image so the final figure looks complementary yet distinct.
